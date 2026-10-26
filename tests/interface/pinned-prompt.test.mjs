@@ -610,8 +610,10 @@ test("full extension wiring combines all UI features and cleans on reload", asyn
     assert.equal(question.terminate, true);
     const pending = view.widgets.get("compact-tools:questions");
     const pendingRows = pending.render(90);
-    assert.equal(pendingRows.length, 2, "one top spacer then question text, without a header or trailing spacer");
+    assert.equal(pendingRows.length, 3, "one top spacer, question text, and one bottom spacer without a header");
     assert.equal(pendingRows[0], "");
+    assert.equal(pendingRows.at(-1), "");
+    assert.equal(pending.handleMouse({ type: "click", button: "left", x: 3, y: 2 }), undefined, "reminder bottom spacing has no answer target");
     assert.match(plain(pendingRows[1]), /Q1: Keep the ordinary input available/);
     assert.doesNotMatch(pendingRows.map(plain).join("\n"), /Questions ·|\d+ pending/);
     assert.doesNotMatch(plain(view.editor.render(90)[1]), /pending question|· \/q/);

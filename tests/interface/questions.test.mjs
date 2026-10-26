@@ -20,7 +20,7 @@ const { KeybindingsManager } = await fromPi("dist/core/keybindings.js");
 const { ToolExecutionComponent } = await fromPi("dist/modes/interactive/components/tool-execution.js");
 const themes = await fromPi("dist/modes/interactive/theme/theme.js");
 const tuiPath = requirePi.resolve("@earendil-works/pi-tui");
-const { Container, Text, Input, Spacer, visibleWidth, stripTerminalSequences, wrapTextWithAnsi, backgroundAnsi, parseColor, getOsc8LinkAtColumn, getCapabilities, setCapabilities } = await import(pathToFileURL(tuiPath).href);
+const { Container, Text, Input, Spacer, visibleWidth, stripTerminalSequences, wrapTextWithAnsi, truncateToWidth, backgroundAnsi, parseColor, getOsc8LinkAtColumn, getCapabilities, setCapabilities } = await import(pathToFileURL(tuiPath).href);
 const { renderLayoutFrame, getLayoutBoxesAt, getScrollViewBox } = await import(pathToFileURL(join(dirname(tuiPath), "layout.js")).href);
 const { createChatViewport } = await fromPi("dist/modes/interactive/chat-viewport.js");
 themes.initTheme("dark", false);
@@ -223,7 +223,7 @@ test("ask_user returns pending immediately without auto-open; recommendation onl
   assert.equal(result.details.status, "pending");
   assert.equal(result.terminate, true);
   assert.equal(h.updates.length, 0, "no repeated pending tool update");
-  assert.equal(h.widget().split("\n").length, 2, "one top spacer then the question, without a header or trailing blank rows");
+  assert.equal(h.widget().split("\n").length, 3, "one top spacer, the question, and one bottom spacer without a header");
   assert.doesNotMatch(h.widget(), /Questions ·|\d+ pending/);
   assert.match(h.widget(), /Q1: Which database/);
   assert.match(h.widget(), /Which database/);
@@ -277,11 +277,13 @@ test("headerless question entries are full-width colored click targets in both t
       assert.match(entry, /\x1b\[(?:48;[25];[^m]+|4[0-7]|10[0-7])m/, "explicit theme background");
     }
     const lines = widget.render(100);
-    assert.equal(lines.length, 2);
+    assert.equal(lines.length, 3);
     assert.equal(lines[0], "", "one unfilled row separates the reminder from the transcript");
     assert.match(stripTerminalSequences(lines[1]), /Q1: Readable scope/);
     assert.doesNotMatch(lines.map(stripTerminalSequences).join("\n"), /Questions ·|\d+ pending/);
-    assert.notEqual(stripTerminalSequences(lines.at(-1)).trim(), "", "content ends the widget, not extra blank rows");
+    assert.equal(lines.at(-1), "", "one unfilled bottom row separates the reminder from the input");
+    assert.equal(widget.handleMouse({ type: "click", button: "left", x: 99, y: 2 }), undefined, "bottom spacing has no stale target from narrower wrapping");
+    assert.equal(h.dialogs.length, 0);
     assert.equal(visibleWidth(lines[1]), 100, "entry padding is colored and clickable");
     assert.match(lines[1], /\x1b\[(?:48;[25];[^m]+|4[0-7]|10[0-7])m/);
     widget.handleMouse({ type: "click", button: "left", x: 99, y: 1 });
@@ -652,7 +654,7 @@ test("tiny expanded pending list scrolls bounded rows and selects the actual cli
   const h = await harness({ rows: 8 });
   for (let i = 1; i <= 7; i++) await h.ask({ question: `Question ${i}?` });
   const widget = h.widgetComponent();
-  assert.equal(widget.render(48).length, 4, "tiny viewport keeps top spacing, two body rows and an overflow hint without trailing padding");
+  assert.equal(widget.render(48).length, 4, "tiny viewport keeps one body row and a hint between top and bottom spacing");
   assert.match(plain(widget, 48), /Q1: Question 1/);
   for (let i = 0; i < 10; i++) {
     widget.handleMouse({ type: "wheel", x: 2, y: 2, wheelDelta: 1 });
@@ -712,28 +714,28 @@ test("every scrolled continuation row keeps its question ID at the smallest list
     }
     const widget = h.widgetComponent();
     const visited = new Set();
-    for (let offset = 0; offset <= expected.length - 2; offset++) {
+    for (let offset = 0; offset < expected.length; offset++) {
       const lines = widget.render(width);
-      assert.equal(lines.length, 4, "tiny list reserves two scrollable content rows and a hint");
+      assert.equal(lines.length, 4, "tiny list reserves one scrollable content row and a hint within both spacers");
       assert.equal(lines[0], "", "only one top separator remains");
+      assert.equal(lines[3], "", "one bottom separator remains inside the same row budget");
       assert.ok(lines.every(line => visibleWidth(line) <= width));
-      for (let y = 1; y <= 2; y++) {
-        const row = expected[offset + y - 1];
-        visited.add(offset + y - 1);
-        assert.equal(stripTerminalSequences(lines[y]).trim(), row.text.trim());
-        const hit = widget.handleMouse({ type: "click", button: "left", x: width - 1, y });
-        if (row.id === undefined) {
-          assert.equal(lines[y], "", "internal list separation stays unfilled");
-          assert.equal(hit, undefined, "separator has no question target");
-        } else {
-          assert.equal(hit?.handled, true, `width ${width}: continuation row opens its own question`);
-          assert.match(plain(h.current().component), new RegExp(`Q${row.id} ·`));
-          h.current().done({ kind: "defer" });
-          await new Promise(resolve => setImmediate(resolve));
-        }
+      const row = expected[offset];
+      visited.add(offset);
+      assert.equal(stripTerminalSequences(lines[1]).trim(), row.text.trim());
+      const hit = widget.handleMouse({ type: "click", button: "left", x: width - 1, y: 1 });
+      if (row.id === undefined) {
+        assert.equal(lines[1], "", "internal list separation stays unfilled");
+        assert.equal(hit, undefined, "separator has no question target");
+      } else {
+        assert.equal(hit?.handled, true, `width ${width}: continuation row opens its own question`);
+        assert.match(plain(h.current().component), new RegExp(`Q${row.id} ·`));
+        h.current().done({ kind: "defer" });
+        await new Promise(resolve => setImmediate(resolve));
       }
-      assert.equal(widget.handleMouse({ type: "click", button: "left", x: width - 1, y: 3 }), undefined, "scroll hint is not an answer target");
-      assert.equal(widget.handleMouse({ type: "click", button: "left", x: width - 1, y: 4 }), undefined, "removed trailing gap is out of bounds");
+      assert.equal(widget.handleMouse({ type: "click", button: "left", x: width - 1, y: 2 }), undefined, "scroll hint is not an answer target");
+      assert.equal(widget.handleMouse({ type: "click", button: "left", x: width - 1, y: 3 }), undefined, "bottom spacing is not an answer target");
+      assert.equal(widget.handleMouse({ type: "click", button: "left", x: width - 1, y: 4 }), undefined, "rows beyond the bottom spacing are out of bounds");
       widget.handleMouse({ type: "wheel", x: 0, y: 1, wheelDelta: 1 });
     }
     assert.equal(visited.size, expected.length, "every wrapped row remains reachable and keeps its own target");
@@ -834,8 +836,9 @@ test("list is always expanded and headerless across refresh; only entries open o
   assert.equal(widget.handleMouse({ type: "click", button: "left", x: 3, y: 0 }), undefined, "top separation is inert");
   for (const width of [1, 15, 100]) {
     const lines = widget.render(width);
-    assert.ok(lines.length >= 2);
+    assert.ok(lines.length >= 3);
     assert.equal(lines[0], "");
+    assert.equal(lines.at(-1), "");
     for (const line of lines) assert.ok(visibleWidth(line) <= width);
   }
   await h.emit("agent_settled");
@@ -862,9 +865,9 @@ test("Questions widget has unfilled padding, one inter-question gap and no resid
   for (const question of ["First?", "Second?"]) await h.ask({ question });
   const widget = h.widgetComponent();
   const lines = widget.render(80);
-  assert.equal(lines.length, 4, "one top spacer and separated entries; no heading or trailing blank rows");
+  assert.equal(lines.length, 5, "one top and one bottom spacer surround separated entries, without a heading");
   assert.doesNotMatch(lines.map(stripTerminalSequences).join("\n"), /Questions ·|\d+ pending/);
-  for (const y of [0, 2]) {
+  for (const y of [0, 2, 4]) {
     assert.equal(lines[y], "", "padding and separator have no background fill");
     assert.equal(widget.handleMouse({ type: "click", button: "left", x: 3, y }), undefined, "padding and separator are not click targets");
   }
@@ -873,9 +876,9 @@ test("Questions widget has unfilled padding, one inter-question gap and no resid
   const background = line => line.match(/\x1b\[48;[^m]+m/)?.[0];
   assert.ok(background(lines[1]), "question row has an explicit background");
   assert.equal(background(lines[3]), background(lines[1]), "question rows share the same amber fill");
-  assert.notEqual(stripTerminalSequences(lines.at(-1)).trim(), "");
-  for (const [x, y] of [[3, 4], [3, 5], [80, 3], [-1, 3], [3, -1]]) {
-    assert.equal(widget.handleMouse({ type: "click", button: "left", x, y }), undefined, "removed padding and out-of-bounds positions are inert");
+  assert.equal(lines.at(-1), "");
+  for (const [x, y] of [[3, 5], [80, 3], [-1, 3], [3, -1]]) {
+    assert.equal(widget.handleMouse({ type: "click", button: "left", x, y }), undefined, "out-of-bounds positions are inert");
   }
   widget.handleMouse({ type: "click", button: "left", x: 79, y: 3 });
   assert.match(plain(h.current().component), /Q2/);
@@ -1039,7 +1042,7 @@ test("restart restores deferred questions and resumes sequence without automatic
   const next = await resumed.ask({ question: "Next?" });
   assert.equal(next.details.question.id, 2);
   assert.equal(resumed.dialogs.length, 0);
-  assert.equal(resumed.widget().split("\n").length, 4, "restored questions start expanded without a header or opening a dialog");
+  assert.equal(resumed.widget().split("\n").length, 5, "restored questions start expanded between both spacers without a header or opening a dialog");
 });
 
 test("tree restoration keeps only branch pending questions but high-water includes abandoned Q5/prose", async () => {
@@ -1232,7 +1235,7 @@ test("fallback captures labeled assistant prose, skips fences/quotes/examples/th
   await h.message({ role: "toolResult", toolName: "bash", content: [{ type: "text", text: "Q101: Tool output?" }], timestamp: Date.now() });
   assert.deepEqual(h.records().map(record => record.id), [3, 4]);
   assert.equal((h.widget().match(/Q\d+:/g) ?? []).length, 2);
-  assert.equal(h.widget().split("\n").length, 4);
+  assert.equal(h.widget().split("\n").length, 5);
   assert.deepEqual(h.latest().options, []);
   assert.equal(h.latest().recommended, undefined);
   const result = await h.ask({ question: "Next?" });
@@ -1346,7 +1349,7 @@ test("transcript separates the question, each choice, rationale and recorded ans
 
 test("question transcript uses amber buffers and darker amber separators without expanded duplicates", async () => {
   const h = await harness({ mode: "print", hasUI: false });
-  const args = { question: "Choose 界?\n\nKeep this internal gap.", options: [{ label: "Keep", description: "Local only" }] };
+  const args = { question: "Choose 界?\n\nKeep\tthis internal gap.", options: [{ label: "Keep", description: "Local only" }] };
   const result = await h.ask(args);
   for (const appearance of ["dark", "light"]) for (const mode of ["truecolor", "256color"]) {
     const theme = themes.loadThemeFromPath(join(root, `dist/modes/interactive/theme/${appearance}.json`), mode);
@@ -1363,9 +1366,17 @@ test("question transcript uses amber buffers and darker amber separators without
       assert.doesNotMatch(lines.map(stripTerminalSequences).join("\n"), /Pending|click to answer/);
       if (width === 80) assert.match(stripTerminalSequences(lines[1]), /Q1: Choose/);
       assert.equal(lines.at(-1), buffer, `${appearance}/${mode}/${width}: exact bottom fill`);
-      if (mode === "truecolor") assert.equal(lines.filter(line => line === buffer).length, 2);
+      const questionRows = wrapTextWithAnsi(`Q1: ${args.question}`.replace(/\t/g, " "), width);
+      const afterQuestion = 1 + questionRows.length;
+      assert.equal(lines[afterQuestion], buffer, "one normal amber row follows the final wrapped question row, before choices");
+      assert.ok(stripTerminalSequences(lines[afterQuestion - 1]).trim(), "the buffer follows actual text, not an internal blank row");
+      for (const [index, row] of questionRows.entries()) {
+        assert.equal(stripTerminalSequences(lines[index + 1]).trim(), stripTerminalSequences(truncateToWidth(row, width, "", true)).trim(), "extra spacing leaves all actual-question row offsets unchanged");
+      }
+      if (mode === "truecolor") assert.equal(lines.filter(line => line === buffer).length, 3);
       const separatorBg = backgroundAnsi(parseColor(appearance === "dark" ? "#3d351b" : "#e6d58c"), mode);
-      const separators = lines.slice(1, -1).filter(line => !stripTerminalSequences(line).trim());
+      const separators = lines.filter((line, index) => index > 0 && index < lines.length - 1 && index !== afterQuestion && !stripTerminalSequences(line).trim());
+      assert.ok(lines[afterQuestion + 1].includes(separatorBg), "existing dark separator remains immediately after the new normal amber buffer");
       assert.ok(separators.length >= 2, "internal question gap and choice separation remain present");
       assert.ok(separators.every(line => line.includes(separatorBg) && visibleWidth(line) === width), "blank card rows have full-width amber fill, never terminal-gray gaps");
       assert.ok(lines.every(line => visibleWidth(line) <= width));
@@ -1405,6 +1416,9 @@ test("question transcript plain modes retain buffer geometry without painting in
         assert.equal(lines[0], " ".repeat(width));
         assert.equal(lines.at(-1), " ".repeat(width));
         assert.ok(lines.slice(1, -1).filter(line => !line.trim()).every(line => line === ""));
+        const afterQuestion = 1 + wrapTextWithAnsi(`Q1: ${result.details.question.question}`, width).length;
+        assert.equal(lines[afterQuestion], "", "the extra row after the entire wrapped question is unpainted in plain mode");
+        assert.equal(afterQuestion, lines.length - 2, "text-only cards retain the separate existing outer bottom buffer");
         assert.doesNotMatch(lines.join("\n"), /\x1b\[[0-9;]*m/);
         assert.ok(lines.every(line => visibleWidth(line) <= width));
         const call = h.tool.renderCall({ question: result.details.question.question }, themes.theme, { toolCallId: "call-1" }).render(width);
@@ -1415,7 +1429,7 @@ test("question transcript plain modes retain buffer geometry without painting in
         const widget = h.widgetComponent().render(width);
         assert.equal(widget[0], "");
         assert.doesNotMatch(widget.join("\n"), /\x1b\[[0-9;]*m/);
-        assert.notEqual(widget.at(-1).trim(), "", "no added trailing widget spacing in plain mode");
+        assert.equal(widget.at(-1), "", "one unpainted bottom reminder spacer remains in plain mode");
       }
     }
   } finally {
@@ -1461,7 +1475,8 @@ test("native transcript keeps one question/choice copy and live Answered/Dismiss
   assert.match(stripTerminalSequences(resultRows[1]), /Q1: Choose a target/, "pending question begins immediately after top fill");
   assert.equal(visibleWidth(resultRows.at(-1)), 100);
   const separatorBg = backgroundAnsi(parseColor("#3d351b"), themes.theme.getColorMode());
-  assert.ok(resultRows.slice(1, -1).filter(line => !stripTerminalSequences(line).trim()).every(line => line.includes(separatorBg)), "internal transcript separators retain a darker amber fill");
+  assert.equal(resultRows[2], resultRows[0], "one normal amber buffer follows actual question text before the choices");
+  assert.ok(resultRows.slice(3, -1).filter(line => !stripTerminalSequences(line).trim()).every(line => line.includes(separatorBg)), "internal transcript separators retain a darker amber fill");
   if (process.env.QUESTION_TRANSCRIPT_SAMPLE) {
     const widget = h.widgetComponent();
     writeFileSync(process.env.QUESTION_TRANSCRIPT_SAMPLE, [...painted, "", ...widget.render(100)].join("\n") + "\n");
@@ -1480,6 +1495,8 @@ test("native transcript keeps one question/choice copy and live Answered/Dismiss
   assert.equal(stripTerminalSequences(answeredRows[2]).trim(), "", "resolved status retains its separator before the question");
   assert.ok(answeredRows[2].includes(separatorBg), "resolved status separator retains darker amber fill");
   assert.match(stripTerminalSequences(answeredRows[3]), /Q1: Choose a target/);
+  assert.equal(answeredRows[4], answeredRows[0], "resolved question retains its normal amber bottom buffer");
+  assert.ok(answeredRows[5].includes(separatorBg), "resolved choice separation stays darker after the new buffer");
   assert.doesNotMatch(frame(), /Q1 · Pending/);
   await h.message(user(h.sent[0].content));
   await h.message(assistant("Using the chosen target."));
@@ -1502,6 +1519,8 @@ test("native transcript keeps one question/choice copy and live Answered/Dismiss
   assert.match(stripTerminalSequences(dismissedRows[1]), /Q2 · Dismissed/);
   assert.ok(dismissedRows[2].includes(separatorBg), "dismissed status keeps the darker amber separator");
   assert.match(stripTerminalSequences(dismissedRows[3]), /Q2: Proceed further/);
+  assert.equal(dismissedRows[4], dismissedRows[0], "dismissed question retains its normal amber bottom buffer");
+  assert.ok(dismissedRows[5].includes(separatorBg), "dismissed choice separation stays darker after the new buffer");
   assert.doesNotMatch(frame(), /Q[12] · Pending/);
   assert.equal(h.sent.length, 1, "dismissal and live rendering send no extra messages");
   assert.equal(JSON.stringify(first), immutable, "old tool result remains an immutable historical pending result");
@@ -2212,8 +2231,15 @@ test("native fullscreen resize and follow-end decisions do not feed the reminder
     assert.equal(view.transcript.isFollowingEnd, true);
     assert.match(view.text(), /Unsent ordinary draft/);
   }
+  const visibleList = view.list();
+  const visibleRows = visibleList.render(64);
+  assert.equal(visibleRows.length, 3, "offscreen single question reserves exactly its text and both outer spacers");
+  assert.equal(visibleRows.at(-1), "");
+  assert.equal(visibleList.handleMouse({ type: "click", button: "left", x: 3, y: 2 }), undefined, "visible reminder bottom spacer is inert");
   view.chat.removeChild(filler);
   assert.equal(view.reminderVisible(), false, "newly visible question restores full transcript space immediately");
+  assert.deepEqual(visibleList.render(64), [], "hiding a previously visible reminder removes both outer spacers");
+  for (const y of [0, 1, 2]) assert.equal(visibleList.handleMouse({ type: "click", button: "left", x: 3, y }), undefined, "hidden reminder clears every old target including its bottom spacer");
   assert.equal(getScrollViewBox(view.frame(), view.transcript).rect.height, 24 - view.root.entries.at(-1).component.render(64).length);
 });
 

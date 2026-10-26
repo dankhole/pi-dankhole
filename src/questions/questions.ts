@@ -126,7 +126,7 @@ function questionLines(question: QuestionView): string[] {
 class QuestionTranscript extends Text {
   private lastWidth = 0;
   private lastHeight = 0;
-  constructor(private readonly currentText: () => string, private readonly paint: (line: string, separator?: boolean) => string, private readonly buffers: "top" | "both",
+  constructor(private readonly currentText: () => { text: string; bufferAfterText?: string }, private readonly paint: (line: string, separator?: boolean) => string, private readonly buffers: "top" | "both",
     private readonly open?: () => boolean, private readonly content?: (width: number) => { identity: object; rows: number[] } | undefined) { super("", 0, 0); }
   [QUESTION_CONTENT](width: number) { return this.content?.(width); }
   handleMouse(event: TuiMouseEvent) {
@@ -137,7 +137,8 @@ class QuestionTranscript extends Text {
   render(width: number): string[] {
     this.lastWidth = width;
     this.lastHeight = 0;
-    this.setText(this.currentText());
+    const { text, bufferAfterText } = this.currentText();
+    this.setText(text);
     if (width <= 0) return [];
     // Text may emit a two-column grapheme into a one-column wrap. The self-rendered shell avoids
     // native Box padding overflow and this final clamp preserves the component width contract.
@@ -146,9 +147,14 @@ class QuestionTranscript extends Text {
       if (!stripTerminalSequences(content).trim()) return !questionPlain() ? this.paint(" ".repeat(width), true) : "";
       return questionPlain() ? stripTerminalSequences(content) : this.paint(content);
     });
-    // Outer buffers retain the card fill; internal blank rows use a darker amber
-    // separator. Native tool/editor outer spacing remains untouched.
+    // Keep the question's own bottom buffer light, before the darker separators
+    // between content groups. Match Text's tab normalization when measuring wrapping.
     const buffer = this.paint(" ".repeat(width));
+    if (bufferAfterText !== undefined) {
+      const row = wrapTextWithAnsi(bufferAfterText.replace(/\t/g, "   "), width).length;
+      lines.splice(row, 0, questionPlain() ? "" : buffer);
+    }
+    // Outer buffers retain the card fill. Native tool/editor spacing is untouched.
     this.lastHeight = lines.length + (this.buffers === "both" ? 2 : 1);
     return this.buffers === "both" ? [buffer, ...lines, buffer] : [buffer, ...lines];
   }
@@ -270,7 +276,7 @@ export function registerQuestions(pi: ExtensionAPI, enabled: boolean): void {
           targets = [];
           lastHeight = 0;
           if (width <= 0 || !shouldShow(width)) return [];
-          const lines = [""]; // Keep breathing room above; the native editor owns the gap below.
+          const lines = [""]; // Keep one neutral buffer above and below the reminder.
           if (wrappedWidth !== width) {
             wrappedWidth = width;
             body = [];
@@ -284,7 +290,7 @@ export function registerQuestions(pi: ExtensionAPI, enabled: boolean): void {
           }
           // Keep the bounded list and hint clear of ordinary input/footer controls.
           const budget = Math.max(4, Math.min(16, (tui.terminal?.rows ?? 24) - 5));
-          const available = budget - lines.length;
+          const available = budget - lines.length - 1; // Reserve the bottom buffer, even on tiny screens.
           const overflow = body.length > available;
           const hint = overflow && available > 1;
           const capacity = available - (hint ? 1 : 0);
@@ -295,6 +301,7 @@ export function registerQuestions(pi: ExtensionAPI, enabled: boolean): void {
             lines.push(row.record ? questionStyle(theme, truncateToWidth(row.text, width, "", true), "text", "question") : "");
           }
           if (hint) lines.push(questionStyle(theme, truncateToWidth(`  Rows ${listOffset + 1}–${Math.min(body.length, listOffset + capacity)}/${body.length} · wheel to scroll`, width), "muted"));
+          lines.push(""); // Neutral terminal background; never a question click target.
           lastHeight = lines.length;
           // Width helpers can add reset sequences even to otherwise plain text.
           return questionPlain() ? lines.map(stripTerminalSequences) : lines;
@@ -606,7 +613,7 @@ export function registerQuestions(pi: ExtensionAPI, enabled: boolean): void {
     renderCall(_args, theme, context) {
       const record = [...records.values()].find(question => question.toolCallId === context.toolCallId);
       const renderedSession = sessionId;
-      return new QuestionTranscript(() => questionStyle(theme, `Ask user${record ? ` · Q${record.id}` : ""}`, "questionText", "question"),
+      return new QuestionTranscript(() => ({ text: questionStyle(theme, `Ask user${record ? ` · Q${record.id}` : ""}`, "questionText", "question") }),
         line => questionPaint(theme, line, "question"), "top", () => openCard(record, renderedSession));
     },
     renderResult(result, _options, theme, context) {
@@ -626,16 +633,19 @@ export function registerQuestions(pi: ExtensionAPI, enabled: boolean): void {
       return new QuestionTranscript(() => {
         const record = current();
         const { status, label } = labelFor(record);
-        return [
-          ...(status === "pending" ? [] : [questionStyle(theme, label,
-            status === "answered" ? "success" : status === "error" ? "warning" : "muted", "question"), ...(record ? [""] : [])]),
-          // The actual question and all choices are always in the ordinary
-          // transcript, once, independently of expansion and the optional popup.
-          ...(record ? questionLines(record) : []),
-          ...(record?.answer ? ["", `Answer: ${safe(record.answer.text)}`] : []),
-          ...(status === "dismissed" && record?.resolution ? ["", `Reason: ${safe(record.resolution.reason)}`] : []),
-          ...(details?.reason && status === "error" ? [safe(details.reason)] : []),
-        ].join("\n");
+        const heading = status === "pending" ? [] : [questionStyle(theme, label,
+          status === "answered" ? "success" : status === "error" ? "warning" : "muted", "question"), ...(record ? [""] : [])];
+        const body = record ? questionLines(record) : [];
+        return {
+          // The actual question and all choices appear once, independently of the popup.
+          text: [
+            ...heading, ...body,
+            ...(record?.answer ? ["", `Answer: ${safe(record.answer.text)}`] : []),
+            ...(status === "dismissed" && record?.resolution ? ["", `Reason: ${safe(record.resolution.reason)}`] : []),
+            ...(details?.reason && status === "error" ? [safe(details.reason)] : []),
+          ].join("\n"),
+          bufferAfterText: record ? [...heading, body[0]].join("\n") : undefined,
+        };
       }, (line, separator) => questionPaint(theme, line, separator ? "questionSeparator" : "question"), "both",
       () => associated && details?.status !== "error" && openCard(snapshot, renderedSession), width => {
         const live = associated ? liveQuestion(snapshot, renderedSession) : undefined;
