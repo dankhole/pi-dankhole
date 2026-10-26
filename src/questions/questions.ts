@@ -119,7 +119,7 @@ function questionLines(question: QuestionView): string[] {
   return [
     `Q${question.id}: ${safe(question.question)}`,
     ...question.options.flatMap((option, index) => ["", `  ${index + 1}. ${safe(option.label)}${index === question.recommended ? " (Recommended)" : ""}${option.description ? ` — ${safe(option.description)}` : ""}`]),
-    ...(question.recommended !== undefined && question.rationale ? ["", `  Recommendation rationale: ${safe(question.rationale)}`] : []),
+    ...(question.recommended !== undefined && question.rationale ? ["", `  Recommendation rationale: ${safe(question.rationale)}`] : question.options.length ? [""] : []),
   ];
 }
 
@@ -298,7 +298,8 @@ export function registerQuestions(pi: ExtensionAPI, enabled: boolean): void {
           listOffset = Math.max(0, Math.min(listOffset, maxOffset));
           for (const row of body.slice(listOffset, listOffset + capacity)) {
             targets[lines.length] = row.record;
-            lines.push(row.record ? questionStyle(theme, truncateToWidth(row.text, width, "", true), "text", "question") : "");
+            lines.push(row.record ? questionStyle(theme, truncateToWidth(row.text, width, "", true), "text", "question")
+              : questionPlain() ? "" : questionPaint(theme, " ".repeat(width), "questionSeparator"));
           }
           if (hint) lines.push(questionStyle(theme, truncateToWidth(`  Rows ${listOffset + 1}–${Math.min(body.length, listOffset + capacity)}/${body.length} · wheel to scroll`, width), "muted"));
           lines.push(""); // Neutral terminal background; never a question click target.
@@ -636,12 +637,13 @@ export function registerQuestions(pi: ExtensionAPI, enabled: boolean): void {
         const heading = status === "pending" ? [] : [questionStyle(theme, label,
           status === "answered" ? "success" : status === "error" ? "warning" : "muted", "question"), ...(record ? [""] : [])];
         const body = record ? questionLines(record) : [];
+        const afterBody = body.at(-1) === "" ? [] : [""];
         return {
           // The actual question and all choices appear once, independently of the popup.
           text: [
             ...heading, ...body,
-            ...(record?.answer ? ["", `Answer: ${safe(record.answer.text)}`] : []),
-            ...(status === "dismissed" && record?.resolution ? ["", `Reason: ${safe(record.resolution.reason)}`] : []),
+            ...(record?.answer ? [...afterBody, `Answer: ${safe(record.answer.text)}`] : []),
+            ...(status === "dismissed" && record?.resolution ? [...afterBody, `Reason: ${safe(record.resolution.reason)}`] : []),
             ...(details?.reason && status === "error" ? [safe(details.reason)] : []),
           ].join("\n"),
           bufferAfterText: record ? [...heading, body[0]].join("\n") : undefined,

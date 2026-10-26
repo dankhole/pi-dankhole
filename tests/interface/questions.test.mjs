@@ -725,7 +725,8 @@ test("every scrolled continuation row keeps its question ID at the smallest list
       assert.equal(stripTerminalSequences(lines[1]).trim(), row.text.trim());
       const hit = widget.handleMouse({ type: "click", button: "left", x: width - 1, y: 1 });
       if (row.id === undefined) {
-        assert.equal(lines[1], "", "internal list separation stays unfilled");
+        assert.equal(stripTerminalSequences(lines[1]), " ".repeat(width), "internal list separation is full-width amber");
+        assert.ok(lines[1].includes(backgroundAnsi(parseColor(themes.theme.appearance === "light" ? "#e6d58c" : "#3d351b"), themes.theme.getColorMode())));
         assert.equal(hit, undefined, "separator has no question target");
       } else {
         assert.equal(hit?.handled, true, `width ${width}: continuation row opens its own question`);
@@ -859,7 +860,7 @@ test("list is always expanded and headerless across refresh; only entries open o
   assert.equal(h.dialogs.length, 1, "new questions never open automatically");
 });
 
-test("Questions widget has unfilled padding, one inter-question gap and no residual empty padding", async () => {
+test("Questions widget has neutral outer padding, an amber inter-question gap and no residual empty padding", async () => {
   const h = await harness();
   assert.equal(h.widgets.has(statusKey), false);
   for (const question of ["First?", "Second?"]) await h.ask({ question });
@@ -868,7 +869,10 @@ test("Questions widget has unfilled padding, one inter-question gap and no resid
   assert.equal(lines.length, 5, "one top and one bottom spacer surround separated entries, without a heading");
   assert.doesNotMatch(lines.map(stripTerminalSequences).join("\n"), /Questions ·|\d+ pending/);
   for (const y of [0, 2, 4]) {
-    assert.equal(lines[y], "", "padding and separator have no background fill");
+    if (y === 2) {
+      assert.equal(stripTerminalSequences(lines[y]), " ".repeat(80), "inter-question gap keeps its full-width amber fill");
+      assert.ok(lines[y].includes(backgroundAnsi(parseColor(themes.theme.appearance === "light" ? "#e6d58c" : "#3d351b"), themes.theme.getColorMode())));
+    } else assert.equal(lines[y], "", "outer padding stays neutral");
     assert.equal(widget.handleMouse({ type: "click", button: "left", x: 3, y }), undefined, "padding and separator are not click targets");
   }
   assert.match(stripTerminalSequences(lines[1]), /Q1: First/);
@@ -1349,7 +1353,7 @@ test("transcript separates the question, each choice, rationale and recorded ans
 
 test("question transcript uses amber buffers and darker amber separators without expanded duplicates", async () => {
   const h = await harness({ mode: "print", hasUI: false });
-  const args = { question: "Choose 界?\n\nKeep\tthis internal gap.", options: [{ label: "Keep", description: "Local only" }] };
+  const args = { question: "Choose 界?\n\nKeep\tthis internal gap.", options: [{ label: "Keep", description: "Local only" }, { label: "Pause" }] };
   const result = await h.ask(args);
   for (const appearance of ["dark", "light"]) for (const mode of ["truecolor", "256color"]) {
     const theme = themes.loadThemeFromPath(join(root, `dist/modes/interactive/theme/${appearance}.json`), mode);
@@ -1377,6 +1381,10 @@ test("question transcript uses amber buffers and darker amber separators without
       const separatorBg = backgroundAnsi(parseColor(appearance === "dark" ? "#3d351b" : "#e6d58c"), mode);
       const separators = lines.filter((line, index) => index > 0 && index < lines.length - 1 && index !== afterQuestion && !stripTerminalSequences(line).trim());
       assert.ok(lines[afterQuestion + 1].includes(separatorBg), "existing dark separator remains immediately after the new normal amber buffer");
+      assert.ok(lines.at(-2).includes(separatorBg), "dark amber also follows the final option, before the outer light buffer");
+      assert.equal(visibleWidth(lines.at(-2)), width);
+      assert.equal(stripTerminalSequences(lines.at(-2)).trim(), "");
+      assert.ok(stripTerminalSequences(lines.at(-3)).trim(), "exactly one dark spacer follows the last wrapped option row");
       assert.ok(separators.length >= 2, "internal question gap and choice separation remain present");
       assert.ok(separators.every(line => line.includes(separatorBg) && visibleWidth(line) === width), "blank card rows have full-width amber fill, never terminal-gray gaps");
       assert.ok(lines.every(line => visibleWidth(line) <= width));
