@@ -1,5 +1,7 @@
-import { type Component, getOsc8LinkAtColumn, stripTerminalSequences, type TUI } from "@earendil-works/pi-tui";
-import { withTranscriptMeasurement } from "../styling/transcript-measurement.ts";
+import type { Theme } from "@earendil-works/pi-coding-agent";
+import { backgroundAnsi, type Component, foregroundAnsi, getOsc8LinkAtColumn, stripTerminalSequences, type TUI, visibleWidth } from "@earendil-works/pi-tui";
+import { isTranscriptRendererSupported, registerTranscriptRenderer, withTranscriptMeasurement } from "../styling/transcript-measurement.ts";
+import { questionPalette, questionPlain } from "./question-palette.ts";
 
 /** Only question renderers owned by this registration can supply these identities. */
 export const QUESTION_CONTENT = Symbol("question-content");
@@ -29,6 +31,9 @@ export interface ProseQuestionSource { message: object; questions: ProseQuestion
 interface ProseBinding {
   descriptor?: PropertyDescriptor;
   handler: NonNullable<Component["handleMouse"]>;
+  renderDescriptor?: PropertyDescriptor;
+  render: Component["render"];
+  unregister: () => void;
   message: object;
   lines: string[];
   width: number;
@@ -58,13 +63,54 @@ function proseRows(lines: string[], id: number, question: string): number[] | un
   return matches.length === 1 ? matches[0] : undefined;
 }
 
+function proseTargets(lines: string[], questions: ProseQuestion[]): Map<number, ProseQuestion> {
+  const targets = new Map<number, ProseQuestion>();
+  const ambiguous = new Set<number>();
+  for (const question of questions) for (const row of proseRows(lines, question.id, question.question) ?? []) {
+    if (targets.has(row)) ambiguous.add(row);
+    else targets.set(row, question);
+  }
+  for (const row of ambiguous) targets.delete(row);
+  return targets;
+}
+
+// Replace only SGR colors, never text attributes, OSC links/zones or opaque payloads. A
+// question owns its row colors, not the native text, wrapping, or link geometry.
+const sequences = /\x1b(?:\][\s\S]*?(?:\x07|\x1b\\)|[P_^][\s\S]*?\x1b\\|\[[0-?]*[ -/]*[@-~])/g;
+function paintProse(theme: Theme, line: string, width: number): string {
+  if (questionPlain()) return line;
+  const palette = questionPalette(theme);
+  const paint = foregroundAnsi(palette.questionText, theme.getColorMode()) + backgroundAnsi(palette.question, theme.getColorMode());
+  const text = line.replace(sequences, sequence => {
+    if (!/^\x1b\[[\d;:]*m$/.test(sequence)) return sequence;
+    const parameters = sequence.slice(2, -1).split(";");
+    const attributes: string[] = [];
+    for (let index = 0; index < parameters.length; index++) {
+      const parameter = parameters[index];
+      const code = Number(parameter.split(":")[0]);
+      let end = index;
+      if ([38, 48, 58].includes(code) && !parameter.includes(":")) {
+        if (parameters[index + 1] === "5") end += 2;
+        else if (parameters[index + 1] === "2") end += 4;
+      }
+      if (!(code >= 30 && code <= 49 || code >= 90 && code <= 107)) {
+        attributes.push(`\x1b[${parameters.slice(index, end + 1).join(";")}m` + (code === 0 ? paint : ""));
+      }
+      index = end;
+    }
+    return attributes.join("");
+  });
+  return paint + text + " ".repeat(Math.max(0, width - visibleWidth(text))) + "\x1b[0m";
+}
+
 const tree = (value: unknown): value is Tree => !!value && Array.isArray((value as Tree).children)
   && typeof (value as Tree).render === "function";
 
 /** Instance-local adapter for Pi 1.4's fullscreen chat layout and prose mouse routing. */
 export function questionListVisibility(tui: TUI, pending: readonly PendingIdentity[],
   proseSources?: () => ProseQuestionSource[] | undefined,
-  openProse?: (identity: object, message: object) => boolean) {
+  openProse?: (identity: object, message: object) => boolean,
+  theme?: () => Theme) {
   let measuring = false;
   let disposed = false;
   const bindings = new Map<Component, ProseBinding>();
@@ -77,6 +123,11 @@ export function questionListVisibility(tui: TUI, pending: readonly PendingIdenti
       if (binding.descriptor) Object.defineProperty(component, "handleMouse", binding.descriptor);
       else delete component.handleMouse;
     }
+    if (component.render === binding.render) {
+      if (binding.renderDescriptor) Object.defineProperty(component, "render", binding.renderDescriptor);
+      else delete (component as Partial<Component>).render;
+    }
+    binding.unregister();
     bindings.delete(component);
   };
   const clearBindings = () => { for (const component of bindings.keys()) removeBinding(component); };
@@ -84,24 +135,52 @@ export function questionListVisibility(tui: TUI, pending: readonly PendingIdenti
   const bindProse = (component: Component, source: ProseQuestionSource, lines: string[], width: number, targets: Map<number, ProseQuestion>) => {
     if (!openProse || !targets.size || contested.has(component)) return false;
     let binding = bindings.get(component);
-    if (binding && component.handleMouse !== binding.handler) { contested.add(component); removeBinding(component); return false; }
+    if (binding && (component.handleMouse !== binding.handler || component.render !== binding.render)) {
+      contested.add(component); removeBinding(component); return false;
+    }
     if (!binding) {
+      if (!isTranscriptRendererSupported(component)) return false;
+      const originalRender = component.render;
+      const renderDescriptor = Object.getOwnPropertyDescriptor(component, "render");
+      const render: Component["render"] = width => {
+        const rows = originalRender.call(component, width);
+        const current = bindings.get(component);
+        if (disposed || !current || current.render !== render || component.render !== render
+          || component.handleMouse !== current.handler || tui.mode !== "fullscreen"
+          || (component as Component & { lastMessage?: object }).lastMessage !== current.message) return rows;
+        const document = (tui as unknown as Tree).children?.[0];
+        const chat = tree(document) && document.children[2];
+        const matches = tree(chat) ? chat.children.filter(child => child.constructor.name === "AssistantMessageComponent"
+          && (child as Component & { lastMessage?: object }).lastMessage === current.message) : [];
+        const source = matches.length === 1 && matches[0] === component
+          ? proseSources?.()?.find(source => source.message === current.message) : undefined;
+        // Always remeasure native rows: resize, streaming and native rebuilds may
+        // invalidate the previous hit map even before the reminder is measured.
+        const targets = proseTargets(rows, source?.questions ?? []);
+        Object.assign(current, { lines: rows, width, targets });
+        return theme ? rows.map((line, row) => targets.has(row) ? paintProse(theme(), line, width) : line) : rows;
+      };
       const original = component.handleMouse;
       const descriptor = Object.getOwnPropertyDescriptor(component, "handleMouse");
       const handler: NonNullable<Component["handleMouse"]> = event => {
         const native = original?.call(component, event);
         if (native) return native;
         const current = bindings.get(component);
-        if (disposed || !current || component.handleMouse !== handler || event.type !== "click" || event.button !== "left"
+        if (disposed || !current || component.handleMouse !== handler || component.render !== current.render
+          || event.type !== "click" || event.button !== "left"
           || event.shift || event.alt || event.ctrl || event.x < 0 || event.x >= current.width || event.width !== current.width
           || (component as Component & { lastMessage?: object }).lastMessage !== current.message
           || getOsc8LinkAtColumn(current.lines[event.y] ?? "", event.x)) return;
         const question = current.targets.get(event.y);
         if (question && openProse(question.identity, current.message)) return { handled: true, render: true };
       };
-      binding = { descriptor, handler, message: source.message, lines, width, targets };
-      Object.defineProperty(component, "handleMouse", { configurable: true, writable: true, value: handler });
+      binding = { descriptor, handler, renderDescriptor, render, unregister: () => {}, message: source.message, lines, width, targets };
       bindings.set(component, binding);
+      try {
+        Object.defineProperty(component, "handleMouse", { configurable: true, writable: true, value: handler });
+        Object.defineProperty(component, "render", { configurable: true, writable: true, value: render });
+        binding.unregister = registerTranscriptRenderer(component, render);
+      } catch { removeBinding(component); return false; }
     }
     Object.assign(binding, { message: source.message, lines, width, targets });
     return component.handleMouse === binding.handler;
@@ -183,13 +262,7 @@ export function questionListVisibility(tui: TUI, pending: readonly PendingIdenti
           const offset = offsets.get(child);
           if (offset === undefined) continue;
           const rows = render(child);
-          const targets = new Map<number, ProseQuestion>();
-          const ambiguous = new Set<number>();
-          for (const question of source.questions) for (const row of proseRows(rows, question.id, question.question) ?? []) {
-            if (targets.has(row)) ambiguous.add(row);
-            else targets.set(row, question);
-          }
-          for (const row of ambiguous) targets.delete(row);
+          const targets = proseTargets(rows, source.questions);
           if (!bindProse(child, source, rows, contentWidth, targets)) continue;
           retained.add(child);
           // Visibility can suppress the only reminder only after native click routing exists.

@@ -392,7 +392,7 @@ export function registerQuestions(pi: ExtensionAPI, enabled: boolean): void {
           || ctx.sessionManager.getSessionId() !== sessionId || !ctx.sessionManager.buildContextEntries().some(entry =>
             entry.type === "message" && entry.message === message)) return false;
         return openCard(record, sessionId);
-      });
+      }, () => ctx.ui.theme);
       const dispose = () => { shouldShow.dispose(); viewportDisposers.delete(dispose); };
       viewportDisposers.add(dispose);
       let lastWidth = 0;

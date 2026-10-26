@@ -20,7 +20,7 @@ const { KeybindingsManager } = await fromPi("dist/core/keybindings.js");
 const { ToolExecutionComponent } = await fromPi("dist/modes/interactive/components/tool-execution.js");
 const themes = await fromPi("dist/modes/interactive/theme/theme.js");
 const tuiPath = requirePi.resolve("@earendil-works/pi-tui");
-const { Container, Text, Input, Spacer, visibleWidth, stripTerminalSequences, wrapTextWithAnsi, truncateToWidth, backgroundAnsi, parseColor, getOsc8LinkAtColumn, getCapabilities, setCapabilities } = await import(pathToFileURL(tuiPath).href);
+const { Container, Text, Input, Spacer, visibleWidth, stripTerminalSequences, wrapTextWithAnsi, truncateToWidth, backgroundAnsi, foregroundAnsi, parseColor, getOsc8LinkAtColumn, getCapabilities, setCapabilities } = await import(pathToFileURL(tuiPath).href);
 const { renderLayoutFrame, getLayoutBoxesAt, getScrollViewBox } = await import(pathToFileURL(join(dirname(tuiPath), "layout.js")).href);
 const { createChatViewport } = await fromPi("dist/modes/interactive/chat-viewport.js");
 themes.initTheme("dark", false);
@@ -40,9 +40,10 @@ async function harness(options = {}) {
   writeFileSync(path, `import {registerQuestions} from ${JSON.stringify(questionsPath)};
 import {registerPinnedPrompt} from ${JSON.stringify(resolve(dirname(questionsPath), "../styling/pinned-prompt.ts"))};
 import {registerGrouping} from ${JSON.stringify(resolve(dirname(questionsPath), "../styling/grouping.ts"))};
+import {registerAssistantPanels} from ${JSON.stringify(resolve(dirname(questionsPath), "../styling/assistant-panels.ts"))};
 import {defaults} from ${JSON.stringify(resolve(dirname(questionsPath), "../settings/interface.ts"))};
 ${options.instrument ? `import {registerTranscriptRenderer} from ${JSON.stringify(resolve(dirname(questionsPath), "../styling/transcript-measurement.ts"))}; globalThis.__questionTestRegisterRenderer = registerTranscriptRenderer;` : ""}
-export default pi => { registerQuestions(pi, ${options.enabled !== false}); ${options.pin ? "registerPinnedPrompt(pi, true);" : ""} ${options.grouping ? "registerGrouping(pi, defaults());" : ""} }`);
+export default pi => { registerQuestions(pi, ${options.enabled !== false}); ${options.pin ? "registerPinnedPrompt(pi, true);" : ""} ${options.grouping ? "registerGrouping(pi, defaults());" : ""} ${options.panels ? "registerAssistantPanels(pi, true);" : ""} }`);
   const loaded = await loadExtensions([path], scratch);
   assert.deepEqual(loaded.errors, []);
   const extension = loaded.extensions[0];
@@ -2339,6 +2340,122 @@ test("native prose visibility uses current entry message identity, never arbitra
   assert.equal(h.sent.length, 0);
 });
 
+test("native pending prose rows use question amber across wrapping, live palettes and conversation panels", async t => {
+  const { AssistantMessageComponent } = await fromPi("dist/modes/interactive/components/assistant-message.js");
+  for (const panels of [false, true]) {
+    const h = await harness({ panels });
+    const view = nativeQuestionView(h, { rows: 45, width: 60 });
+    let theme = themes.theme;
+    Object.defineProperty(h.ctx.ui, "theme", { get: () => theme });
+    const msg = assistant("Ordinary prose stays ordinary.\n\nQ2: Want me to make these three commits with the complete changes and regression tests?\n\n```text\nQ8: Fenced example?\n```\n\nExample:\nQ9: Sample question?\n\n> Q10: Quoted question?");
+    const snapshot = structuredClone(msg);
+    await h.message(msg);
+    assert.deepEqual(h.records().map(record => record.id), [2]);
+    const native = new AssistantMessageComponent(msg);
+    const original = native.render;
+    const descriptor = Object.getOwnPropertyDescriptor(native, "render");
+    view.chat.addChild(native);
+    view.frame();
+    assert.notEqual(native.render, original);
+    for (const appearance of ["dark", "light"]) for (const mode of ["truecolor", "256color"]) {
+      theme = themes.loadThemeFromPath(join(root, `dist/modes/interactive/theme/${appearance}.json`), mode);
+      const amber = backgroundAnsi(parseColor(appearance === "dark" ? "#594515" : "#fff0bf"), mode);
+      const foreground = foregroundAnsi(parseColor(appearance === "dark" ? "#ffff80" : "#5f0000"), mode);
+      for (const width of [60, 28, 75]) {
+        // Rendering before the reminder's next pass must recompute wrapped targets.
+        const rows = native.render(width);
+        const first = rows.findIndex(line => /Q2:/.test(stripTerminalSequences(line)));
+        const last = rows.findIndex(line => /tests\?/.test(stripTerminalSequences(line)));
+        assert.ok(first >= 0 && last > first, "the native question really wraps");
+        for (let y = 0; y < rows.length; y++) {
+          assert.equal(rows[y].includes(amber), y >= first && y <= last, `${panels}/${appearance}/${mode}/${width}: only actual pending question rows are amber`);
+          if (y >= first && y <= last) assert.ok(rows[y].includes(foreground), "native question text uses the question foreground, not ordinary assistant blue");
+        }
+        const frame = view.frame(width, 45);
+        const displayed = frame.lines.find(line => /Q2:/.test(stripTerminalSequences(line)));
+        assert.ok(displayed?.includes(amber) && displayed.includes(foreground), "the actual native fullscreen frame carries the question palette");
+        assert.equal(view.reminderVisible(), false, "the preserving render certificate still supports native measurement");
+      }
+    }
+    const noColor = process.env.NO_COLOR;
+    try {
+      process.env.NO_COLOR = "1";
+      assert.deepEqual(native.render(75), original.call(native, 75), "plain mode adds no styling or padding");
+    } finally {
+      if (noColor === undefined) delete process.env.NO_COLOR; else process.env.NO_COLOR = noColor;
+    }
+    assert.equal(view.click(/Q2:/)?.handled, true, "native question click survives coloring and resize");
+    assert.match(plain(h.current().component), /Q2 ·/);
+    h.current().component.handleInput("\x1b");
+    await new Promise(resolve => setImmediate(resolve));
+    await h.resolveQuestion({ question_id: 2, resolution: "dismissed", reason: "No longer needed" });
+    assert.deepEqual(Object.getOwnPropertyDescriptor(native, "render"), descriptor, "dismissal restores the original render property immediately");
+    assert.deepEqual(native.render(75), original.call(native, 75));
+    assert.equal(view.click(/Q2:/), undefined);
+    assert.deepEqual(msg, snapshot, "saved assistant content is unchanged");
+    await h.emit("session_shutdown");
+  }
+  t.diagnostic(`Pi host: ${root}`);
+});
+
+test("native prose repeated in fences or examples remains uncolored rather than guessing a target", async () => {
+  const { AssistantMessageComponent } = await fromPi("dist/modes/interactive/components/assistant-message.js");
+  for (const example of ["```text\nQ1: Is this the pending question?\n```", "Example:\nQ1: Is this the pending question?"]) {
+    const h = await harness({ panels: true });
+    const view = nativeQuestionView(h, { rows: 30 });
+    const msg = assistant(`Q1: Is this the pending question?\n\n${example}`);
+    await h.message(msg);
+    const native = new AssistantMessageComponent(msg);
+    const original = native.render;
+    view.chat.addChild(native);
+    assert.equal(view.reminderVisible(), true, "ambiguous rendered copies retain the reminder");
+    assert.equal(native.render, original, "ambiguous prose never acquires a color decorator");
+    const amber = backgroundAnsi(parseColor("#594515"), themes.theme.getColorMode());
+    assert.ok(!native.render(80).some(line => line.includes(amber)));
+    await h.emit("session_shutdown");
+  }
+});
+
+test("native prose render ownership rejects ambiguity, foreign renderers and stale retained decorators", async () => {
+  const h = await harness();
+  const view = nativeQuestionView(h, { rows: 30 });
+  const { AssistantMessageComponent } = await fromPi("dist/modes/interactive/components/assistant-message.js");
+  const msg = assistant("Q1: A uniquely identified question?");
+  await h.message(msg);
+  const native = new AssistantMessageComponent(msg);
+  const original = native.render;
+  const descriptor = Object.getOwnPropertyDescriptor(native, "render");
+  const mouse = native.handleMouse;
+  const amber = backgroundAnsi(parseColor("#594515"), themes.theme.getColorMode());
+  view.chat.addChild(native); view.frame();
+  const retained = native.render;
+  assert.ok(native.render(80).some(line => line.includes(amber)));
+  const duplicate = new AssistantMessageComponent(msg);
+  view.chat.addChild(duplicate);
+  assert.ok(!native.render(80).some(line => line.includes(amber)), "a newly ambiguous entry loses color before reminder measurement");
+  assert.equal(view.reminderVisible(), true);
+  assert.equal(native.render, original);
+  view.chat.removeChild(duplicate); view.frame();
+  const replacement = width => original.call(native, width).map(line => line.replace("uniquely", "foreignly"));
+  native.render = replacement;
+  assert.ok(!retained(80).some(line => line.includes(amber)), "retained wrappers cannot color another owner's render");
+  assert.equal(view.reminderVisible(), true);
+  assert.equal(native.render, replacement, "cleanup does not overwrite foreign render ownership");
+  assert.equal(native.handleMouse, mouse);
+  delete native.render;
+  await h.emit("session_tree"); view.frame();
+  assert.ok(native.render(80).some(line => line.includes(amber)));
+  view.tui.mode = "regular";
+  assert.ok(!native.render(80).some(line => line.includes(amber)));
+  view.frame();
+  assert.deepEqual(Object.getOwnPropertyDescriptor(native, "render"), descriptor);
+  view.tui.mode = "fullscreen"; view.frame();
+  const shutdownRender = native.render;
+  await h.emit("session_shutdown");
+  assert.deepEqual(Object.getOwnPropertyDescriptor(native, "render"), descriptor);
+  assert.deepEqual(shutdownRender(80), original.call(native, 80), "disposed decorators return native rows without pending color");
+});
+
 test("foreign question-body rendering cannot hide the offscreen reminder using stale metadata", async () => {
   const h = await harness();
   const view = nativeQuestionView(h, { rows: 35, width: 80 });
@@ -2395,10 +2512,11 @@ test("native prose adapters preserve links, selection and existing handlers; ref
   const h = await harness();
   const view = nativeQuestionView(h, { rows: 30, width: 90 });
   const { AssistantMessageComponent } = await fromPi("dist/modes/interactive/components/assistant-message.js");
-  const msg = assistant("Ordinary prose above the question.\n\nQ1: Is https://example.com the correct endpoint?");
+  const msg = assistant("Ordinary prose above the question.\n\n**Q1:** Is https://example.com the correct endpoint?");
   await h.message(msg);
   const native = new AssistantMessageComponent(msg);
   const inherited = native.handleMouse;
+  const originalRows = native.render(90);
   let nativeCalls = 0;
   const original = function(event) {
     nativeCalls++;
@@ -2412,6 +2530,7 @@ test("native prose adapters preserve links, selection and existing handlers; ref
   assert.notEqual(native.handleMouse, original);
   const lines = native.render(90);
   const y = lines.map(stripTerminalSequences).findIndex(line => /Q1:/.test(line));
+  assert.deepEqual(lines[y].match(/\x1b\]8;[\s\S]*?(?:\x07|\x1b\\)/g), originalRows[y].match(/\x1b\]8;[\s\S]*?(?:\x07|\x1b\\)/g), "OSC8 link payloads are preserved exactly");
   const event = { type: "click", button: "left", x: 3, y, width: 90, height: lines.length };
   for (const type of ["press", "drag", "release", "wheel"]) assert.equal(native.handleMouse({ ...event, type }), undefined, `${type} remains available to native selection/scrolling`);
   assert.equal(native.handleMouse({ ...event, button: "right" }), undefined);
@@ -2456,8 +2575,11 @@ test("native prose answer submission retires click targets without duplicating d
   await h.message(msg);
   const native = new AssistantMessageComponent(msg);
   const original = native.handleMouse;
+  const originalRender = native.render;
+  const amber = backgroundAnsi(parseColor("#594515"), themes.theme.getColorMode());
   view.chat.addChild(native);
   assert.equal(view.reminderVisible(), false);
+  assert.ok(native.render(80).filter(line => /Q[12]:/.test(stripTerminalSequences(line))).every(line => line.includes(amber)));
   view.frame(28, 30);
   assert.equal(view.click(/Q2:/)?.handled, true, "resize keeps the second question's native row bound to Q2");
   assert.match(plain(h.current().component), /Q2 ·/);
@@ -2465,6 +2587,12 @@ test("native prose answer submission retires click targets without duplicating d
   h.submitCustom("Keep the existing scope");
   await new Promise(resolve => setImmediate(resolve));
   assert.equal(native.handleMouse, original, "answer refresh removes old targets immediately");
+  assert.equal(native.render, originalRender, "answer refresh also removes the old color decorator immediately");
+  assert.ok(!native.render(28).some(line => line.includes(amber)));
+  view.frame();
+  const refreshedRows = native.render(28);
+  assert.ok(refreshedRows.find(line => /Q1:/.test(stripTerminalSequences(line))).includes(amber));
+  assert.ok(!refreshedRows.find(line => /Q2:/.test(stripTerminalSequences(line))).includes(amber), "only the still-pending question is recolored");
   assert.equal(h.latest().id, 2);
   assert.equal(h.latest().status, "answered");
   assert.equal(h.sent.length, 1);
