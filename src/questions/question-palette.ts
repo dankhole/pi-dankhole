@@ -5,7 +5,7 @@ import { backgroundAnsi, foregroundAnsi, parseColor, type TextAttributes } from 
 // apart from gray chat chrome; opaque neutral popup controls remain separate.
 // WCAG targets: text >= 4.5:1; meaningful focus/border cues >= 3:1.
 const colors = {
-  dark: { surface: "#1c1c1c", choice: "#262626", focused: "#3a3a3a", selected: "#303030", question: "#594515", questionSeparator: "#554214",
+  dark: { surface: "#1c1c1c", choice: "#262626", focused: "#3a3a3a", selected: "#303030", question: "#594515", questionSeparator: "#524013",
     questionText: "#ffff80", questionMuted: "#d7d7d7", questionAccent: "#afffff",
     text: "#eeeeee", muted: "#c6c6c6", accent: "#87d7ff", success: "#afffaf", warning: "#ffd787", border: "#a8a8a8" },
   light: { surface: "#eeeeee", choice: "#e4e4e4", focused: "#d0d0d0", selected: "#dadada", question: "#fff0bf", questionSeparator: "#e6d58c",
