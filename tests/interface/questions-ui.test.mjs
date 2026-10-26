@@ -391,8 +391,9 @@ test("real host mouse submission restores ordinary editor focus and accepts subs
   }
 });
 
-test("native host Up/Down includes custom input; one Enter submits and restores the ordinary editor", async () => {
-  for (const action of ["first", "second", "custom", "close", "escape", "dismiss"]) {
+test("native host keyboard and quick double-click submission restore the ordinary editor", async t => {
+  t.mock.method(Date, "now", () => 1000);
+  for (const action of ["first", "second", "custom", "close", "escape", "dismiss", "double-click"]) {
     const terminal = { rows: 32, columns: 120, kittyProtocolActive: false,
       start(input) { this.input = input; }, stop() {}, write() {}, hideCursor() {}, showCursor() {}, moveBy() {},
       clearLine() {}, clearFromCursor() {}, clearScreen() {}, setTitle() {}, setProgress() {} };
@@ -402,13 +403,13 @@ test("native host Up/Down includes custom input; one Enter submits and restores 
     const editor = new CustomEditor(tui, themes.getEditorTheme(), keybindings);
     editor.setText("ordinary draft"); tui.addChild(editor); tui.setFocus(editor);
     const host = Object.assign(Object.create(InteractiveMode.prototype), { ui: tui, editor, keybindings });
-    let component;
+    let component, handle;
     try {
       tui.start();
       const pending = host.showExtensionCustom((ui, theme, kb, done) => {
         component = createQuestionComponent(question, theme, kb, done, () => ui.requestRender(), () => ui.terminal.rows);
         return component;
-      }, { overlay: true, overlayOptions: { anchor: "center", width: "90%", margin: 1 } });
+      }, { overlay: true, overlayOptions: { anchor: "center", width: "90%", margin: 1 }, onHandle(value) { handle = value; } });
       await Promise.resolve(); tui.renderNow();
       const key = data => { terminal.input(data); tui.renderNow(); };
       key("\x1b[B"); key("\x1b[B");
@@ -423,9 +424,21 @@ test("native host Up/Down includes custom input; one Enter submits and restores 
       if (action === "second") key("\x1b[A");
       if (action === "close") { key("\t"); key("\t"); }
       if (action === "dismiss") { key("\t"); key("\t"); key("\t"); }
-      key(action === "escape" ? "\x1b" : "\r");
+      if (action === "double-click") {
+        const box = handle.getBounds();
+        const lines = plain(component.render(box.width));
+        const row = lines.findIndex(line => /2\. Second/.test(line));
+        const x = box.col + lines[row].indexOf("Second") + 1;
+        const y = box.row + row + 1;
+        for (let click = 0; click < 2; click++) {
+          terminal.input(`\x1b[<0;${x};${y}M`);
+          terminal.input(`\x1b[<0;${x};${y}m`);
+          if (!click) assert.equal(tui.hasOverlay(), true, "first native click only selects");
+        }
+        assert.equal(tui.hasOverlay(), false, "second native click submits and closes the overlay");
+      } else key(action === "escape" ? "\x1b" : "\r");
       const expected = action === "custom" ? { kind: "answer", answer: { text: "typed draft" } }
-        : action === "first" || action === "second" ? { kind: "answer", answer: { text: action === "first" ? "First" : "Second", optionIndex: action === "first" ? 0 : 1 } }
+        : ["first", "second", "double-click"].includes(action) ? { kind: "answer", answer: { text: action === "first" ? "First" : "Second", optionIndex: action === "first" ? 0 : 1 } }
         : { kind: action === "dismiss" ? "dismiss" : "defer" };
       assert.deepEqual(await pending, expected);
       assert.equal(tui.hasOverlay(), false);
@@ -620,8 +633,7 @@ test("fullscreen mouse stages options, focuses/edits custom text, and explicitly
   const y = f.row(/2\. Second/);
   assert.equal(f.mouse(y, "press"), undefined);
   assert.equal(f.mouse(y).handled, true);
-  f.mouse(y, "click", { clickCount: 2 });
-  assert.deepEqual(f.results, []);
+  assert.deepEqual(f.results, [], "a single click only stages the option");
   assert.equal(f.mouse(f.row(/>\* 2\./), "click", { button: "right" }), undefined);
   const inputY = f.row(/Type your own answer/);
   assert.equal(f.mouse(inputY, "press").focus, true);
@@ -629,6 +641,49 @@ test("fullscreen mouse stages options, focuses/edits custom text, and explicitly
   f.key("mouse answer");
   f.mouse(f.row(/Submit answer/));
   assert.deepEqual(f.results, [{ kind: "answer", answer: { text: "mouse answer" } }]);
+});
+
+test("only a quick native double-click submits an option, exactly once", t => {
+  let now = 1000;
+  t.mock.method(Date, "now", () => now);
+  for (const delay of [0, 100, 300, 301, 500]) {
+    const f = setup();
+    const y = f.row(/2\. Second/);
+    f.mouse(y, "click", { clickCount: 1 });
+    assert.deepEqual(f.results, []);
+    now += delay;
+    const result = f.mouse(y, "click", { clickCount: 2 });
+    if (delay <= 300) {
+      assert.deepEqual(f.results, [{ kind: "answer", answer: { text: "Second", optionIndex: 1 } }]);
+      assert.equal(result.focus, false, "a completed overlay must not reclaim editor focus");
+      f.mouse(y, "click", { clickCount: 3 });
+      assert.equal(f.results.length, 1);
+    } else assert.deepEqual(f.results, [], "slow repeat clicks remain selection only");
+  }
+});
+
+test("double-click submission requires the same option without an intervening interaction", t => {
+  let now = 1000;
+  t.mock.method(Date, "now", () => now);
+  for (const interrupt of [
+    f => f.mouse(f.row(/1\. First/)),
+    f => f.key("\x1b[A"),
+    f => f.mouse(f.row(/2\. Second/), "wheel", { button: "none", wheelDelta: 1 }),
+    f => f.mouse(f.row(/Which target/)),
+    f => f.mouse(f.row(/Custom answer:/), "press"),
+    f => { f.ui.focused = false; f.ui.focused = true; },
+    f => f.lines(60),
+  ]) {
+    const f = setup();
+    f.mouse(f.row(/2\. Second/), "click", { clickCount: 1 });
+    interrupt(f);
+    now += 100;
+    f.mouse(f.row(/2\. Second/), "click", { clickCount: 2 });
+    assert.deepEqual(f.results, []);
+  }
+  const fresh = setup();
+  fresh.mouse(fresh.row(/2\. Second/), "click", { clickCount: 2 });
+  assert.deepEqual(fresh.results, [], "an opening click cannot double-click-submit a fresh overlay");
 });
 
 test("long cards stay bounded and all content is reachable through keyboard and wheel scrolling", () => {

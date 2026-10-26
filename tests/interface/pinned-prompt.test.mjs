@@ -611,8 +611,9 @@ test("full extension wiring combines all UI features and cleans on reload", asyn
     const pending = view.widgets.get("compact-tools:questions");
     const pendingRows = pending.render(90);
     assert.equal(pendingRows.length, 3, "one top spacer, question text, and one bottom spacer without a header");
-    assert.equal(pendingRows[0], "");
-    assert.equal(pendingRows.at(-1), "");
+    assert.equal(plain(pendingRows[0]), " ".repeat(90));
+    assert.match(pendingRows[0], /\x1b\[48;/, "top buffer is filled rather than terminal gray");
+    assert.equal(pendingRows.at(-1), pendingRows[0], "bottom buffer uses the same dark amber");
     assert.equal(pending.handleMouse({ type: "click", button: "left", x: 3, y: 2 }), undefined, "reminder bottom spacing has no answer target");
     assert.match(plain(pendingRows[1]), /Q1: Keep the ordinary input available/);
     assert.doesNotMatch(pendingRows.map(plain).join("\n"), /Questions ·|\d+ pending/);

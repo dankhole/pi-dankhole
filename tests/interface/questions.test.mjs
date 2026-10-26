@@ -281,10 +281,10 @@ test("headerless question entries are full-width colored click targets in both t
     }
     const lines = widget.render(100);
     assert.equal(lines.length, 3);
-    assert.equal(lines[0], "", "one unfilled row separates the reminder from the transcript");
+    assert.equal(stripTerminalSequences(lines[0]), " ".repeat(100), "one filled amber row separates the reminder from the transcript");
     assert.match(stripTerminalSequences(lines[1]), /Q1: Readable scope/);
     assert.doesNotMatch(lines.map(stripTerminalSequences).join("\n"), /Questions ·|\d+ pending/);
-    assert.equal(lines.at(-1), "", "one unfilled bottom row separates the reminder from the input");
+    assert.equal(lines.at(-1), lines[0], "matching amber buffers surround the reminder");
     assert.equal(widget.handleMouse({ type: "click", button: "left", x: 99, y: 2 }), undefined, "bottom spacing has no stale target from narrower wrapping");
     assert.equal(h.dialogs.length, 0);
     assert.equal(visibleWidth(lines[1]), 100, "entry padding is colored and clickable");
@@ -720,8 +720,8 @@ test("every scrolled continuation row keeps its question ID at the smallest list
     for (let offset = 0; offset < expected.length; offset++) {
       const lines = widget.render(width);
       assert.equal(lines.length, 4, "tiny list reserves one scrollable content row and a hint within both spacers");
-      assert.equal(lines[0], "", "only one top separator remains");
-      assert.equal(lines[3], "", "one bottom separator remains inside the same row budget");
+      assert.equal(stripTerminalSequences(lines[0]), " ".repeat(width), "one filled top separator remains");
+      assert.equal(lines[3], lines[0], "matching bottom separator remains inside the same row budget");
       assert.ok(lines.every(line => visibleWidth(line) <= width));
       const row = expected[offset];
       visited.add(offset);
@@ -841,8 +841,8 @@ test("list is always expanded and headerless across refresh; only entries open o
   for (const width of [1, 15, 100]) {
     const lines = widget.render(width);
     assert.ok(lines.length >= 3);
-    assert.equal(lines[0], "");
-    assert.equal(lines.at(-1), "");
+    assert.equal(stripTerminalSequences(lines[0]), " ".repeat(width));
+    assert.equal(lines.at(-1), lines[0]);
     for (const line of lines) assert.ok(visibleWidth(line) <= width);
   }
   await h.emit("agent_settled");
@@ -863,7 +863,7 @@ test("list is always expanded and headerless across refresh; only entries open o
   assert.equal(h.dialogs.length, 1, "new questions never open automatically");
 });
 
-test("Questions widget has neutral outer padding, an amber inter-question gap and no residual empty padding", async () => {
+test("Questions widget has matching amber outer buffers and inter-question gap, without residual empty padding", async () => {
   const h = await harness();
   assert.equal(h.widgets.has(statusKey), false);
   for (const question of ["First?", "Second?"]) await h.ask({ question });
@@ -872,10 +872,9 @@ test("Questions widget has neutral outer padding, an amber inter-question gap an
   assert.equal(lines.length, 5, "one top and one bottom spacer surround separated entries, without a heading");
   assert.doesNotMatch(lines.map(stripTerminalSequences).join("\n"), /Questions ·|\d+ pending/);
   for (const y of [0, 2, 4]) {
-    if (y === 2) {
-      assert.equal(stripTerminalSequences(lines[y]), " ".repeat(80), "inter-question gap keeps its full-width amber fill");
-      assert.ok(lines[y].includes(backgroundAnsi(parseColor(themes.theme.appearance === "light" ? "#e6d58c" : "#3d351b"), themes.theme.getColorMode())));
-    } else assert.equal(lines[y], "", "outer padding stays neutral");
+    assert.equal(stripTerminalSequences(lines[y]), " ".repeat(80), "outer buffers and inter-question gap have full-width amber fill");
+    assert.ok(lines[y].includes(backgroundAnsi(parseColor(themes.theme.appearance === "light" ? "#e6d58c" : "#3d351b"), themes.theme.getColorMode())));
+    assert.equal(lines[y], lines[2], "all three spacers use the same darker amber");
     assert.equal(widget.handleMouse({ type: "click", button: "left", x: 3, y }), undefined, "padding and separator are not click targets");
   }
   assert.match(stripTerminalSequences(lines[1]), /Q1: First/);
@@ -883,7 +882,7 @@ test("Questions widget has neutral outer padding, an amber inter-question gap an
   const background = line => line.match(/\x1b\[48;[^m]+m/)?.[0];
   assert.ok(background(lines[1]), "question row has an explicit background");
   assert.equal(background(lines[3]), background(lines[1]), "question rows share the same amber fill");
-  assert.equal(lines.at(-1), "");
+  assert.equal(lines.at(-1), lines[0]);
   for (const [x, y] of [[3, 5], [80, 3], [-1, 3], [3, -1]]) {
     assert.equal(widget.handleMouse({ type: "click", button: "left", x, y }), undefined, "out-of-bounds positions are inert");
   }
@@ -927,7 +926,7 @@ test("installed viewport keeps Questions outer spacing and ordinary input intact
     assert.match(frame().lines.map(stripTerminalSequences).join("\n"), /Unsent ordinary draft/);
     assert.equal(h.dialogs.length, 0);
     const beforePaddingClick = widget.render(48);
-    assert.equal(beforePaddingClick[0], "");
+    assert.equal(stripTerminalSequences(beforePaddingClick[0]), " ".repeat(48));
     assert.equal(widget.handleMouse({ type: "click", button: "left", x: 3, y: 0 }), undefined);
     assert.deepEqual(widget.render(48), beforePaddingClick, "top spacing is not a collapse control");
     assert.equal(h.dialogs.length, 0);
@@ -2257,7 +2256,7 @@ test("native fullscreen resize and follow-end decisions do not feed the reminder
   const visibleList = view.list();
   const visibleRows = visibleList.render(64);
   assert.equal(visibleRows.length, 3, "offscreen single question reserves exactly its text and both outer spacers");
-  assert.equal(visibleRows.at(-1), "");
+  assert.equal(visibleRows.at(-1), visibleRows[0]);
   assert.equal(visibleList.handleMouse({ type: "click", button: "left", x: 3, y: 2 }), undefined, "visible reminder bottom spacer is inert");
   view.chat.removeChild(filler);
   assert.equal(view.reminderVisible(), false, "newly visible question restores full transcript space immediately");

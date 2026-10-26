@@ -62,6 +62,8 @@ export class QuestionComponent implements Component, Focusable {
   private inputWidth = 0;
   private paste: string | undefined;
   private pasteOverflow = false;
+  private optionClick?: { option: number; at: number };
+  private lastAvailable = 0;
 
   constructor(
     question: QuestionView,
@@ -90,13 +92,14 @@ export class QuestionComponent implements Component, Focusable {
   }
 
   get focused(): boolean { return this.hasFocus; }
-  set focused(value: boolean) { this.hasFocus = value; this.syncFocus(); }
+  set focused(value: boolean) { this.hasFocus = value; if (!value) this.optionClick = undefined; this.syncFocus(); }
   private syncFocus(): void { this.input.focused = this.hasFocus && this.focus === "custom" && !this.finished; }
   invalidate(): void { this.rowsWidth = -1; this.input.invalidate(); }
   private refresh(): void { this.syncFocus(); this.requestRender(); }
   private setFocus(focus: Focus): void {
     this.focus = focus;
     if (focus === "custom") {
+      this.optionClick = undefined;
       // Focus changes the answer source even before typing. Keep the editable
       // draft, but never leave an earlier option staged behind an empty input.
       this.selected = undefined;
@@ -187,6 +190,7 @@ export class QuestionComponent implements Component, Focusable {
 
   handleInput(data: string): void {
     if (this.finished) return;
+    this.optionClick = undefined;
     const kb = this.keybindings;
     if (matchesKey(data, Key.escape) || matchesKey(data, Key.ctrl("c")) || kb.matches(data, "tui.select.cancel")) {
       this.complete({ kind: "defer" }); return;
@@ -219,6 +223,7 @@ export class QuestionComponent implements Component, Focusable {
   }
 
   private scrollBy(delta: number): void {
+    this.optionClick = undefined;
     this.scroll = Math.max(0, Math.min(Math.max(0, this.rows.length - this.bodyRows), this.scroll + delta));
     this.revealCursor = false;
     this.refresh();
@@ -229,7 +234,7 @@ export class QuestionComponent implements Component, Focusable {
       this.scrollBy(Math.sign(event.wheelDelta) * Math.min(this.bodyRows, Math.max(1, Math.abs(event.wheelDelta))));
       return { handled: true, render: true };
     }
-    if (event.button !== "left") return undefined;
+    if (event.button !== "left" || event.type === "drag") { this.optionClick = undefined; return undefined; }
     if (event.y === this.inputRow && event.x >= this.bodyColumn && event.x < this.bodyColumn + this.bodyWidth
       && (event.type === "press" || event.type === "click")) {
       this.setFocus("custom");
@@ -245,10 +250,20 @@ export class QuestionComponent implements Component, Focusable {
       && event.y >= this.bodyRow && event.y < this.bodyRow + this.bodyRows) {
       const option = this.rows[this.scroll + event.y - this.bodyRow]?.option;
       if (option !== undefined) {
+        const now = Date.now();
+        const previous = this.optionClick;
+        const plainClick = !event.shift && !event.alt && !event.ctrl;
+        const doubleClick = plainClick && event.clickCount === 2 && previous?.option === option
+          && now >= previous.at && now - previous.at <= 300;
+        this.optionClick = plainClick ? { option, at: now } : undefined;
         this.select(option);
-        return { handled: true, focus: true, render: true };
+        if (doubleClick) this.submit();
+        // Refocusing the current component toggles its focus off/on in Pi,
+        // which would clear the first click. Never reclaim focus after completion.
+        return { handled: true, focus: !this.finished && !this.hasFocus, render: true };
       }
     }
+    this.optionClick = undefined;
     const button = this.buttons.find(button => event.y === button.row && event.x >= button.column && event.x < button.end);
     if (button) {
       this.focus = button.action;
@@ -288,6 +303,8 @@ export class QuestionComponent implements Component, Focusable {
     const available = height !== undefined && Number.isFinite(height)
       ? Math.max(1, Math.min(Math.floor(height * .9), Math.floor(height) - 2)) : 16;
     const columns = Number.isFinite(width) ? Math.max(0, Math.min(4096, Math.floor(width))) : 0;
+    if (columns !== this.lastWidth || available !== this.lastAvailable) this.optionClick = undefined;
+    this.lastAvailable = available;
     this.lastWidth = columns;
     this.lastHeight = 0;
     this.inputRow = -1;

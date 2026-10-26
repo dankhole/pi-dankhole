@@ -409,7 +409,8 @@ export function registerQuestions(pi: ExtensionAPI, enabled: boolean): void {
           targets = [];
           lastHeight = 0;
           if (width <= 0 || !shouldShow(width)) return [];
-          const lines = [""]; // Keep one neutral buffer above and below the reminder.
+          const separator = questionPlain() ? "" : questionPaint(theme, " ".repeat(width), "questionSeparator");
+          const lines = [separator]; // Match the outer buffers to the inter-question separators.
           if (wrappedWidth !== width) {
             wrappedWidth = width;
             body = [];
@@ -432,10 +433,10 @@ export function registerQuestions(pi: ExtensionAPI, enabled: boolean): void {
           for (const row of body.slice(listOffset, listOffset + capacity)) {
             targets[lines.length] = row.record;
             lines.push(row.record ? questionStyle(theme, truncateToWidth(row.text, width, "", true), "text", "question")
-              : questionPlain() ? "" : questionPaint(theme, " ".repeat(width), "questionSeparator"));
+              : separator);
           }
           if (hint) lines.push(questionStyle(theme, truncateToWidth(`  Rows ${listOffset + 1}–${Math.min(body.length, listOffset + capacity)}/${body.length} · wheel to scroll`, width), "muted"));
-          lines.push(""); // Neutral terminal background; never a question click target.
+          lines.push(separator); // Buffer rows are never question click targets.
           lastHeight = lines.length;
           // Width helpers can add reset sequences even to otherwise plain text.
           return questionPlain() ? lines.map(stripTerminalSequences) : lines;
