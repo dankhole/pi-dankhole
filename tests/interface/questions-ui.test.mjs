@@ -823,17 +823,23 @@ function contrast(fg, bg) {
   return (Math.max(first, second) + .05) / (Math.min(first, second) + .05);
 }
 
-test("transcript/list text and backgrounds match the header and retain readable contrast", () => {
+test("amber transcript/list cards match the header, contrast with gray chrome, and keep readable text", () => {
   for (const appearance of ["dark", "light"]) for (const mode of ["truecolor", "256color"]) {
     const theme = themes.loadThemeFromPath(join(root, `dist/modes/interactive/theme/${appearance}.json`), mode);
-    const header = ansiCells(questionStyle(theme, "Header", "warning", "choice"))[0];
+    const header = ansiCells(questionStyle(theme, "Header", "warning", "question"))[0];
     const body = ansiCells(questionStyle(theme, "Body", "text", "question"))[0];
     const modal = ansiCells(questionStyle(theme, "Modal", "text", "surface"))[0];
     assert.ok(contrast(header.fg, header.bg) >= 4.5, "restored warm header retains readable contrast");
     assert.equal(body.fg, header.fg, "question text matches the header foreground");
     assert.equal(body.bg, header.bg, "question text matches the header background");
     assert.deepEqual(rgbFromAnsi(body.fg), appearance === "dark" ? [255, 215, 135] : [95, 0, 0], "question foreground stays warm yellow/dark red");
-    assert.deepEqual(rgbFromAnsi(body.bg), appearance === "dark" ? [38, 38, 38] : [228, 228, 228], "question background retains the exact neutral palette");
+    const expectedBackground = mode === "truecolor"
+      ? appearance === "dark" ? [89, 69, 21] : [255, 240, 191]
+      : appearance === "dark" ? [95, 95, 0] : [255, 255, 175];
+    assert.deepEqual(rgbFromAnsi(body.bg), expectedBackground, "amber survives terminal color quantization");
+    const chrome = ansiCells(questionStyle(theme, "Chrome", "text", "choice"))[0];
+    assert.notEqual(body.bg, chrome.bg, "cards no longer blend into generic gray controls");
+    assert.ok(contrast(body.bg, chrome.bg) >= (appearance === "dark" ? 1.6 : 1.1), "question fill is separated from gray chrome");
     for (const width of [1, 2, 5, 80]) {
       const cells = ansiCells(questionPaint(theme, " ".repeat(width), "question"));
       assert.equal(cells.length, width);
@@ -844,8 +850,9 @@ test("transcript/list text and backgrounds match the header and retain readable 
       const line = questionPaint(theme, questionStyle(theme, "Question", tone, "question") + "  ", "question");
       for (const cell of ansiCells(line)) {
         assert.equal(cell.bg, header.bg, `${appearance}/${mode}: body matches header`);
-        assert.equal(new Set(rgbFromAnsi(cell.bg)).size, 1, "question fills are neutral gray, never blue");
-        assert.ok(contrast(cell.fg, cell.bg) >= 4.5, `${appearance}/${mode}/${tone}: readable neutral panel`);
+        const [red, green, blue] = rgbFromAnsi(cell.bg);
+        assert.ok(red >= green && green > blue, "question fills stay yellow/amber, never neutral gray or blue");
+        assert.ok(contrast(cell.fg, cell.bg) >= 4.5, `${appearance}/${mode}/${tone}: readable amber panel`);
       }
     }
   }

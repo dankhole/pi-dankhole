@@ -80,6 +80,24 @@ export function getChildLineOffset(chat: unknown, target: Component, width: numb
   return undefined;
 }
 
+/** Measure all displayed direct children in one projection-aware pass. Refreshes the
+ * projection once; callers can reuse their own per-pass component measurements.
+ */
+export function getChildLineOffsets(chat: unknown, width: number,
+  measure: (component: Component) => number = component => component.render(width).length): Map<Component, number> | undefined {
+  if (!container(chat)) return undefined;
+  chat.render(width);
+  const projection = projections.get(chat);
+  const children = projection && chat.render === projection.render ? projection.view.children : chat.children;
+  const offsets = new Map<Component, number>();
+  let offset = 0;
+  for (const child of children) {
+    offsets.set(child, offset);
+    offset += measure(child);
+  }
+  return offsets;
+}
+
 export interface GroupingOptions {
   theme: () => Theme;
   requestRender: () => void;

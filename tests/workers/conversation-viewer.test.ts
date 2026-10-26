@@ -164,7 +164,7 @@ describe("ConversationViewer cost display", () => {
     // so this reads the record, and would show nothing if it did not.
     const out = header(true, 0.0042);
     expect(out).toContain("1.2k token");
-    expect(out).toContain("~$0.0042");
+    expect(out).toContain("~$0");
   });
 
   it("shows no cost when disabled", () => {

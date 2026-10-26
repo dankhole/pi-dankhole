@@ -105,28 +105,13 @@ export function formatTokens(count: number): string {
 }
 
 /**
- * Format a cost as `~$0.0042`, or "" when there is nothing to show.
- *
- * The tilde is load-bearing: this is pi's own estimate from the model's listed
- * rates, not a billed figure, and the surfaces that print it sit next to token
- * counts that ARE exact.
- *
- * Nothing is printed for zero, which is also what a model with no pricing data
- * reports: `$0.00` beside a local model's tokens would claim its cost was
- * measured and found to be nothing, rather than never measured at all. For the
- * same reason a real cost too small for four decimals reads `<$0.0001` — it was
- * measured, and rounding it to `~$0.0000` would say the opposite.
+ * Display estimated cost rounded to whole dollars; raw accounting stays unchanged.
+ * Keep the estimate marker even for positive costs rounded to `~$0`.
+ * Exact zero (also reported by unpriced models), negative costs and NaN stay hidden.
  */
 export function formatCost(cost: number): string {
-  if (!(cost > 0)) return "";                     // also catches NaN
-  if (cost < 0.0001) return "<$0.0001";
-  if (cost >= 1) return `~$${cost.toFixed(2)}`;
-  // Under a dollar: cents at minimum, four decimals at most, nothing trailing.
-  // Most single runs land between a tenth of a cent and a dime, where rounding
-  // to cents would collapse a 4x difference in spend into the same figure.
-  const rounded = Number(cost.toFixed(4));
-  const decimals = (String(rounded).split(".")[1] ?? "").length;
-  return `~$${rounded.toFixed(Math.max(2, decimals))}`;
+  if (!(cost > 0)) return "";
+  return `~$${Math.round(cost)}`;
 }
 
 /**
@@ -163,9 +148,9 @@ export function formatTurns(turnCount: number, maxTurns?: number | null): string
   return maxTurns != null ? `↻${turnCount}≤${maxTurns}` : `↻${turnCount}`;
 }
 
-/** Format milliseconds as human-readable duration. */
+/** Display elapsed milliseconds rounded to whole minutes, starting at `0m`. */
 export function formatMs(ms: number): string {
-  return `${(ms / 1000).toFixed(1)}s`;
+  return `${Math.max(0, Math.round(ms / 60_000))}m`;
 }
 
 /** Format duration from start/completed timestamps. */

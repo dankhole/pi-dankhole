@@ -1,7 +1,7 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { renderRunningAgentStatus } from "../../src/workers/index.js";
 import type { WidgetMode } from "../../src/workers/types.js";
-import { type AgentActivity, AgentWidget, fgPreservingNestedStyles, formatCost, formatSessionTokens } from "../../src/workers/ui/agent-widget.js";
+import { type AgentActivity, AgentWidget, fgPreservingNestedStyles, formatCost, formatDuration, formatMs, formatSessionTokens } from "../../src/workers/ui/agent-widget.js";
 
 describe("formatSessionTokens", () => {
   const theme = { fg: (c: string, s: string) => `<${c}>${s}</${c}>`, bold: (s: string) => s };
@@ -233,52 +233,58 @@ describe("AgentWidget", () => {
 // That happens exactly when the concurrency limit is saturated, i.e. when the
 // queue is the thing the user most needs to see.
 describe("formatCost", () => {
-  it("keeps the precision that distinguishes one run from another", () => {
-    // Rounding to cents would print the same figure for a run that cost four
-    // times another — the band most single subagent runs fall in.
-    expect(formatCost(0.0042)).toBe("~$0.0042");
-    expect(formatCost(0.0123)).toBe("~$0.0123");
-    expect(formatCost(1.239)).toBe("~$1.24");
+  it.each([
+    [0.00002, "~$0"], [0.0042, "~$0"], [0.4999, "~$0"],
+    [0.5, "~$1"], [0.8534, "~$1"], [1.239, "~$1"],
+    [1.4999, "~$1"], [1.5, "~$2"], [12, "~$12"],
+  ])("rounds %s to whole estimated dollars (%s)", (cost, expected) => {
+    expect(formatCost(cost)).toBe(expected);
   });
 
-  it("never pads a round figure with noise, nor cuts it below cents", () => {
-    expect(formatCost(0.05)).toBe("~$0.05");    // not ~$0.0500
-    expect(formatCost(0.4)).toBe("~$0.40");     // not ~$0.4
-    expect(formatCost(12)).toBe("~$12.00");
-  });
-
-  it("shows nothing when there is nothing to show", () => {
-    // Zero is what a model with no pricing data reports, so `$0.00` would claim
-    // a measurement that was never made.
+  it("keeps exact zero/unpriced, negative and invalid costs hidden", () => {
     expect(formatCost(0)).toBe("");
     expect(formatCost(Number.NaN)).toBe("");
     expect(formatCost(-1)).toBe("");
   });
+});
 
-  it("says a real but tiny cost is tiny, not zero", () => {
-    // The distinction the whole helper turns on: "measured, below what four
-    // decimals can show" must not render the same as "never measured".
-    expect(formatCost(0.00002)).toBe("<$0.0001");
-    expect(formatCost(0)).toBe("");
+describe("elapsed minute formatting", () => {
+  it.each([
+    [0, "0m"], [29_999, "0m"], [30_000, "1m"], [60_000, "1m"],
+    [89_999, "1m"], [90_000, "2m"], [811_100, "14m"],
+    [3_600_000, "60m"], [-1, "0m"],
+  ])("rounds %sms to %s", (ms, expected) => {
+    expect(formatMs(ms)).toBe(expected);
   });
 
-  it("marks the figure as an estimate", () => {
-    // The tilde is the whole disclaimer — it sits beside exact token counts.
-    expect(formatCost(0.5).startsWith("~")).toBe(true);
+  it("counts up live and freezes the completed duration without changing timestamps", () => {
+    const now = vi.spyOn(Date, "now");
+    const start = 100_000;
+    try {
+      now.mockReturnValue(start + 29_999);
+      expect(formatDuration(start)).toBe("0m (running)");
+      now.mockReturnValue(start + 30_000);
+      expect(formatDuration(start)).toBe("1m (running)");
+      now.mockReturnValue(start + 90_000);
+      expect(formatDuration(start)).toBe("2m (running)");
+      expect(formatDuration(start, start + 30_000)).toBe("1m");
+    } finally {
+      now.mockRestore();
+    }
   });
 });
 
 describe("AgentWidget cost display", () => {
   const theme = { fg: (_c: string, s: string) => s, bold: (s: string) => s };
 
-  function render(showCost: boolean, cost: number): string {
+  function render(showCost: boolean, cost: number, elapsed = 0): string {
     const agent = {
       id: "a1",
 
       description: "spending agent",
       status: "running",
       toolUses: 1,
-      startedAt: Date.now(),
+      startedAt: Date.now() - elapsed,
       lifetimeUsage: { input: 1000, output: 200, cacheWrite: 0, cost },
       compactionCount: 0,
     };
@@ -304,10 +310,16 @@ describe("AgentWidget cost display", () => {
     return factory({ terminal: { columns: 200 }, requestRender: () => {} }, theme).render().join("\n");
   }
 
+  it("rounds the widget’s cost and elapsed time without seconds or fractional dollars", () => {
+    expect(render(true, 0.8534, 811_100)).toContain("~$1 · 14m");
+    expect(render(true, 0.0042)).toContain("~$0 · 0m");
+    expect(render(true, 0.8534, 811_100)).not.toMatch(/\$\d+\.|\d+(?:\.\d+)?s\b/);
+  });
+
   it("shows the cost beside the token count when enabled", () => {
     const line = render(true, 0.0042);
     expect(line).toContain("1.2k token");
-    expect(line).toContain("~$0.0042");
+    expect(line).toContain("~$0");
   });
 
   it("shows no cost when disabled", () => {
@@ -343,7 +355,7 @@ describe("AgentWidget cost display", () => {
     expect(out).toContain("done agent");
     expect(out.match(/done agent/g)).toHaveLength(1);
     expect(out).not.toMatch(/tool uses?|general-purpose|\(twin\)/);
-    expect(out).toContain("~$0.0042");
+    expect(out).toContain("~$0");
   });
 
   it("shows stats for an agent nobody is tracking live", () => {
@@ -364,7 +376,7 @@ describe("AgentWidget cost display", () => {
     const out = factory({ terminal: { columns: 200 }, requestRender: () => {} }, theme).render().join("\n");
 
     expect(out).toContain("1.2k token");
-    expect(out).toContain("~$0.0042");
+    expect(out).toContain("~$0");
   });
 
   it("defaults to hiding it", () => {

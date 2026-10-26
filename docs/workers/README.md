@@ -80,6 +80,8 @@ Stopped, failed and turn-limited work is distinguished from normal completion; a
 - **Conversation viewer:** live transcript with scrolling, Markdown controls, steering and stopping. Enter opens the steering composer; `x` twice stops the worker. Escape returns to the parent without stopping it. Detailed metrics remain available here.
 - **`/agents`:** worker conversations and settings. No profile creation, type management, scheduler or workflow menus.
 
+Worker usage displays round elapsed time to the nearest whole minute (`0m` below 30 seconds, `1m` at 30 seconds, `2m` at 90 seconds), counting up while running. Estimated costs round to the nearest whole dollar with the `~$` marker (`~$0` for positive costs below $0.50, `~$1` at $0.50). Exact zero/unpriced costs remain hidden. These display rules apply across the widget, FleetView, conversation viewer, completion cards and tool summaries; raw usage, costs and timestamps retain their precision.
+
 Fullscreen viewers retain mouse-wheel scrolling, scrollbar interaction and jump-to-latest controls. Regular-mode viewers retain the centered overlay. Finished workers remain briefly visible; a viewer already open on a finishing worker stays open.
 
 **Section colors** remain opt-in through `sectionColors` or `/agents → Settings`. The goal uses primary text, the model uses the syntax-variable color, and thinking uses the medium-thinking color. Separators, metrics and activity stay dim; status and context warning/error colors are preserved. This does not enable model display by itself.

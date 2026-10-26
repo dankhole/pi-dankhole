@@ -148,14 +148,14 @@ function harness(
 }
 
 describe("formatFleetElapsed", () => {
-  it("renders integer seconds (no decimal, no suffix)", () => {
-    expect(formatFleetElapsed(0)).toBe("0s");
-    expect(formatFleetElapsed(11_000)).toBe("11s");
-    expect(formatFleetElapsed(11_400)).toBe("11s");
-    expect(formatFleetElapsed(11_600)).toBe("12s");
+  it.each([
+    [0, "0m"], [29_999, "0m"], [30_000, "1m"],
+    [89_999, "1m"], [90_000, "2m"], [811_100, "14m"],
+  ])("rounds %sms to whole minutes (%s)", (ms, expected) => {
+    expect(formatFleetElapsed(ms)).toBe(expected);
   });
-  it("floors negatives to 0s", () => {
-    expect(formatFleetElapsed(-500)).toBe("0s");
+  it("clamps negatives to 0m", () => {
+    expect(formatFleetElapsed(-500)).toBe("0m");
   });
 });
 
@@ -217,13 +217,13 @@ describe("FleetList navigation", () => {
     // Selection marker keeps accent color; row content uses primary text color.
     expect(selected).toContain("<accent>●</accent>");
     expect(selected).toContain("<text>one</text>");
-    expect(selected).toMatch(/<text>\d+s · ↓ [\d.]+k? tokens<\/text>/);
+    expect(selected).toMatch(/<text>\d+m · ↓ [\d.]+k? tokens<\/text>/);
     expect(plain(selected).match(/one/g)).toHaveLength(1);
     expect(selected).not.toMatch(/general-purpose|\(twin\)/);
     // Inactive rows keep the muted/dim treatment.
     const unselected = h.render().find(l => l.includes("two"))!;
     expect(unselected).toContain("<dim>○</dim>");
-    expect(unselected).toMatch(/<dim>\d+s · ↓ [\d.]+k? tokens<\/dim>/);
+    expect(unselected).toMatch(/<dim>\d+m · ↓ [\d.]+k? tokens<\/dim>/);
     expect(unselected).not.toContain("<text>");
   });
 
@@ -391,7 +391,7 @@ describe("FleetList rendering", () => {
     expect(plain(agentLine).match(/Sleep then report 1/g)).toHaveLength(1);
     expect(agentLine).not.toMatch(/general-purpose|\(twin\)/);
     expect(agentLine).toContain("↓ 13.1k tokens");
-    expect(agentLine).toMatch(/\d+s · ↓/); // "<seconds>s · ↓ ..." (timing-agnostic)
+    expect(agentLine).toMatch(/\d+m · ↓/); // whole minutes, then tokens
   });
 
   it("orders agents earliest-launched first (top)", () => {
@@ -610,7 +610,7 @@ describe("FleetList cost display", () => {
   it("appends the cost after the token count when enabled", () => {
     const out = row(true, 0.0042);
     expect(out).toContain("13.1k tokens");
-    expect(out).toContain("~$0.0042");
+    expect(out).toContain("~$0");
   });
 
   it("shows no cost when disabled, and none for an unpriced model", () => {

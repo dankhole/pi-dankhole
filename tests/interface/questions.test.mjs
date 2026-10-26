@@ -20,8 +20,8 @@ const { KeybindingsManager } = await fromPi("dist/core/keybindings.js");
 const { ToolExecutionComponent } = await fromPi("dist/modes/interactive/components/tool-execution.js");
 const themes = await fromPi("dist/modes/interactive/theme/theme.js");
 const tuiPath = requirePi.resolve("@earendil-works/pi-tui");
-const { Container, Text, Input, visibleWidth, stripTerminalSequences, wrapTextWithAnsi } = await import(pathToFileURL(tuiPath).href);
-const { renderLayoutFrame, getLayoutBoxesAt } = await import(pathToFileURL(join(dirname(tuiPath), "layout.js")).href);
+const { Container, Text, Input, Spacer, visibleWidth, stripTerminalSequences, wrapTextWithAnsi, backgroundAnsi, parseColor, getOsc8LinkAtColumn, getCapabilities, setCapabilities } = await import(pathToFileURL(tuiPath).href);
+const { renderLayoutFrame, getLayoutBoxesAt, getScrollViewBox } = await import(pathToFileURL(join(dirname(tuiPath), "layout.js")).href);
 const { createChatViewport } = await fromPi("dist/modes/interactive/chat-viewport.js");
 themes.initTheme("dark", false);
 const scratch = mkdtempSync(join(tmpdir(), "pi-questions-test-"));
@@ -37,7 +37,11 @@ const plain = (component, width = 100) => component.render(width).map(stripVTCon
 
 async function harness(options = {}) {
   const path = join(scratch, `questions-${serial++}.ts`);
-  writeFileSync(path, `import {registerQuestions} from ${JSON.stringify(questionsPath)}; export default pi => registerQuestions(pi, ${options.enabled !== false});`);
+  writeFileSync(path, `import {registerQuestions} from ${JSON.stringify(questionsPath)};
+import {registerPinnedPrompt} from ${JSON.stringify(resolve(dirname(questionsPath), "../styling/pinned-prompt.ts"))};
+import {registerGrouping} from ${JSON.stringify(resolve(dirname(questionsPath), "../styling/grouping.ts"))};
+import {defaults} from ${JSON.stringify(resolve(dirname(questionsPath), "../settings/interface.ts"))};
+export default pi => { registerQuestions(pi, ${options.enabled !== false}); ${options.pin ? "registerPinnedPrompt(pi, true);" : ""} ${options.grouping ? "registerGrouping(pi, defaults());" : ""} }`);
   const loaded = await loadExtensions([path], scratch);
   assert.deepEqual(loaded.errors, []);
   const extension = loaded.extensions[0];
@@ -56,6 +60,7 @@ async function harness(options = {}) {
     isIdle: () => true,
     waitForIdle() { assert.fail("must not deadlock an active question with waitForIdle"); },
     ui: {
+      get theme() { return themes.theme; },
       setStatus(key, value) { if (value === undefined) statuses.delete(key); else statuses.set(key, value); },
       setWidget(key, value, placement) { if (value === undefined) widgets.delete(key); else widgets.set(key, { factory: value, placement }); },
       notify(message, type) { notifications.push({ message, type }); },
@@ -143,6 +148,50 @@ async function legacyToolAnswer(h, text, question = "Proceed?") {
   return { content: [{ type: "text", text }], details: { status: "answered", question: record } };
 }
 
+function nativeQuestionView(h, { rows = 24, width = 80 } = {}) {
+  const chat = new Container();
+  const document = new Container();
+  document.addChild(new Container()); document.addChild(new Container()); document.addChild(chat);
+  const widgetsAbove = new Container();
+  const editor = new Input(); editor.setValue("Unsent ordinary draft"); editor.focused = true;
+  const pendingMessages = new Container();
+  const viewport = createChatViewport({ document, pendingMessages, status: new Container(), widgetsAbove,
+    editor, footer: new Text("Footer", 0, 0), scrollbar: "hidden" });
+  const tui = { children: [document], layoutRoot: viewport.root, mode: "fullscreen", terminal: { rows, columns: width }, requestRender() {} };
+  const instances = new Map();
+  const sync = () => {
+    for (const key of instances.keys()) if (!h.widgets.has(key)) { instances.get(key).component.dispose?.(); instances.delete(key); }
+    for (const [key, widget] of h.widgets) if (instances.get(key)?.factory !== widget.factory) {
+      instances.get(key)?.component.dispose?.();
+      instances.set(key, { factory: widget.factory, component: widget.factory(tui, themes.theme) });
+    }
+    widgetsAbove.clear();
+    widgetsAbove.addChild(new Spacer(1)); // InteractiveMode.renderWidgetContainer's native above-input separator.
+    for (const { component } of instances.values()) widgetsAbove.addChild(component);
+  };
+  const frame = (columns = tui.terminal.columns, height = tui.terminal.rows) => {
+    tui.terminal.columns = columns; tui.terminal.rows = height; sync();
+    return renderLayoutFrame(viewport.root, columns, height, () => {});
+  };
+  return { ...viewport, tui, document, chat, widgetsAbove, pendingMessages, editor, frame,
+    text: () => frame().lines.map(stripTerminalSequences).join("\n"),
+    list: () => { sync(); return instances.get(statusKey)?.component; },
+    add(result, args = { question: result.details.question.question }) {
+      const component = new ToolExecutionComponent("ask_user", result.details.question.toolCallId, args, { showImages: false }, h.tool, tui, scratch);
+      component.updateResult(result); chat.addChild(component); return component;
+    },
+    click(pattern) {
+      const current = frame();
+      const y = current.lines.map(stripTerminalSequences).findIndex(line => pattern.test(line));
+      assert.ok(y >= 0, `native frame target ${pattern}`);
+      const box = getLayoutBoxesAt(current, 3, y).find(box => box.component === document);
+      assert.ok(box, "native layout contains transcript document at the target");
+      return document.handleMouse({ type: "click", button: "left", x: 3 - box.rect.x, y: y - box.rect.y,
+        screenX: 3, screenY: y, width: box.rect.width, height: box.rect.height });
+    },
+  };
+}
+
 test("registers model-only sequential question and resolution tools; disabled is inert", async () => {
   const h = await harness();
   assert.deepEqual([...h.extension.tools.keys()], ["ask_user", "resolve_question"]);
@@ -174,7 +223,7 @@ test("ask_user returns pending immediately without auto-open; recommendation onl
   assert.equal(result.terminate, true);
   assert.equal(h.updates.length, 0, "no repeated pending tool update");
   assert.equal(h.widget().split("\n").length, 4, "default expanded list has no trailing blank rows");
-  assert.match(h.widget(), /▾ Questions.*1 pending/);
+  assert.match(h.widget(), /Questions.*1 pending/);
   assert.match(h.widget(), /Which database/);
   const pending = h.command("Q1");
   assert.equal(h.current().customOptions.overlay, true);
@@ -199,12 +248,12 @@ test("ask_user returns pending immediately without auto-open; recommendation onl
   assert.equal(h.statuses.get("other"), "keep me");
 });
 
-test("/q is primary in UI and /questions remains a working manual alias", async () => {
+test("everyday heading omits command hints; /q and /questions remain working manual entry points", async () => {
   const h = await harness();
   await h.ask();
-  assert.match(h.widget().split("\n")[1], /\/q\s*$/);
+  assert.doesNotMatch(h.widget().split("\n")[1], /\/q|▾|▸/);
   assert.equal(h.statuses.get(statusKey), undefined, "pending count belongs only in the Questions widget");
-  assert.match(h.widget(), /1 pending.*\/q/);
+  assert.match(h.widget(), /1 pending/);
   const opened = h.extension.commands.get("questions").handler("Q1", h.ctx);
   assert.equal(h.dialogs.length, 1);
   assert.equal(h.current().customOptions.overlayOptions.width, "90%");
@@ -763,49 +812,37 @@ test("explicit retry refuses known queued/busy work and reconciles a persisted a
   assert.equal(h.widget(), "");
 });
 
-test("list defaults expanded, preserves manual collapse across refresh/new questions, and opens overlays only on entry clicks", async () => {
+test("list is always expanded; heading is inert across refresh and only entries open overlays", async () => {
   const h = await harness();
   const question = "Approve this exact scope?\nDevelopment only\r\nDo not touch production";
   await h.ask({ question });
   const widget = h.widgetComponent();
-  const mouse = (y, extras = {}) => widget.handleMouse({ type: "click", button: "left", x: 3, y, ...extras });
-  assert.match(plain(widget), /▾ Questions/);
+  assert.match(plain(widget), /Questions/);
   assert.match(plain(widget), /exact scope\? Development only Do not touch production/);
   assert.equal(h.latest().question, question.replace(/\r\n/g, "\n"));
-  assert.equal(h.dialogs.length, 0, "default expansion never opens a dialog");
-  assert.equal(mouse(0), undefined, "top whitespace is not clickable");
-  assert.equal(mouse(2), undefined, "header gap is not a question target");
-  assert.equal(mouse(1).handled, true, "header manually collapses the list");
+  for (const y of [0, 1, 2]) assert.equal(widget.handleMouse({ type: "click", button: "left", x: 3, y }), undefined);
   for (const width of [1, 15, 100]) {
     const lines = widget.render(width);
-    assert.equal(lines.length, 2, "collapsed widget has only top spacing and header");
+    assert.ok(lines.length >= 4);
     assert.equal(lines[0], "");
-    for (const line of lines) {
-      assert.doesNotMatch(line, /[\n\r]/);
-      assert.ok(visibleWidth(line) <= width);
-    }
+    for (const line of lines) assert.ok(visibleWidth(line) <= width);
   }
-  assert.equal(mouse(2), undefined, "no stale entry targets below a collapsed header");
   await h.emit("agent_settled");
   await h.ask({ question: "Another?" });
   await h.message(assistant("Q3: One prose question?"));
   await h.emit("session_tree");
-  assert.match(h.widget(), /▸ Questions · 3 pending/);
-  assert.equal(h.widget().split("\n").length, 2, "refresh, tool/prose additions and reconstruction honor manual collapse");
+  assert.match(h.widget(), /Questions · 3 pending/);
+  assert.match(h.widget(), /One prose question/);
+  assert.doesNotMatch(h.widget(), /▾|▸|\/q/);
   assert.equal(h.dialogs.length, 0);
   const refreshed = h.widgetComponent(); refreshed.render(100);
-  refreshed.handleMouse({ type: "click", button: "left", x: 3, y: 1 });
-  assert.match(plain(refreshed), /▾ Questions/);
-  assert.equal(h.dialogs.length, 0, "manual expansion must not open the answer dialog");
   assert.equal(refreshed.handleMouse({ type: "click", button: "left", x: 3, y: 3 }).handled, true);
-  assert.equal(h.dialogs.length, 1);
   assert.equal(h.current().customOptions.overlay, true);
   h.current().component.handleInput("\x1b");
   await new Promise(resolve => setImmediate(resolve));
   await h.ask({ question: "Fourth question?" });
-  assert.match(h.widget(), /▾ Questions · 4 pending/);
-  assert.match(h.widget(), /Fourth question/);
-  assert.equal(h.dialogs.length, 1, "new questions preserve expansion without automatic popup");
+  assert.match(h.widget(), /Questions · 4 pending/);
+  assert.equal(h.dialogs.length, 1, "new questions never open automatically");
 });
 
 test("Questions widget has unfilled padding, one inter-question gap and no residual empty padding", async () => {
@@ -864,12 +901,12 @@ test("installed viewport keeps Questions outer spacing and ordinary input intact
       assert.equal(result?.target.component, widget, "container routes clicks to the actual list");
       return result;
     };
-    assert.match(plain(widget, 48), /▾ Questions/);
+    assert.match(plain(widget, 48), /Questions/);
     assert.match(frame().lines.map(stripTerminalSequences).join("\n"), /Unsent ordinary draft/);
     assert.equal(h.dialogs.length, 0);
-    assert.equal(click(/▾ Questions/).handled, true);
-    assert.equal(widget.render(48).length, 2, "collapsed list keeps top spacing without an extra bottom gap");
-    assert.equal(click(/▸ Questions/).handled, true);
+    const beforeHeaderClick = widget.render(48);
+    assert.equal(widget.handleMouse({ type: "click", button: "left", x: 3, y: 1 }), undefined);
+    assert.deepEqual(widget.render(48), beforeHeaderClick, "heading is not a collapse control");
     assert.equal(h.dialogs.length, 0);
     assert.ok(widget.render(48).length <= Math.max(4, Math.min(16, rows - 5)), "twenty wrapped questions stay within the list budget");
     assert.match(frame().lines.map(stripTerminalSequences).join("\n"), /Unsent ordinary draft/);
@@ -1259,10 +1296,39 @@ test("native tool renderers remain readable at all expansion states and widths w
       assert.match(text, /Safe option/);
       assert.match(text, /Preserves current data/);
       assert.match(text, /Q1/);
-      assert.match(text, /Pending.*\/q/);
+      assert.match(text, /Pending.*click to answer/);
+      assert.doesNotMatch(text, /\/q/);
     }
   }
   themes.initTheme("dark", false);
+});
+
+test("transcript separates the question, each choice, rationale and recorded answer with blank rows", async () => {
+  const h = await harness();
+  const args = { question: "Choose the next step for this deliberately long question that wraps?", options: [
+    { label: "Keep local", description: "Preserve the current workspace without remote changes." },
+    { label: "Pause", description: "Leave everything unchanged until the next check." },
+  ], recommended_option: 1, rationale: "This preserves the current workspace." };
+  const result = await h.ask(args);
+  const snapshot = JSON.stringify(result);
+  const native = new ToolExecutionComponent("ask_user", "call-1", args, { showImages: false }, h.tool, { requestRender() {} }, scratch);
+  native.updateResult(result);
+  const check = (width, answered = false) => {
+    const lines = native.render(width).map(stripTerminalSequences);
+    const groups = [/1\. Keep local/, /2\. Pause/, /Recommendation rationale:/, ...(answered ? [/Answer:/] : [])];
+    for (const pattern of groups) {
+      const row = lines.findIndex(line => pattern.test(line));
+      assert.ok(row > 0, `missing group ${pattern}`);
+      assert.equal(lines[row - 1].trim(), "", `${pattern} starts after a blank row, not the previous text block`);
+      assert.equal(lines.filter(line => pattern.test(line)).length, 1);
+    }
+    assert.ok(lines.every(line => visibleWidth(line) <= width));
+  };
+  for (const width of [48, 120]) check(width);
+  await h.input("Q1: Keep local for now");
+  for (const width of [48, 120]) check(width, true);
+  assert.equal(JSON.stringify(result), snapshot, "spacing is presentation-only");
+  assert.equal(h.sent.length, 0);
 });
 
 test("question transcript fills exactly one outer buffer per side, never internal separators or expanded duplicates", async () => {
@@ -1272,7 +1338,7 @@ test("question transcript fills exactly one outer buffer per side, never interna
   for (const appearance of ["dark", "light"]) for (const mode of ["truecolor", "256color"]) {
     const theme = themes.loadThemeFromPath(join(root, `dist/modes/interactive/theme/${appearance}.json`), mode);
     const fg = mode === "truecolor" ? (appearance === "dark" ? "38;2;255;215;135" : "38;2;95;0;0") : (appearance === "dark" ? "38;5;222" : "38;5;52");
-    const bg = mode === "truecolor" ? (appearance === "dark" ? "48;2;38;38;38" : "48;2;228;228;228") : (appearance === "dark" ? "48;5;235" : "48;5;254");
+    const bg = backgroundAnsi(parseColor(appearance === "dark" ? "#594515" : "#fff0bf"), mode).slice(2, -1);
     for (const width of [1, 2, 5, 12, 80]) {
       const render = expanded => h.tool.renderResult(result, { expanded }, theme).render(width);
       const lines = render(false);
@@ -1992,6 +2058,355 @@ test("resolution persistence failure leaves the pending UI and question untouche
   h.loaded.runtime.appendEntry = append;
   h.current().component.handleInput("\x1b"); await opening;
   assert.equal(h.sent.length, 0);
+});
+
+test("native tool card routes heading, status, question and option clicks to the answer overlay, never expansion", async () => {
+  const h = await harness();
+  const view = nativeQuestionView(h, { rows: 35 });
+  const args = { question: "Choose the development target?", options: [{ label: "Local only" }, { label: "Leave unchanged" }] };
+  const result = await h.ask(args);
+  const component = view.add(result, args);
+  assert.equal(h.dialogs.length, 0);
+  for (const pattern of [/Ask user/, /Q1 · Pending/, /Q1: Choose/, /1\. Local only/]) {
+    assert.equal(view.click(pattern)?.handled, true);
+    assert.equal(component.expanded, false, "child handler wins over native expansion MouseRegion");
+    assert.equal(h.current().customOptions.overlay, true);
+    assert.equal(view.editor.getValue(), "Unsent ordinary draft");
+    assert.equal(view.editor.focused, true);
+    h.current().component.handleInput("\x1b");
+    await new Promise(resolve => setImmediate(resolve));
+  }
+  assert.equal(h.sent.length, 0);
+  assert.equal(h.latest().status, "pending");
+  view.click(/Q1: Choose/);
+  h.current().component.handleInput("\r");
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(h.sent.length, 1);
+  assert.equal(h.latest().answer.text, "Local only");
+  assert.match(view.text(), /Q1 · Answered/);
+  view.click(/Q1: Choose/);
+  assert.equal(h.dialogs.length, 5, "answered cards cannot open a new answer overlay");
+  await h.emit("session_shutdown");
+});
+
+test("native fullscreen hides the entire list when any actual question row is visible, including partial questions", async () => {
+  const h = await harness();
+  const view = nativeQuestionView(h, { rows: 18, width: 42 });
+  view.chat.addChild(new Text("before\n".repeat(30), 0, 0));
+  const args = { question: "First actual question text wraps over multiple rows and ends here?", options: [{ label: "An option far below the question" }] };
+  const result = await h.ask(args);
+  const card = view.add(result, args);
+  view.chat.addChild(new Text("after\n".repeat(30), 0, 0));
+  view.frame();
+  const before = view.chat.children[0].render(42).length;
+  const rows = card.render(42).map(stripTerminalSequences);
+  const first = rows.findIndex(line => /Q1: First/.test(line));
+  const last = rows.findIndex(line => /ends here/.test(line));
+  const option = rows.findIndex(line => /1\. An option/.test(line));
+  const dock = view.root.entries.at(-1).component;
+  const withoutList = () => {
+    const list = view.list();
+    const children = [...view.widgetsAbove.children]; view.widgetsAbove.removeChild(list);
+    const height = dock.render(42).length;
+    view.widgetsAbove.clear(); for (const child of children) view.widgetsAbove.addChild(child);
+    return { list, viewport: 18 - Math.max(1, height) };
+  };
+  const { viewport } = withoutList();
+  const stable = (top, hidden, label) => {
+    view.transcript.scrollTo(top, { disableFollow: true });
+    for (let i = 0; i < 5; i++) {
+      view.frame();
+      assert.equal(view.list().render(42).length === 0, hidden, label);
+      assert.equal(/Questions ·/.test(view.text()), !hidden, `${label}: no residual heading/gap`);
+    }
+  };
+  stable(before + first - viewport, false, "status/call/padding without actual text keeps reminder");
+  stable(before + first - viewport + 1, true, "first text row at viewport bottom counts");
+  stable(before + last, true, "only final wrapped question row at viewport top counts");
+  stable(before + last + 1, false, "options or padding alone do not count");
+  stable(before + option, false, "visible option is not visible question text");
+  assert.equal(h.dialogs.length, 0);
+  assert.equal(h.sent.length, 0);
+});
+
+test("native grouped tool projection preserves question visibility and click identity across group expansion", async () => {
+  const h = await harness({ grouping: true });
+  const view = nativeQuestionView(h, { rows: 35 });
+  for (let i = 0; i < 3; i++) {
+    const tool = new ToolExecutionComponent("bash", `bash-${i}`, { command: "echo before question" }, { showImages: false }, undefined, view.tui, scratch);
+    tool.updateResult({ content: [{ type: "text", text: "output\n".repeat(3) }] });
+    view.chat.addChild(tool);
+  }
+  view.add(await h.ask({ question: "Question after grouped tools?" }));
+  assert.match(view.text(), /3 tools/);
+  assert.doesNotMatch(view.text(), /Questions ·/);
+  assert.equal(view.click(/3 tools/)?.handled, true);
+  assert.doesNotMatch(view.text(), /Questions ·/, "expanded grouped rows retain accurate native question offsets");
+  assert.equal(view.click(/Q1: Question after/)?.handled, true);
+  assert.equal(h.dialogs.length, 1);
+  h.current().component.handleInput("\x1b");
+  await new Promise(resolve => setImmediate(resolve));
+  await h.emit("session_shutdown");
+});
+
+test("native fullscreen resize and follow-end decisions do not feed the reminder height back into visibility", async () => {
+  const h = await harness();
+  const view = nativeQuestionView(h, { rows: 24, width: 64 });
+  const result = await h.ask({ question: "A visible question near the end?" });
+  view.add(result);
+  assert.doesNotMatch(view.text(), /Questions ·/);
+  assert.deepEqual(view.list().render(64), []);
+  assert.equal(view.list().handleMouse({ type: "click", button: "left", x: 3, y: 3 }), undefined, "hidden reminder has no stale hit rows");
+  const filler = new Text("tail\n".repeat(22), 0, 0); view.chat.addChild(filler);
+  for (const [width, height] of [[64, 24], [28, 12], [90, 50], [64, 24]]) {
+    const first = view.frame(width, height);
+    const expected = /Questions ·/.test(first.lines.map(stripTerminalSequences).join("\n"));
+    for (let i = 0; i < 8; i++) assert.equal(/Questions ·/.test(view.frame().lines.map(stripTerminalSequences).join("\n")), expected);
+    assert.equal(view.transcript.isFollowingEnd, true);
+    assert.match(view.text(), /Unsent ordinary draft/);
+  }
+  view.chat.removeChild(filler);
+  assert.doesNotMatch(view.text(), /Questions ·/, "newly visible question restores full transcript space immediately");
+  assert.equal(getScrollViewBox(view.frame(), view.transcript).rect.height, 24 - view.root.entries.at(-1).component.render(64).length);
+});
+
+test("one offscreen question shows every pending question and stale/mismatched native cards prove no visibility", async () => {
+  const h = await harness();
+  const view = nativeQuestionView(h, { rows: 24 });
+  const first = await h.ask({ question: "First pending scope?" });
+  const oldCard = view.add(first);
+  view.chat.addChild(new Text("middle\n".repeat(40), 0, 0));
+  view.add(await h.ask({ question: "Second pending scope?" }));
+  assert.match(view.text(), /Second pending scope/);
+  assert.match(plain(view.list()), /Q1: First pending scope/);
+  assert.match(plain(view.list()), /Q2: Second pending scope/);
+  await h.input("Q1: not now");
+  assert.doesNotMatch(view.text(), /Questions ·/, "all remaining pending questions are visible");
+  const staleWidget = view.list();
+  view.chat.clear();
+  view.chat.addChild(new Text("Q2: Second pending scope?", 0, 0));
+  assert.match(view.text(), /Questions ·/, "an arbitrary matching row cannot hide a question");
+  const mismatched = new ToolExecutionComponent("ask_user", "unrelated-call", { question: "Second pending scope?" }, { showImages: false }, h.tool, view.tui, scratch);
+  const secondSnapshot = h.records().find(record => record.id === 2);
+  mismatched.updateResult({ content: [{ type: "text", text: "" }], details: { status: "pending", question: secondSnapshot } });
+  view.chat.clear(); view.chat.addChild(mismatched);
+  assert.match(view.text(), /Questions ·/, "a result snapshot attached to a different native call has no identity");
+  h.ctx.sessionManager = SessionManager.inMemory(scratch);
+  await h.emit("session_start");
+  await h.ask({ question: "First pending scope?" }); // same ID, words and call shape in another session
+  view.chat.clear(); view.chat.addChild(oldCard);
+  assert.match(view.text(), /Questions · 1 pending/, "an old session card cannot hide a new question");
+  view.click(/Q1: First pending scope/);
+  assert.equal(h.dialogs.length, 0, "old session card cannot open a new scope");
+  assert.equal(staleWidget?.handleMouse({ type: "click", button: "left", x: 3, y: 3 }), undefined);
+  await h.emit("session_shutdown");
+  assert.doesNotMatch(view.text(), /Questions ·/);
+});
+
+test("native prose visibility uses current entry message identity, never arbitrary matching transcript text", async () => {
+  const h = await harness();
+  const view = nativeQuestionView(h, { rows: 24, width: 50 });
+  const { AssistantMessageComponent } = await fromPi("dist/modes/interactive/components/assistant-message.js");
+  const msg = assistant("Q3: First prose question with words wrapping across several rows?\n\nQ4: Second prose question?");
+  await h.message(msg);
+  const native = new AssistantMessageComponent(msg);
+  view.chat.addChild(native);
+  assert.doesNotMatch(view.text(), /Questions ·/, "both entry-identified prose question texts are visible");
+  for (const id of [3, 4]) {
+    assert.equal(view.click(new RegExp(`Q${id}:`))?.handled, true, "visible prose retains a native transcript entry point");
+    assert.match(plain(h.current().component), new RegExp(`Q${id} ·`));
+    assert.equal(view.editor.getValue(), "Unsent ordinary draft");
+    assert.equal(view.editor.focused, true);
+    h.current().component.handleInput("\x1b");
+    await new Promise(resolve => setImmediate(resolve));
+  }
+  view.chat.addChild(new Text("tail\n".repeat(40), 0, 0));
+  assert.match(view.text(), /Questions · 2 pending/);
+  view.transcript.scrollTo(0, { disableFollow: true });
+  assert.doesNotMatch(view.text(), /Questions ·/);
+  view.chat.clear();
+  view.chat.addChild(new Text("Q3: First prose question with words wrapping across several rows?\n\nQ4: Second prose question?", 0, 0));
+  assert.match(view.text(), /Questions · 2 pending/, "text-only coincidences cannot supply native entry identity");
+  view.chat.clear();
+  view.chat.addChild(new AssistantMessageComponent(structuredClone(msg)));
+  assert.match(view.text(), /Questions · 2 pending/, "even a same-text assistant from outside this branch cannot prove visibility");
+  assert.equal(h.dialogs.length, 2);
+  assert.equal(h.sent.length, 0);
+});
+
+test("one pending question with many historical native cards has linear per-frame render counts", async t => {
+  const samples = [];
+  for (const count of [20, 50]) {
+    const h = await harness();
+    const view = nativeQuestionView(h);
+    const history = [];
+    for (let i = 1; i <= count; i++) {
+      history.push(await h.ask({ question: `Historical question ${i}?` }));
+      await h.input(`Q${i}: already handled`);
+    }
+    const pending = await h.ask({ question: "The only pending question?" });
+    const cards = [...history, pending].map(result => view.add(result));
+    view.frame();
+    let renders = 0;
+    for (const card of cards) {
+      const render = card.render;
+      card.render = function(width) { renders++; return render.call(this, width); };
+    }
+    const frame = view.frame();
+    assert.doesNotMatch(frame.lines.map(stripTerminalSequences).join("\n"), /Questions ·/);
+    samples.push(renders);
+    assert.ok(renders <= 12 * cards.length, `${count} historical cards: ${renders} native renders, bounded passes not per-card rescans`);
+    await h.emit("session_shutdown");
+  }
+  assert.ok(samples[1] < samples[0] * 3, `render work scales linearly: ${samples.join(" -> ")}`);
+  t.diagnostic(`20/50 historical cards, one pending: ${samples.join(" / ")} native renders per frame`);
+});
+
+test("native prose adapters preserve links, selection and existing handlers; refresh and shutdown restore ownership", async t => {
+  const capabilities = getCapabilities();
+  setCapabilities({ ...capabilities, hyperlinks: true });
+  t.after(() => setCapabilities(capabilities));
+  const h = await harness();
+  const view = nativeQuestionView(h, { rows: 30, width: 90 });
+  const { AssistantMessageComponent } = await fromPi("dist/modes/interactive/components/assistant-message.js");
+  const msg = assistant("Ordinary prose above the question.\n\nQ1: Is https://example.com the correct endpoint?");
+  await h.message(msg);
+  const native = new AssistantMessageComponent(msg);
+  const inherited = native.handleMouse;
+  let nativeCalls = 0;
+  const original = function(event) {
+    nativeCalls++;
+    if (event.alt) return { handled: true };
+    return inherited.call(this, event);
+  };
+  native.handleMouse = original;
+  const descriptor = Object.getOwnPropertyDescriptor(native, "handleMouse");
+  view.chat.addChild(native);
+  assert.doesNotMatch(view.text(), /Questions ·/);
+  assert.notEqual(native.handleMouse, original);
+  const lines = native.render(90);
+  const y = lines.map(stripTerminalSequences).findIndex(line => /Q1:/.test(line));
+  const event = { type: "click", button: "left", x: 3, y, width: 90, height: lines.length };
+  for (const type of ["press", "drag", "release", "wheel"]) assert.equal(native.handleMouse({ ...event, type }), undefined, `${type} remains available to native selection/scrolling`);
+  assert.equal(native.handleMouse({ ...event, button: "right" }), undefined);
+  for (const modifier of ["shift", "ctrl"]) assert.equal(native.handleMouse({ ...event, [modifier]: true }), undefined, "modified question clicks retain native selection behavior");
+  assert.equal(native.handleMouse({ ...event, y: y - 2 }), undefined, "ordinary prose does not become a question target");
+  assert.equal(native.handleMouse({ ...event, alt: true })?.handled, true, "existing native handlers win");
+  const linkX = Array.from({ length: 90 }, (_, x) => x).find(x => getOsc8LinkAtColumn(lines[y], x));
+  assert.notEqual(linkX, undefined, "actual native Markdown emitted an OSC8 link on the question row");
+  assert.equal(native.handleMouse({ ...event, x: linkX }), undefined, "question clicks never intercept hyperlink cells");
+  assert.equal(h.dialogs.length, 0);
+  assert.ok(nativeCalls >= 8);
+  assert.equal(view.click(/Q1:/)?.handled, true);
+  h.current().component.handleInput("\x1b");
+  await new Promise(resolve => setImmediate(resolve));
+  const stale = native.handleMouse;
+  await h.emit("session_tree");
+  assert.deepEqual(Object.getOwnPropertyDescriptor(native, "handleMouse"), descriptor, "refresh restores the exact original property");
+  assert.equal(stale.call(native, event), undefined, "retained callbacks from the disposed adapter cannot reopen questions");
+  view.frame();
+  assert.notEqual(native.handleMouse, original);
+  view.tui.mode = "regular"; view.frame();
+  assert.equal(native.handleMouse, original, "leaving fullscreen removes prose mouse routing");
+  view.tui.mode = "fullscreen"; view.frame();
+  const replacement = function() { return { handled: true }; };
+  native.handleMouse = replacement;
+  assert.match(view.text(), /Questions ·/, "a handler replaced by another extension cannot justify hiding the reminder");
+  assert.equal(native.handleMouse, replacement, "cleanup never overwrites another owner's handler");
+  native.handleMouse = original; view.frame();
+  const shutdownCallback = native.handleMouse;
+  await h.emit("session_shutdown");
+  assert.equal(native.handleMouse, original);
+  assert.equal(shutdownCallback.call(native, event), undefined);
+  assert.equal(h.dialogs.length, 1);
+  assert.equal(h.sent.length, 0);
+});
+
+test("native prose answer submission retires click targets without duplicating delivery", async () => {
+  const h = await harness();
+  const view = nativeQuestionView(h, { rows: 30 });
+  const { AssistantMessageComponent } = await fromPi("dist/modes/interactive/components/assistant-message.js");
+  const msg = assistant("Q1: First pending prose question?\n\nQ2: Second pending prose question?");
+  await h.message(msg);
+  const native = new AssistantMessageComponent(msg);
+  const original = native.handleMouse;
+  view.chat.addChild(native);
+  assert.doesNotMatch(view.text(), /Questions ·/);
+  view.frame(28, 30);
+  assert.equal(view.click(/Q2:/)?.handled, true, "resize keeps the second question's native row bound to Q2");
+  assert.match(plain(h.current().component), /Q2 ·/);
+  const stale = native.handleMouse;
+  h.submitCustom("Keep the existing scope");
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(native.handleMouse, original, "answer refresh removes old targets immediately");
+  assert.equal(h.latest().id, 2);
+  assert.equal(h.latest().status, "answered");
+  assert.equal(h.sent.length, 1);
+  assert.match(h.sent[0].content, /Answer to Q2/);
+  const event = { type: "click", button: "left", x: 3, y: 1, width: 28, height: 8 };
+  assert.equal(stale.call(native, event), undefined);
+  assert.equal(view.click(/Q2:/), undefined, "answered prose is no longer an answer target");
+  assert.equal(h.dialogs.length, 1);
+  assert.equal(h.sent.length, 1);
+  assert.equal(view.editor.getValue(), "Unsent ordinary draft");
+  await h.emit("session_shutdown");
+});
+
+test("native prose click callbacks reject replaced sessions before lifecycle reconstruction", async () => {
+  const h = await harness();
+  const view = nativeQuestionView(h);
+  const { AssistantMessageComponent } = await fromPi("dist/modes/interactive/components/assistant-message.js");
+  const msg = assistant("Q1: Same words do not identify a session?");
+  await h.message(msg);
+  const native = new AssistantMessageComponent(msg);
+  const original = native.handleMouse;
+  view.chat.addChild(native); view.frame();
+  const lines = native.render(80).map(stripTerminalSequences);
+  const event = { type: "click", button: "left", x: 3, y: lines.findIndex(line => /Q1:/.test(line)), width: 80, height: lines.length };
+  h.ctx.sessionManager = SessionManager.inMemory(scratch);
+  assert.equal(native.handleMouse(event), undefined);
+  assert.equal(h.dialogs.length, 0);
+  await h.emit("session_start");
+  assert.equal(native.handleMouse, original);
+  assert.equal(h.sent.length, 0);
+});
+
+test("regular/unsupported layouts keep the reminder; pin and other input widgets preserve stable native boundaries", async () => {
+  const h = await harness({ pin: true });
+  const view = nativeQuestionView(h, { rows: 24 });
+  const { UserMessageComponent } = await fromPi("dist/modes/interactive/components/user-message.js");
+  await h.message(user("Pinned prompt before question"));
+  view.chat.addChild(new UserMessageComponent("Pinned prompt before question"));
+  view.chat.addChild(new Text("between\n".repeat(25), 0, 0));
+  view.add(await h.ask({ question: "Question near the bottom?" }));
+  view.pendingMessages.addChild(new Text("queued input", 0, 0));
+  const extra = new Text("Other extension widget", 0, 0);
+  h.widgets.set("unrelated", { factory: () => extra });
+  for (const height of [14, 24, 40, 18]) {
+    view.frame(64, height);
+    const seen = [];
+    for (let i = 0; i < 8; i++) seen.push(view.frame().lines.map(stripTerminalSequences).join("\n"));
+    assert.ok(seen.every(text => text === seen[0]), "pin/list decisions converge in the same frame, not alternating frames");
+    assert.match(seen[0], /Unsent ordinary draft/);
+    assert.match(seen[0], /Other extension widget/);
+    assert.match(seen[0], /queued input/);
+  }
+  view.frame(64, 18);
+  const contentHeight = view.document.render(64).length;
+  for (let top = 0; top <= contentHeight; top++) {
+    view.transcript.scrollTo(top, { disableFollow: true });
+    const expected = view.text();
+    for (let repeat = 0; repeat < 4; repeat++) assert.equal(view.text(), expected, `pin/list boundary at scroll row ${top} is stable`);
+  }
+  view.tui.mode = "regular";
+  assert.match(plain(view.list(), 64), /Questions ·/);
+  view.tui.mode = "fullscreen";
+  const originalGap = view.root.gap; view.root.gap = 1;
+  assert.match(plain(view.list(), 64), /Questions ·/, "unknown layout is conservative");
+  view.root.gap = originalGap;
+  assert.equal(h.sent.length, 0);
+  assert.equal(h.dialogs.length, 0);
+  await h.emit("session_shutdown");
 });
 
 test("invalid recommendation/reuse and manual UI rejection safely leave actionable unanswered results", async () => {

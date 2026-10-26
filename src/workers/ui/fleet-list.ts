@@ -16,7 +16,7 @@ import { renderAgentName } from "../agent-color.js";
 import type { AgentManager } from "../agent-manager.js";
 import type { AgentRecord, ViewerMarkdownMode } from "../types.js";
 import { getLifetimeCost, getLifetimeTotal } from "../usage.js";
-import { type AgentActivity, formatCost, type Theme } from "./agent-widget.js";
+import { type AgentActivity, formatCost, formatMs, type Theme } from "./agent-widget.js";
 import { ConversationViewer, getConversationOverlayOptions, type ViewerBackgroundAction } from "./conversation-viewer.js";
 
 /** Widget key for the below-editor fleet list. */
@@ -48,9 +48,9 @@ type MainEntry = { kind: "main" };
 type AgentEntry = { kind: "agent"; record: AgentRecord };
 type FleetEntry = MainEntry | AgentEntry;
 
-/** `11s` — integer seconds, no decimal/suffix (matches Claude Code, unlike formatMs). */
+/** Whole elapsed minutes, using the same rounding as the other worker surfaces. */
 export function formatFleetElapsed(ms: number): string {
-  return `${Math.max(0, Math.round(ms / 1000))}s`;
+  return formatMs(ms);
 }
 
 /** `↓ 13.1k tokens` — down-arrow prefix, compact magnitude, plural "tokens". */

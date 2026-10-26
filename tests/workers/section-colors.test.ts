@@ -129,14 +129,14 @@ describe("section colors", () => {
   it("keeps default and explicit-off widget output byte-for-byte unchanged", () => {
     const expected = [
       `${fg("accent", "●")} ${fg("accent", "Agents")}`,
-      `${fg("dim", "└─")} ${fg("accent", "⠙")} ${fg("muted", theme.bold("Inspect auth"))} ${fg("dim", "·")} ${fg("dim", "sonnet 4.6 · thinking: high (asked max) · ↻3 · 1.2k token · 4.0s")}`,
+      `${fg("dim", "└─")} ${fg("accent", "⠙")} ${fg("muted", theme.bold("Inspect auth"))} ${fg("dim", "·")} ${fg("dim", "sonnet 4.6 · thinking: high (asked max) · ↻3 · 1.2k token · 0m")}`,
       `${fg("dim", "  ")}${fg("dim", " ⎿ reading…")}`,
     ];
     expect(widgetLines(record())).toEqual(expected);
     expect(widgetLines(record(), false)).toEqual(expected);
     expect(widgetLines(record("completed"), false)).toEqual([
       `${fg("dim", "○")} ${fg("dim", "Agents")}`,
-      `${fg("dim", "└─")} ${fg("success", "✓")} ${fg("dim", "Inspect auth")} ${fg("dim", "·")} ${fg("dim", "↻3 · 4.0s")}`,
+      `${fg("dim", "└─")} ${fg("success", "✓")} ${fg("dim", "Inspect auth")} ${fg("dim", "·")} ${fg("dim", "↻3 · 0m")}`,
     ]);
   });
 
@@ -147,7 +147,7 @@ describe("section colors", () => {
     expect(lines.join("\n")).not.toMatch(/tool uses?|Reviewer|general-purpose|\(twin\)/);
     expect(lines[1]).toContain(fg("syntaxVariable", "sonnet 4.6"));
     expect(lines[1]).toContain(fg("thinkingMedium", "thinking: high (asked max)"));
-    expect(lines[1]).toContain(`\u001b[39m\u001b[2m · ↻3 · 1.2k token · 4.0s`);
+    expect(lines[1]).toContain(`\u001b[39m\u001b[2m · ↻3 · 1.2k token · 0m`);
     expect(lines[2]).toBe(`${fg("dim", "  ")}${fg("dim", " ⎿ reading…")}`);
     expect(widgetLines(record(), true, 240, false).join("\n")).not.toContain("sonnet");
   });
@@ -175,7 +175,7 @@ describe("section colors", () => {
     const lines = widgetLines({ ...record(), compactionCount: 2 }, true, 240, true, percent);
     expect(lines[1]).toContain(fg(color, `${percent}%`));
     expect(lines[1]).toContain(fg("dim", "⇊2"));
-    expect(lines[1]).toContain("\u001b[39m\u001b[2m) · 4.0s");
+    expect(lines[1]).toContain("\u001b[39m\u001b[2m) · 0m");
   });
 
   it.each([1, 12, 40, 80, 240])("preserves visible text and bounds at %i columns", width => {
@@ -226,7 +226,7 @@ describe("section colors", () => {
     const offWidget = renderWidget();
     expect(offWidget).toContain(fg("muted", theme.bold("Inspect auth")));
     const off = render();
-    expect(off).toBe(`${fg("success", "✓")} ${fg("dim", "sonnet 4.6")} ${fg("dim", "·")} ${fg("dim", "thinking: high")} ${fg("dim", "·")} ${fg("dim", "isolated")} ${fg("dim", "·")} ${fg("dim", "2 tool uses")} ${fg("dim", "·")} ${fg("dim", "1.2k token")} ${fg("dim", "·")} ${fg("dim", "4.0s")}\n\u001b[2m${fg("dim", "  ⎿  Done")}`);
+    expect(off).toBe(`${fg("success", "✓")} ${fg("dim", "sonnet 4.6")} ${fg("dim", "·")} ${fg("dim", "thinking: high")} ${fg("dim", "·")} ${fg("dim", "isolated")} ${fg("dim", "·")} ${fg("dim", "2 tool uses")} ${fg("dim", "·")} ${fg("dim", "1.2k token")} ${fg("dim", "·")} ${fg("dim", "0m")}\n\u001b[2m${fg("dim", "  ⎿  Done")}`);
     let toggle = "on";
     const ctx = {
       ui: {

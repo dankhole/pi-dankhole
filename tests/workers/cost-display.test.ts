@@ -3,8 +3,8 @@
  * never put there.
  *
  * Two rules run through all of it. A cost is shown only when there is one to
- * show: a model pi has no rates for reports 0, and printing `$0.00` beside its
- * tokens would claim the run was measured and free. And each surface punctuates
+ * show: a model pi has no rates for reports 0, which stays hidden rather than
+ * sharing the `~$0` display of small positive estimates. Each surface punctuates
  * its own — the stats line joins with `·`, the foreground result with `,`, the
  * `get_subagent_result` header with `|` — which is why the cost travels as a
  * number and is formatted at the end, not baked into the token string.
@@ -65,12 +65,14 @@ describe("cost display", () => {
       const { tools } = boot({ showCost: true });
       runSpending(COST);
 
-      const text = textOf(await spawn(tools));
+      const result = await spawn(tools);
+      const text = textOf(result);
 
-      expect(text).toContain("~$0.0123");
+      expect(result.details.cost).toBe(COST);
+      expect(text).toContain("~$0");
       // Comma-joined with the rest, not glued to the token count with the "·"
       // that the widget uses — the separator belongs to the surface.
-      expect(text).toMatch(/1\.2k token, ~\$0\.0123/);
+      expect(text).toMatch(/1\.2k token, ~\$0/);
     });
 
     it("says nothing when the setting is off", async () => {
@@ -103,7 +105,7 @@ describe("cost display", () => {
       ));
 
       // Pipe-separated `Label: value` fields, matching its neighbours.
-      expect(text).toContain("Cost: ~$0.0123");
+      expect(text).toContain("Cost: ~$0");
     });
 
     it("omits the field entirely when unpriced", async () => {
@@ -173,6 +175,25 @@ describe("cost display", () => {
     });
   });
 
+  describe("the Agent tool renderer", () => {
+    it.each([false, true])("rounds display without changing raw details (partial: %s)", (isPartial) => {
+      const { tools } = boot({ showCost: true });
+      const details = {
+        description: "spend", status: isPartial ? "running" : "completed",
+        tokens: "1.2k token", toolUses: 1, cost: 0.8534, durationMs: 811_100,
+      };
+      const original = structuredClone(details);
+      const output = tools.get("Agent").renderResult(
+        { content: [{ type: "text", text: "done" }], details },
+        { expanded: false, isPartial }, getThemeByName("dark"), { isError: false },
+      ).render(200).map(stripTerminalSequences).join("\n");
+      expect(output).toContain("~$1");
+      if (!isPartial) expect(output).toContain("14m");
+      expect(output).not.toMatch(/\$\d+\.|\d+(?:\.\d+)?s\b/);
+      expect(details).toEqual(original);
+    });
+  });
+
   describe("the completion notification", () => {
     /** Render a notification through the extension's registered renderer. */
     function render(pi: any, details: any): string {
@@ -188,18 +209,18 @@ describe("cost display", () => {
 
     it("keeps each card's cost in its own header without a dense batch total", () => {
       const { pi } = boot({ showCost: true });
-      const out = render(pi, { ...agent("first", 1000, 0.01), others: [agent("second", 3000, 0.02)] });
+      const out = render(pi, { ...agent("first", 1000, 0.8534), others: [agent("second", 3000, 1.5)] });
 
-      expect(out).toContain("~$0.01");
-      expect(out).toContain("~$0.02");
+      expect(out).toContain("~$1");
+      expect(out).toContain("~$2");
       expect(out).not.toContain("agents ·");
     });
 
     it("does not total a single agent — the line above already says it", () => {
       const { pi } = boot({ showCost: true });
-      const out = render(pi, agent("only", 1000, 0.01));
+      const out = render(pi, agent("only", 1000, 0.8534));
 
-      expect(out).toContain("~$0.01");
+      expect(out).toContain("~$1");
       expect(out).not.toContain("1 agents");
     });
 

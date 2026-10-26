@@ -1,8 +1,9 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { stripTerminalSequences, Text, truncateToWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
+import { stripTerminalSequences, Text, type TuiMouseEvent, truncateToWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { questionPaint, questionPlain, questionStyle } from "./question-palette.ts";
 import { createQuestionComponent, type QuestionAnswer, type QuestionUIResult, type QuestionView, sanitizeQuestionText } from "./question-ui.ts";
+import { type ProseQuestionSource, QUESTION_CONTENT, questionListVisibility } from "./question-viewport.ts";
 
 export const QUESTION_TOOL_NAME = "ask_user";
 export const QUESTION_RESOLUTION_TOOL_NAME = "resolve_question";
@@ -117,14 +118,25 @@ function readRecord(value: unknown): QuestionRecord | undefined {
 function questionLines(question: QuestionView): string[] {
   return [
     `Q${question.id}: ${safe(question.question)}`,
-    ...question.options.map((option, index) => `  ${index + 1}. ${safe(option.label)}${index === question.recommended ? " (Recommended)" : ""}${option.description ? ` — ${safe(option.description)}` : ""}`),
-    ...(question.recommended !== undefined && question.rationale ? [`  Recommendation rationale: ${safe(question.rationale)}`] : []),
+    ...question.options.flatMap((option, index) => ["", `  ${index + 1}. ${safe(option.label)}${index === question.recommended ? " (Recommended)" : ""}${option.description ? ` — ${safe(option.description)}` : ""}`]),
+    ...(question.recommended !== undefined && question.rationale ? ["", `  Recommendation rationale: ${safe(question.rationale)}`] : []),
   ];
 }
 
 class QuestionTranscript extends Text {
-  constructor(private readonly currentText: () => string, private readonly paint: (line: string) => string, private readonly buffered = false) { super("", 0, 0); }
+  private lastWidth = 0;
+  private lastHeight = 0;
+  constructor(private readonly currentText: () => string, private readonly paint: (line: string) => string, private readonly buffered = false,
+    private readonly open?: () => boolean, private readonly content?: (width: number) => { identity: object; rows: number[] } | undefined) { super("", 0, 0); }
+  [QUESTION_CONTENT](width: number) { return this.content?.(width); }
+  handleMouse(event: TuiMouseEvent) {
+    if (event.type !== "click" || event.button !== "left" || event.x < 0 || event.x >= this.lastWidth
+      || event.y < 0 || event.y >= this.lastHeight || !this.open?.()) return;
+    return { handled: true, render: true };
+  }
   render(width: number): string[] {
+    this.lastWidth = width;
+    this.lastHeight = 0;
     this.setText(this.currentText());
     if (width <= 0) return [];
     // Text may emit a two-column grapheme into a one-column wrap. The self-rendered shell avoids
@@ -136,8 +148,9 @@ class QuestionTranscript extends Text {
     });
     // Only these intentional transcript buffers receive fill. Internal blank
     // separators and native tool/editor outer spacing remain unpainted.
-    if (!this.buffered) return lines;
+    if (!this.buffered) { this.lastHeight = lines.length; return lines; }
     const buffer = this.paint(" ".repeat(width));
+    this.lastHeight = lines.length + 2;
     return [buffer, ...lines, buffer];
   }
 }
@@ -175,18 +188,32 @@ export function registerQuestions(pi: ExtensionAPI, enabled: boolean): void {
   let sessionId: string | undefined;
   let active: { id: number; close: (result: QuestionUIResult) => void } | undefined;
   let retryConfirmation: { id: number } | undefined;
-  let listExpanded = true;
   let listOffset = 0;
   // Native tool components cache their layout. Invalidate their public renderer
   // contexts when status changes; never mutate old results or append UI messages.
   const transcriptInvalidators = new Map<string, () => void>();
+  const viewportDisposers = new Set<() => void>();
+  const disposeViewports = () => { for (const dispose of viewportDisposers) dispose(); };
 
   const persist = (record: QuestionRecord) => {
     pi.appendEntry(QUESTION_ENTRY_TYPE, structuredClone(record));
     records.set(record.id, record);
   };
   const attention = () => [...records.values()].filter(record => record.status === "pending" || (record.status === "answered" && !record.delivered));
+  const liveQuestion = (snapshot: QuestionRecord | undefined, renderedSession: string | undefined) => {
+    const live = snapshot && renderedSession === sessionId ? records.get(snapshot.id) : undefined;
+    return live && live.source === snapshot?.source && live.toolCallId === snapshot.toolCallId
+      && live.question === snapshot.question && JSON.stringify(live.options) === JSON.stringify(snapshot.options) ? live : undefined;
+  };
+  const openCard = (snapshot: QuestionRecord | undefined, renderedSession: string | undefined) => {
+    const live = liveQuestion(snapshot, renderedSession);
+    const ctx = currentContext;
+    if (!ctx || ctx.sessionManager.getSessionId() !== renderedSession || live?.status !== "pending") return false;
+    void answerQuestion(`Q${live.id}`, ctx).catch(() => ctx.ui.notify(`Q${live.id}: unable to open. Use /q.`, "warning"));
+    return true;
+  };
   const refresh = () => {
+    disposeViewports();
     const ctx = currentContext;
     if (ctx?.mode !== "tui" || !ctx.hasUI) return;
     for (const invalidate of transcriptInvalidators.values()) invalidate();
@@ -201,6 +228,35 @@ export function registerQuestions(pi: ExtensionAPI, enabled: boolean): void {
     ctx.ui.setStatus(QUESTION_DELIVERY_STATUS_KEY, saved.length && !waitingForDelivery ? `${saved.length} saved answer${saved.length === 1 ? "" : "s"} · delivery unconfirmed · /q Q${saved[0].id} retry` : undefined);
     const stamp = generation;
     ctx.ui.setWidget(QUESTION_STATUS_KEY, pending.length ? (tui, theme) => {
+      let proseLeaf: string | null | undefined;
+      let proseSources: ProseQuestionSource[] | undefined;
+      const shouldShow = questionListVisibility(tui, pending, () => {
+        if (!sameGeneration(stamp) || !pending.some(record => record.source === "prose")
+          || typeof ctx.sessionManager.buildContextEntries !== "function") return;
+        const leaf = ctx.sessionManager.getLeafId();
+        if (leaf === proseLeaf && proseSources) return proseSources;
+        proseLeaf = leaf;
+        const seen = new Set<number>();
+        proseSources = ctx.sessionManager.buildContextEntries().flatMap(entry => {
+          if (entry.type !== "message" || entry.message.role !== "assistant") return [];
+          const questions = parseProseQuestions(textContent(entry.message)).flatMap(question => {
+            const record = pending.find(record => record.source === "prose" && record.id === question.id && record.question === question.question);
+            if (!record || seen.has(record.id)) return [];
+            seen.add(record.id);
+            return [{ identity: record, id: record.id, question: record.question }];
+          });
+          return questions.length ? [{ message: entry.message, questions }] : [];
+        });
+        return proseSources;
+      }, (identity, message) => {
+        const record = pending.find(record => record === identity);
+        if (!record || !sameGeneration(stamp) || records.get(record.id) !== record || record.status !== "pending"
+          || ctx.sessionManager.getSessionId() !== sessionId || !ctx.sessionManager.buildContextEntries().some(entry =>
+            entry.type === "message" && entry.message === message)) return false;
+        return openCard(record, sessionId);
+      });
+      const dispose = () => { shouldShow.dispose(); viewportDisposers.delete(dispose); };
+      viewportDisposers.add(dispose);
       let lastWidth = 0;
       let lastHeight = 0;
       let targets: (QuestionRecord | undefined)[] = [];
@@ -208,17 +264,18 @@ export function registerQuestions(pi: ExtensionAPI, enabled: boolean): void {
       let wrappedWidth = 0;
       let body: { text: string; record?: QuestionRecord }[] = [];
       return {
+        dispose,
         invalidate() {},
         render(width) {
           lastWidth = width;
           targets = [];
           lastHeight = 0;
-          if (width <= 0) return [];
+          if (width <= 0 || !shouldShow(width)) return [];
           const lines = [
             "", // Keep breathing room above; the native editor owns the gap below.
-            questionStyle(theme, truncateToWidth(`${listExpanded ? "▾" : "▸"} Questions · ${pending.length} pending · /q`, width, "", true), "warning", "choice", { bold: true }),
+            questionStyle(theme, truncateToWidth(`Questions · ${pending.length} pending`, width, "", true), "warning", "question", { bold: true }),
           ];
-          if (listExpanded) {
+          {
             if (wrappedWidth !== width) {
               wrappedWidth = width;
               body = [];
@@ -253,17 +310,12 @@ export function registerQuestions(pi: ExtensionAPI, enabled: boolean): void {
         },
         handleMouse(event) {
           if (!sameGeneration(stamp) || event.x < 0 || event.x >= lastWidth || event.y < 0 || event.y >= lastHeight) return;
-          if (listExpanded && event.type === "wheel" && event.wheelDelta) {
+          if (event.type === "wheel" && event.wheelDelta) {
             listOffset = Math.max(0, Math.min(maxOffset, listOffset + Math.sign(event.wheelDelta)));
             tui.requestRender();
             return { handled: true, render: true };
           }
           if (event.type !== "click" || event.button !== "left") return;
-          if (event.y === 1) {
-            listExpanded = !listExpanded;
-            tui.requestRender();
-            return { handled: true, render: true };
-          }
           const record = targets[event.y];
           if (!record) return;
           // No editor replacement or draft mutation: only an explicit click opens an overlay.
@@ -275,6 +327,7 @@ export function registerQuestions(pi: ExtensionAPI, enabled: boolean): void {
   };
   const clearUI = () => {
     generation++;
+    disposeViewports();
     listOffset = 0;
     active?.close({ kind: "defer" });
     active = undefined;
@@ -561,35 +614,52 @@ export function registerQuestions(pi: ExtensionAPI, enabled: boolean): void {
     },
     renderCall(_args, theme, context) {
       const record = [...records.values()].find(question => question.toolCallId === context.toolCallId);
-      return new QuestionTranscript(() => questionStyle(theme, `Ask user${record ? ` · Q${record.id}` : ""}`, "muted", "choice"),
-        line => questionPaint(theme, line, "choice"));
+      const renderedSession = sessionId;
+      return new QuestionTranscript(() => questionStyle(theme, `Ask user${record ? ` · Q${record.id}` : ""}`, "warning", "question"),
+        line => questionPaint(theme, line, "question"), false, () => openCard(record, renderedSession));
     },
     renderResult(result, _options, theme, context) {
       const details = result.details as QuestionDetails | undefined;
       const snapshot = readRecord(details?.question);
+      const associated = snapshot?.toolCallId !== undefined && snapshot.toolCallId === context?.toolCallId;
       const renderedSession = sessionId;
       if (context?.invalidate) transcriptInvalidators.set(context.toolCallId, context.invalidate);
-      return new QuestionTranscript(() => {
-        const live = snapshot && renderedSession === sessionId ? records.get(snapshot.id) : undefined;
-        // IDs are session-scoped. Do not lend a different question's status to an
-        // error result or a historical card whose scope no longer matches.
-        const record = live && live.question === snapshot?.question && JSON.stringify(live.options) === JSON.stringify(snapshot.options) ? live : snapshot;
+      const current = () => liveQuestion(snapshot, renderedSession) ?? snapshot;
+      const labelFor = (record: QuestionRecord | undefined) => {
         const status = details?.status === "error" ? "error" : record?.status ?? details?.status;
-        const label = `${record ? `Q${record.id} · ` : ""}${status === "answered"
+        return { status, label: `${record ? `Q${record.id} · ` : ""}${status === "answered"
           ? `Answered${record?.resolution || record?.delivered ? "" : " · saved, delivery unconfirmed"}`
           : status === "dismissed" ? record?.resolution ? "Dismissed by agent" : "Dismissed"
-          : status === "error" ? "Not answered (error)" : "Pending · click Questions or /q"}`;
+          : status === "error" ? "Not answered (error)" : "Pending · click to answer"}` };
+      };
+      return new QuestionTranscript(() => {
+        const record = current();
+        const { status, label } = labelFor(record);
         return [
           questionStyle(theme, label, status === "answered" ? "success" : status === "error" ? "warning" : "muted", "question"),
           ...(record ? [""] : []),
           // The actual question and all choices are always in the ordinary
           // transcript, once, independently of expansion and the optional popup.
           ...(record ? questionLines(record) : []),
-          ...(record?.answer ? [`Answer: ${safe(record.answer.text)}`] : []),
-          ...(status === "dismissed" && record?.resolution ? [`Reason: ${safe(record.resolution.reason)}`] : []),
+          ...(record?.answer ? ["", `Answer: ${safe(record.answer.text)}`] : []),
+          ...(status === "dismissed" && record?.resolution ? ["", `Reason: ${safe(record.resolution.reason)}`] : []),
           ...(details?.reason && status === "error" ? [safe(details.reason)] : []),
         ].join("\n");
-      }, line => questionPaint(theme, line, "question"), true);
+      }, line => questionPaint(theme, line, "question"), true,
+      () => associated && details?.status !== "error" && openCard(snapshot, renderedSession), width => {
+        const live = associated ? liveQuestion(snapshot, renderedSession) : undefined;
+        if (details?.status === "error" || live?.status !== "pending" || width <= 0) return;
+        const offset = 1 + wrapTextWithAnsi(labelFor(live).label, width).length + 1;
+        const rows: number[] = [];
+        // The ID, status, choices and filled outer buffers are not question text.
+        let prefix = `Q${live.id}:`;
+        for (const [index, line] of wrapTextWithAnsi(`Q${live.id}: ${safe(live.question)}`, width).entries()) {
+          let text = stripTerminalSequences(truncateToWidth(line, width, "", true)).trim();
+          while (prefix && text.startsWith(prefix[0])) { prefix = prefix.slice(1); text = text.slice(1).trimStart(); }
+          if (!prefix && text.trim()) rows.push(offset + index);
+        }
+        return { identity: live, rows };
+      });
     },
   });
 
