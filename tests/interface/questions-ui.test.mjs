@@ -908,8 +908,13 @@ test("amber transcript/list cards match the header, contrast with gray chrome, a
     assert.ok(contrast(header.fg, header.bg) >= 4.5, "restored warm header retains readable contrast");
     assert.equal(body.fg, header.fg, "question text matches the header foreground");
     assert.equal(body.bg, header.bg, "question text matches the header background");
-    const expectedForeground = appearance === "light" ? [95, 0, 0] : mode === "truecolor" ? [255, 240, 191] : [255, 255, 175];
-    assert.deepEqual(rgbFromAnsi(body.fg), expectedForeground, "question foreground uses brighter pale yellow/dark red");
+    const expectedForeground = appearance === "light" ? [95, 0, 0] : mode === "truecolor" ? [255, 255, 128] : [255, 255, 135];
+    assert.deepEqual(rgbFromAnsi(body.fg), expectedForeground, "question foreground uses vivid lemon yellow/dark red");
+    if (appearance === "dark" && mode === "truecolor") {
+      const previous = "2;255;240;191";
+      assert.ok(contrast(body.fg, body.bg) > contrast(previous, body.bg), "lemon yellow improves contrast over the previous cream text");
+      assert.ok(contrast(body.fg, body.bg) >= 8.6, "dark-mode question text retains strong luminance contrast");
+    }
     if (appearance === "dark") {
       const previous = ansiCells(questionStyle(theme, "Previous", "warning", "question"))[0];
       assert.ok(contrast(body.fg, body.bg) > contrast(previous.fg, previous.bg), "question text stands out more than the previous amber-yellow text");

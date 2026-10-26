@@ -1367,7 +1367,7 @@ test("question transcript uses amber buffers and darker amber separators without
   const result = await h.ask(args);
   for (const appearance of ["dark", "light"]) for (const mode of ["truecolor", "256color"]) {
     const theme = themes.loadThemeFromPath(join(root, `dist/modes/interactive/theme/${appearance}.json`), mode);
-    const fg = mode === "truecolor" ? (appearance === "dark" ? "38;2;255;240;191" : "38;2;95;0;0") : (appearance === "dark" ? "38;5;229" : "38;5;52");
+    const fg = mode === "truecolor" ? (appearance === "dark" ? "38;2;255;255;128" : "38;2;95;0;0") : (appearance === "dark" ? "38;5;228" : "38;5;52");
     const bg = backgroundAnsi(parseColor(appearance === "dark" ? "#594515" : "#fff0bf"), mode).slice(2, -1);
     for (const width of [1, 2, 5, 12, 80]) {
       const render = expanded => h.tool.renderResult(result, { expanded }, theme).render(width);
