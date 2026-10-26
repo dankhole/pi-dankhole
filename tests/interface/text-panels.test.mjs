@@ -97,6 +97,57 @@ function fixture(enabled = true, mode = "tui") {
   return { handlers, transformer, ctx, transform, markdown };
 }
 
+test("printable ASCII panels skip segmentation while Unicode stays grapheme-aware and source controls are sanitized", () => {
+  const segment = Intl.Segmenter.prototype.segment;
+  let calls = 0;
+  const inputs = [];
+  Intl.Segmenter.prototype.segment = function (value) { calls++; inputs.push(value); return segment.call(this, value); };
+  try {
+    const f = fixture();
+    const rows = ["", "    a  b\tc  ", "` [literal](path) ~", "a".repeat(100_000)];
+    const source = "~~~~text\n" + rows.join("\n") + "\n~~~~";
+    const transformed = f.transform(source, { availableWidth: 12 });
+    assert.equal(calls, 0, "ASCII wrapping performs no per-character segmentation");
+    assert.doesNotMatch(transformed, /~~~~text/);
+    for (const width of [1, 2, 3, 4, 12, 40]) {
+      const padding = width >= 4 ? 1 : 0;
+      const available = Math.max(1, width - padding * 2);
+      const row = "  a\tb  ` ]](path) trailing  ".replace(/\t/g, "   ");
+      const rendered = f.transform("~~~~text\n" + row + "\n~~~~", { availableWidth: width }).split("\n").filter(Boolean)
+        .map(line => stripVTControlCharacters(/^(`+) ([\s\S]*) \1$/.exec(line)[2]));
+      const expected = [];
+      for (let offset = 0; offset < row.length; offset += available) {
+        expected.push(" ".repeat(padding) + row.slice(offset, offset + available).padEnd(width - padding));
+      }
+      assert.deepEqual(rendered, expected, `literal ASCII output at width ${width}`);
+    }
+    inputs.length = 0;
+    const sanitized = f.transform("```text\n中文 é 👩‍💻\n\u001b[0mcontrol\n```", { availableWidth: 12 });
+    assert.ok(inputs.includes("中文 é 👩‍💻"), "Unicode retains grapheme-aware processing");
+    assert.ok(!inputs.includes("\u001b[0mcontrol"), "source controls are stripped before wrapping, as on master");
+    assert.ok(stripVTControlCharacters(sanitized).includes("control"), "sanitizing controls retains literal text");
+    inputs.length = 0;
+    const code = '{"name": "a   b", "count": 42, "ok": true}';
+    f.transform("```json\n" + code + "\n```", { availableWidth: 12 });
+    assert.ok(!inputs.includes(code), "highlighted ASCII walks style state without segmenting its source");
+  } finally { Intl.Segmenter.prototype.segment = segment; }
+});
+
+test("ordinary Markdown without candidate fences skips line splitting", () => {
+  const f = fixture();
+  const source = "ordinary prose\n".repeat(1000);
+  const split = String.prototype.split;
+  let splits = 0;
+  String.prototype.split = function (...args) {
+    if (this.valueOf() === source) splits++;
+    return split.apply(this, args);
+  };
+  try {
+    assert.equal(f.transform(source), source);
+    assert.equal(splits, 0);
+  } finally { String.prototype.split = split; }
+});
+
 test("native Pi synthesizes visible fence borders; panels replace only the display", () => {
   assert.match(plain(new Markdown(source, 0, 0, themes.getMarkdownTheme())).join("\n"), /```text/);
   const f = fixture();

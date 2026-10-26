@@ -643,6 +643,86 @@ test("full extension wiring combines all UI features and cleans on reload", asyn
   assert.equal(view.statuses.size, 0);
 });
 
+test("pin painting does not repeat provenance resolution or native component measurement", async () => {
+  const extension = await load();
+  const view = setup(true);
+  const user = view.addUser("Counted prompt");
+  view.chat.addChild(new Text("tail\n".repeat(40), 0, 0));
+  await emit(extension, "session_start", view.ctx);
+  let scans = 0;
+  let renders = 0;
+  const filter = view.chat.children.filter;
+  view.chat.children.filter = function(...args) { scans++; return filter.apply(this, args); };
+  const markdown = user.children[0];
+  const render = markdown.render;
+  markdown.render = function(width) { renders++; return render.call(this, width); };
+  const entry = view.root.entries[0];
+  assert.equal(entry.visible({ width: 90, height: 15 }), true);
+  assert.equal(scans, 1);
+  assert.equal(renders, 1, "one fresh document pass supplies target rows and offsets too");
+  for (let index = 0; index < 100; index++) entry.component.render(90);
+  assert.equal(scans, 1, "painting needs history text only");
+  assert.equal(renders, 1);
+  await extension.commands.get("latest-input").handler("", view.ctx);
+  assert.equal(scans, 2, "jump resolves current provenance afresh");
+  assert.equal(renders, 2, "jump also measures the document only once");
+  await emit(extension, "session_shutdown", view.ctx);
+});
+
+test("unsupported foreign chat coordinates retain the pin and explain an unavailable jump", async () => {
+  for (const grouping of [false, true]) {
+    const extension = await load(true, grouping);
+    const view = setup(true);
+    view.addUser("Do not guess this offset");
+    await emit(extension, "session_start", view.ctx);
+    assert.equal(pinVisible(view), false);
+    const lines = view.chat.render(90);
+    view.chat.render = () => lines;
+    const before = view.transcript.scrollTop;
+    assert.equal(pinVisible(view), true, "same-height foreign output does not prove native coordinates");
+    await extension.commands.get("latest-input").handler("", view.ctx);
+    assert.equal(view.transcript.scrollTop, before);
+    assert.match(view.notices.at(-1), /cannot be located.*layout/);
+    await emit(extension, "session_shutdown", view.ctx);
+  }
+});
+
+test("same-height foreign document reversal retains the pin and declines an unsafe jump", async () => {
+  const extension = await load();
+  const view = setup(true);
+  view.chat.addChild(new Text("earlier output\n".repeat(30), 0, 0));
+  view.addUser("Reversed selected prompt");
+  await emit(extension, "session_start", view.ctx);
+  assert.equal(pinVisible(view), false, "native follow-end initially includes the latest prompt");
+  const native = view.document.render;
+  view.document.render = function(width) { return native.call(this, width).slice().reverse(); };
+  const reversed = view.document.render(90);
+  const promptRow = reversed.findIndex(line => plain(line).includes("Reversed selected prompt"));
+  assert.ok(promptRow < view.transcript.scrollTop, "foreign reversal moves actual prompt text above the viewport");
+  assert.equal(pinVisible(view), true, "refreshed native mouseLayout cannot justify foreign row coordinates");
+  const before = view.transcript.scrollTop;
+  await extension.commands.get("latest-input").handler("", view.ctx);
+  assert.equal(view.transcript.scrollTop, before);
+  assert.match(view.notices.at(-1), /cannot be located.*layout/);
+  await emit(extension, "session_shutdown", view.ctx);
+});
+
+test("same-height foreign prompt output cannot stand in for native user text", async () => {
+  const extension = await load();
+  const view = setup(true);
+  const user = view.addUser("Native user text");
+  await emit(extension, "session_start", view.ctx);
+  assert.equal(pinVisible(view), false);
+  const native = user.render(90);
+  user.render = () => native.map(() => "Foreign content");
+  assert.equal(pinVisible(view), true);
+  const before = view.transcript.scrollTop;
+  await extension.commands.get("latest-input").handler("", view.ctx);
+  assert.equal(view.transcript.scrollTop, before);
+  assert.match(view.notices.at(-1), /cannot be located.*layout/);
+  await emit(extension, "session_shutdown", view.ctx);
+});
+
 test("disabled, non-TUI, regular and incompatible layouts leave native UI intact", async () => {
   for (const scenario of ["disabled", "rpc", "regular", "incompatible"]) {
     const extension = await load(scenario !== "disabled");

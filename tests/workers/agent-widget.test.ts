@@ -1,7 +1,12 @@
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { renderRunningAgentStatus } from "../../src/workers/index.js";
 import type { WidgetMode } from "../../src/workers/types.js";
 import { type AgentActivity, AgentWidget, fgPreservingNestedStyles, formatCost, formatDuration, formatMs, formatSessionTokens } from "../../src/workers/ui/agent-widget.js";
+
+// update() now owns animation re-arming as well as lifecycle refreshes.
+// Keep these rendering-only fixtures from leaving real animation intervals.
+beforeEach(() => vi.useFakeTimers());
+afterEach(() => { vi.clearAllTimers(); vi.useRealTimers(); });
 
 describe("formatSessionTokens", () => {
   const theme = { fg: (c: string, s: string) => `<${c}>${s}</${c}>`, bold: (s: string) => s };

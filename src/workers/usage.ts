@@ -1,4 +1,6 @@
-/** usage.ts — Token usage: shapes, accumulator operators, session-stats readers. */
+/** usage.ts — Token usage: shapes, accumulator operators, session readers. */
+
+import type { AgentSession } from "@earendil-works/pi-coding-agent";
 
 /**
  * Lifetime usage components, accumulated via `message_end` events. Survives
@@ -131,9 +133,12 @@ export class PendingUsagePool {
 /** Minimal shape we read from upstream `getSessionStats()`. */
 export type SessionStatsLike = {
   tokens: { input: number; output: number; cacheWrite: number };
-  contextUsage?: { percent: number | null };
 };
 export type SessionLike = { getSessionStats(): SessionStatsLike };
+export type ContextSessionLike = Pick<AgentSession, "getContextUsage"> &
+  Partial<Pick<AgentSession, "sessionManager" | "model" | "routedModel" | "messages">>;
+
+const contextCache = new WeakMap<ContextSessionLike, { state: unknown[]; percent: number | null }>();
 
 /**
  * Session-scoped token count: input + output + cacheWrite as reported by
@@ -160,8 +165,27 @@ export function getSessionTokens(session: SessionLike | undefined): number {
  * Context-window utilization (0–100), or null when unavailable
  * (no model contextWindow, or post-compaction before the next response).
  */
-export function getSessionContextPercent(session: SessionLike | undefined): number | null {
+export function getSessionContextPercent(session: ContextSessionLike | undefined): number | null {
   if (!session) return null;
-  try { return session.getSessionStats().contextUsage?.percent ?? null; }
-  catch { return null; }
+  try {
+    const manager = session.sessionManager;
+    // Pi's finalized projection is append-only and branch-sensitive. Leaf alone
+    // misses session replacement; messages alone misses compaction/context edits.
+    // Never retain an answer for a caller without authoritative history state.
+    if (!manager) return session.getContextUsage()?.percent ?? null;
+    const model = session.model;
+    const routedModel = session.routedModel?.model;
+    const messages = session.messages;
+    const state = [
+      manager, manager.getSessionId(), manager.getLeafId(), manager.getEntryCount(),
+      model, model?.provider, model?.id, model?.contextWindow,
+      routedModel, routedModel?.provider, routedModel?.id, routedModel?.contextWindow,
+      messages, messages?.length, messages?.at(-1),
+    ];
+    const cached = contextCache.get(session);
+    if (cached && state.every((value, index) => value === cached.state[index])) return cached.percent;
+    const percent = session.getContextUsage()?.percent ?? null;
+    contextCache.set(session, { state, percent });
+    return percent;
+  } catch { return null; }
 }

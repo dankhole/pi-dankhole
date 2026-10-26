@@ -61,6 +61,51 @@ function tool(id) {
   return component;
 }
 
+test("thinking run analysis scans once per native update and refreshes same-object mutations", () => {
+  let reads = 0;
+  const count = 100;
+  const content = Array.from({ length: count }, () => [{ type: "thinking", get thinking() { reads++; return "reasoning"; } }, text("answer")]).flat();
+  const source = message(content);
+  const a = new AssistantMessageComponent(source);
+  reads = 0;
+  a.updateContent(source);
+  const nativeReads = reads;
+  const originalUpdate = a.updateContent;
+  const f = fixture([a]);
+  const dispose = f.install();
+  reads = 0;
+  a.updateContent(source);
+  assert.equal(reads, nativeReads + count, "the adapter reads each thinking block once, not once for each run");
+  content.push(thinking("trailing live"));
+  a.updateContent(source, true);
+  assert.ok(plain(a).some(line => line.includes("trailing live")));
+  content.push(toolCall);
+  a.updateContent(source, true);
+  assert.ok(!plain(a).some(line => line.includes("trailing live")), "a same-array append closes the previous run");
+  a.setHideThinkingBlock(false);
+  assert.ok(plain(a).some(line => line.includes("trailing live")), "native global visibility remains authoritative");
+  dispose();
+  assert.equal(a.updateContent, originalUpdate);
+  assert.equal(Object.hasOwn(a, "updateContent"), false);
+});
+
+test("thinking update wrapper restores owned descriptors and retains foreign replacements", () => {
+  const a = assistant([thinking("reasoning")]);
+  const original = a.updateContent.bind(a);
+  a.updateContent = original;
+  const descriptor = Object.getOwnPropertyDescriptor(a, "updateContent");
+  const f = fixture([a]);
+  const dispose = f.install();
+  assert.notEqual(a.updateContent, original);
+  dispose();
+  assert.deepEqual(Object.getOwnPropertyDescriptor(a, "updateContent"), descriptor);
+  const second = f.install();
+  const foreign = a.updateContent.bind(a);
+  a.updateContent = foreign;
+  second();
+  assert.equal(a.updateContent, foreign);
+});
+
 test("native history thinking collapses to its native row; clicks expand intact reasoning and stay expanded", () => {
   const content = [thinking("first **thought**\n\nsecond paragraph\n\n- 中文\n- last"), thinking("adjacent thought"), text("answer")];
   const a = assistant(content);

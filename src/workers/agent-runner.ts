@@ -259,11 +259,27 @@ export function installExtensionToolScope(
     if (event.type === "turn_end") renarrow();
   });
 
-  callGate.allows = (name) => inScope().has(name);
+  // Call-time checks need one name, not a complete activation set. Read the
+  // live maps/policy on every call, but resolve manifests only for extensions
+  // that currently own that name. In particular, built-ins need no filesystem
+  // work. Do not cache aliases: owning manifests can change during a session.
+  const allows = (name: string): boolean => {
+    if (EXCLUDED_TOOL_NAMES.includes(name) || disallowedSet?.has(name)) return false;
+    if (toolNames.includes(name)) return true;
+    for (const extension of loader.getExtensions().extensions) {
+      if (!extension.tools.has(name)) continue;
+      const canons = extensionCanonicalNames(extension.path);
+      if (extNames.size > 0 && !canons.some(c => extNames.has(c))) continue;
+      const narrowed = canons.map(c => narrowing.get(c)).find(Boolean);
+      if (!narrowed || narrowed.has(name)) return true;
+    }
+    return false;
+  };
+  callGate.allows = allows;
 
   const priorBeforeToolCall = session.agent.beforeToolCall;
   session.agent.beforeToolCall = async (context, signal) => {
-    if (!inScope().has(context.toolCall.name)) {
+    if (!allows(context.toolCall.name)) {
       return {
         block: true,
         reason: `Tool "${context.toolCall.name}" is not available to this subagent.`,

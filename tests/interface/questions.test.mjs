@@ -41,10 +41,13 @@ async function harness(options = {}) {
 import {registerPinnedPrompt} from ${JSON.stringify(resolve(dirname(questionsPath), "../styling/pinned-prompt.ts"))};
 import {registerGrouping} from ${JSON.stringify(resolve(dirname(questionsPath), "../styling/grouping.ts"))};
 import {defaults} from ${JSON.stringify(resolve(dirname(questionsPath), "../settings/interface.ts"))};
+${options.instrument ? `import {registerTranscriptRenderer} from ${JSON.stringify(resolve(dirname(questionsPath), "../styling/transcript-measurement.ts"))}; globalThis.__questionTestRegisterRenderer = registerTranscriptRenderer;` : ""}
 export default pi => { registerQuestions(pi, ${options.enabled !== false}); ${options.pin ? "registerPinnedPrompt(pi, true);" : ""} ${options.grouping ? "registerGrouping(pi, defaults());" : ""} }`);
   const loaded = await loadExtensions([path], scratch);
   assert.deepEqual(loaded.errors, []);
   const extension = loaded.extensions[0];
+  const registerRenderer = options.instrument ? globalThis.__questionTestRegisterRenderer : undefined;
+  delete globalThis.__questionTestRegisterRenderer;
   const manager = options.manager ?? SessionManager.inMemory(scratch);
   const statuses = new Map([["other", "keep me"]]);
   const widgets = new Map();
@@ -120,7 +123,7 @@ export default pi => { registerQuestions(pi, ${options.enabled !== false}); ${op
     current.component.handleInput("\r"); // Enter sends the highlighted choice directly.
   };
   await emit("session_start");
-  return { loaded, extension, ctx, manager, statuses, widgets, notifications, confirmations, dialogs, sent, tool, resolutionTool, resolveQuestion, updates, ask, command, emit, message, toolMessage, input, records, latest, widget, widgetComponent, submitCustom, submitOption, current: () => current };
+  return { loaded, extension, ctx, manager, statuses, widgets, notifications, confirmations, dialogs, sent, tool, resolutionTool, resolveQuestion, updates, ask, command, emit, message, toolMessage, input, records, latest, widget, widgetComponent, submitCustom, submitOption, registerRenderer, current: () => current };
 }
 
 // Use Pi's real event/persistence handler while bypassing unrelated model/tool runtime setup.
@@ -2039,7 +2042,7 @@ test("restoration validates exact input/chat IDs, source and question-input-chat
   const body = "Use SQLite.";
   await h.input(body);
   await h.resolveQuestion({ question_id: 1, resolution: "answered", reason: "The observed input chooses SQLite.", user_message: body });
-  for (const variant of ["valid", "chat-before-input", "input-before-question", "chat-after-resolution", "wrong-source", "wrong-input-id", "wrong-chat-id", "assistant-chat"]) {
+  for (const variant of ["valid", "rpc", "chat-before-input", "input-before-question", "chat-after-resolution", "input-after-resolution", "wrong-source", "wrong-input-id", "wrong-chat-id", "assistant-chat", "missing-pending-id", "malformed-pending-ids", "extension-source", "different-observed-text", "not-pending-at-receipt", "prose-cannot-reopen-dismissal"]) {
     const timestamp = new Date().toISOString();
     const resolved = structuredClone(h.latest());
     resolved.resolution.evidence = { inputEntryId: "input", inputSource: "interactive", chatEntryId: "chat", text: body };
@@ -2047,20 +2050,32 @@ test("restoration validates exact input/chat IDs, source and question-input-chat
       question: { id: "question", type: "custom", customType: entryType, data: structuredClone(pending.details.question) },
       input: { id: "input", type: "custom", customType: "compact-tools:question-input", data: { version: 1, source: "interactive", text: body, pendingIds: [1] } },
       chat: { id: "chat", type: "message", message: user(body) },
+      dismissed: { id: "dismissed", type: "custom", customType: entryType, data: { ...structuredClone(pending.details.question), status: "dismissed",
+        resolution: { actor: "agent", reason: "No longer needed on this branch.", toolCallId: "dismiss-call" } } },
+      prose: { id: "prose", type: "message", message: assistant(`Q1: ${pending.details.question.question}`) },
+      pendingAgain: { id: "pendingAgain", type: "custom", customType: entryType, data: structuredClone(pending.details.question) },
       resolution: { id: "resolution", type: "custom", customType: entryType, data: resolved },
     };
     let order = ["question", "input", "chat", "resolution"];
     if (variant === "chat-before-input") order = ["question", "chat", "input", "resolution"];
     if (variant === "input-before-question") order = ["input", "question", "chat", "resolution"];
     if (variant === "chat-after-resolution") order = ["question", "input", "resolution", "chat"];
+    if (variant === "input-after-resolution") order = ["question", "resolution", "input", "chat"];
     if (variant === "wrong-source") resolved.resolution.evidence.inputSource = "rpc";
     if (variant === "wrong-input-id") resolved.resolution.evidence.inputEntryId = "chat";
     if (variant === "wrong-chat-id") resolved.resolution.evidence.chatEntryId = "input";
     if (variant === "assistant-chat") entries.chat.message = assistant(body);
+    if (variant === "rpc") { entries.input.data.source = "rpc"; resolved.resolution.evidence.inputSource = "rpc"; }
+    if (variant === "missing-pending-id") entries.input.data.pendingIds = [2];
+    if (variant === "malformed-pending-ids") entries.input.data.pendingIds = { 0: 1 };
+    if (variant === "extension-source") entries.input.data.source = "extension";
+    if (variant === "different-observed-text") entries.input.data.text = `${body}\nDo not alter this scope.`;
+    if (variant === "not-pending-at-receipt") order = ["question", "dismissed", "input", "pendingAgain", "chat", "resolution"];
+    if (variant === "prose-cannot-reopen-dismissal") order = ["question", "dismissed", "prose", "input", "pendingAgain", "chat", "resolution"];
     // Independent in-memory corruption/ordering fixture; no stored session history is edited.
     const fixture = SessionManager.inMemory(scratch, undefined, [h.manager.getHeader(), ...order.map((key, index) => ({ ...entries[key], timestamp, parentId: index ? order[index - 1] : null }))]);
     const resumed = await harness({ manager: fixture });
-    if (variant === "valid") {
+    if (variant === "valid" || variant === "rpc") {
       assert.equal(resumed.widget(), "");
       assert.match(plain(resumed.tool.renderResult(pending, { expanded: false }, themes.theme)), /Q1 · Answered/);
     } else {
@@ -2315,10 +2330,26 @@ test("native prose visibility uses current entry message identity, never arbitra
   assert.equal(h.sent.length, 0);
 });
 
+test("foreign question-body rendering cannot hide the offscreen reminder using stale metadata", async () => {
+  const h = await harness();
+  const view = nativeQuestionView(h, { rows: 35, width: 80 });
+  const args = { question: "Actual native body question?" };
+  const card = view.add(await h.ask(args), args);
+  view.frame();
+  const body = card.resultRendererComponent;
+  const render = body.render;
+  const lines = body.render(80);
+  body.render = () => lines.map(() => "Foreign replacement without any question");
+  assert.equal(view.reminderVisible(), true, "only actual owned question text can suppress the reminder");
+  body.render = render;
+  assert.equal(view.reminderVisible(), false, "restored native painting supplies valid metadata again");
+  await h.emit("session_shutdown");
+});
+
 test("one pending question with many historical native cards has linear per-frame render counts", async t => {
   const samples = [];
   for (const count of [20, 50]) {
-    const h = await harness();
+    const h = await harness({ instrument: true });
     const view = nativeQuestionView(h);
     const history = [];
     for (let i = 1; i <= count; i++) {
@@ -2329,14 +2360,18 @@ test("one pending question with many historical native cards has linear per-fram
     const cards = [...history, pending].map(result => view.add(result));
     view.frame();
     let renders = 0;
-    for (const card of cards) {
+    const restoreSpies = cards.map(card => {
       const render = card.render;
       card.render = function(width) { renders++; return render.call(this, width); };
-    }
+      // This instrumentation preserves every native row and coordinate exactly.
+      const unregister = h.registerRenderer(card, card.render);
+      return () => { unregister(); card.render = render; };
+    });
     const frame = view.frame();
     assert.equal(view.list().render(view.tui.terminal.columns).length, 0, "visible pending question removes all reminder rows");
     assert.doesNotMatch(frame.lines.map(stripTerminalSequences).join("\n"), /Questions ·/);
     samples.push(renders);
+    for (const restore of restoreSpies) restore();
     assert.ok(renders <= 12 * cards.length, `${count} historical cards: ${renders} native renders, bounded passes not per-card rescans`);
     await h.emit("session_shutdown");
   }
@@ -2489,6 +2524,201 @@ test("regular/unsupported layouts keep the reminder; pin and other input widgets
   assert.equal(h.sent.length, 0);
   assert.equal(h.dialogs.length, 0);
   await h.emit("session_shutdown");
+});
+
+test("question cards cache painting and metadata until their own state, width or style changes", async t => {
+  const h = await harness();
+  const result = await h.ask({ question: "Choose 界e\u0301?", options: [{ label: "Local only", description: "Keep current scope" }] });
+  let currentTheme = themes.theme;
+  const dynamicTheme = new Proxy(currentTheme, { get(_target, key) {
+    const value = Reflect.get(currentTheme, key);
+    return typeof value === "function" ? value.bind(currentTheme) : value;
+  } });
+  const component = h.tool.renderResult(result, { expanded: false }, dynamicTheme,
+    { toolCallId: result.details.question.toolCallId, invalidate() {} });
+  let layouts = 0;
+  const setText = component.setText;
+  component.setText = function(text) { layouts++; setText.call(this, text); };
+  const symbol = Object.getOwnPropertySymbols(Object.getPrototypeOf(component)).find(symbol => symbol.description === "question-content");
+  const first = component.render(80);
+  const metadata = component[symbol](80);
+  for (let i = 0; i < 30; i++) {
+    assert.equal(component.render(80), first, "unchanged painted rows are reused, not just native Text wrapping");
+    assert.equal(component[symbol](80), metadata, "wrapped question-text metadata is reused");
+  }
+  assert.equal(layouts, 1);
+  component.render(0);
+  assert.equal(component.render(80), first, "zero-width probes do not invalidate the bounded last-width cache");
+  assert.ok(component[symbol](79).rows.length);
+  assert.notEqual(component[symbol](80), metadata, "metadata caches one width only");
+  const changedWidth = component.render(79);
+  assert.notEqual(changedWidth, first);
+  component.invalidate();
+  const invalidated = component.render(79);
+  assert.notEqual(invalidated, changedWidth);
+  const originalColors = currentTheme.colors;
+  currentTheme = themes.getThemeByName("dark");
+  assert.notEqual(currentTheme.colors, originalColors);
+  const sameAppearance = component.render(79);
+  assert.notEqual(sameAppearance, invalidated, "same proxy/appearance/mode still observes replaced resolved colors without invalidate");
+  currentTheme = themes.getThemeByName("light");
+  const light = component.render(79);
+  assert.notEqual(light, sameAppearance, "appearance changes cannot reuse old ANSI paint");
+  currentTheme = themes.loadThemeFromPath(join(root, "dist/modes/interactive/theme/light.json"), "256color");
+  const indexedColor = component.render(79);
+  assert.notEqual(indexedColor, light, "same-appearance color mode changes rebuild paint through the stable proxy");
+  assert.match(indexedColor.join("\n"), /\x1b\[(?:38|48);5;/);
+  const noColor = process.env.NO_COLOR;
+  t.after(() => { if (noColor === undefined) delete process.env.NO_COLOR; else process.env.NO_COLOR = noColor; });
+  process.env.NO_COLOR = "1";
+  const uncolored = component.render(79);
+  assert.notEqual(uncolored, indexedColor);
+  assert.equal(uncolored.join("\n"), stripTerminalSequences(uncolored.join("\n")));
+  if (noColor === undefined) delete process.env.NO_COLOR; else process.env.NO_COLOR = noColor;
+  await h.input("Q1: Keep local", { persist: false });
+  const answered = component.render(79);
+  assert.match(answered.map(stripTerminalSequences).join("\n"), /Answered · saved, delivery unconfirmed/);
+  assert.equal(component[symbol](79), undefined);
+  await h.message(user("Q1: Keep local"));
+  const delivered = component.render(79);
+  assert.notEqual(delivered, answered);
+  assert.doesNotMatch(delivered.map(stripTerminalSequences).join("\n"), /unconfirmed/);
+  assert.equal(component.render(79), delivered);
+});
+
+test("unrelated events reuse the reminder and invalidate only changed cards; old tree callbacks retire", async () => {
+  const h = await harness();
+  const ancestor = h.manager.appendMessage(user("Common branch root"));
+  const calls = [0, 0, 0];
+  const results = [];
+  for (let i = 0; i < calls.length; i++) results.push(await h.ask({ question: `Question ${i + 1}?` }));
+  for (const [index, result] of results.entries()) h.tool.renderResult(result, {}, themes.theme,
+    { toolCallId: result.details.question.toolCallId, invalidate() { calls[index]++; } });
+  const factory = h.widgets.get(statusKey).factory;
+  await h.message({ role: "toolResult", toolName: "bash", toolCallId: "unrelated", content: [{ type: "text", text: "done" }], timestamp: Date.now() });
+  await h.input("Unrelated ordinary input");
+  await h.emit("agent_settled");
+  assert.deepEqual(calls, [0, 0, 0]);
+  assert.equal(h.widgets.get(statusKey).factory, factory);
+  await h.input("Q2: Keep unchanged", { persist: false });
+  assert.deepEqual(calls, [0, 1, 0]);
+  const fewerPending = h.widgets.get(statusKey).factory;
+  assert.notEqual(fewerPending, factory);
+  await h.message(user("Q2: Keep unchanged"));
+  assert.deepEqual(calls, [0, 2, 0]);
+  assert.equal(h.widgets.get(statusKey).factory, fewerPending, "delivery-only changes do not rebuild pending-question UI");
+  const branch = h.manager.getLeafId();
+  h.manager.branch(ancestor); await h.emit("session_tree");
+  await h.message(assistant("No question on this branch."));
+  assert.deepEqual(calls, [0, 2, 0], "old callbacks do not survive same-session tree replacement");
+  h.manager.branch(branch); await h.emit("session_tree");
+  let fresh = 0;
+  const context = { toolCallId: results[0].details.question.toolCallId, invalidate() { fresh++; } };
+  h.tool.renderResult(results[0], {}, themes.theme, context);
+  await h.resolveQuestion({ question_id: 1, resolution: "dismissed", reason: "No decision needed." });
+  assert.equal(fresh, 1);
+  assert.deepEqual(calls, [0, 2, 0]);
+  h.tool.renderResult(results[2], {}, themes.theme, { toolCallId: results[2].details.question.toolCallId, invalidate() { fresh++; } });
+  await h.emit("session_compact");
+  await h.resolveQuestion({ question_id: 3, resolution: "dismissed", reason: "No decision needed after compaction." });
+  assert.equal(fresh, 1, "compaction retires callbacks belonging to its replaced native tree");
+});
+
+test("targeted refresh covers every re-ask card and session replacement drops live state without trusting stale cards", async () => {
+  const h = await harness();
+  const first = await h.ask({ question: "Keep this exact scope?" });
+  const invalidations = [0, 0];
+  const firstCard = h.tool.renderResult(first, {}, themes.theme, { toolCallId: first.details.question.toolCallId, invalidate() { invalidations[0]++; } });
+  const firstRows = firstCard.render(80);
+  const second = await h.ask({ question: "Keep this exact scope?", question_id: 1 });
+  const secondCard = h.tool.renderResult(second, {}, themes.theme, { toolCallId: second.details.question.toolCallId, invalidate() { invalidations[1]++; } });
+  const secondRows = secondCard.render(80);
+  const fallbackRows = firstCard.render(80);
+  assert.deepEqual(fallbackRows, firstRows, "re-asking retains the older call's snapshot semantics");
+  invalidations.fill(0);
+  await h.input("Q1: Keep it", { persist: false });
+  assert.deepEqual(invalidations, [1, 1], "both call IDs belong to the changed question, not just its latest call");
+  const answered = secondCard.render(80);
+  assert.match(answered.map(stripTerminalSequences).join("\n"), /Answered/);
+  await h.message(user("Q1: Keep it"));
+  assert.deepEqual(invalidations, [2, 2]);
+  h.ctx.sessionManager = SessionManager.inMemory(scratch);
+  await h.emit("session_start");
+  await h.ask({ question: "Keep this exact scope?" }); // Reuses Q1 and call shape in a different session.
+  assert.deepEqual(invalidations, [2, 2], "old session callbacks are retired, never rebound to the replacement session");
+  assert.deepEqual(secondCard.render(80), secondRows, "old card falls back to its own immutable pending snapshot, without a redundant pending heading");
+  assert.notEqual(secondCard.render(80), answered);
+  assert.equal(firstCard.render(80), fallbackRows, "already-fallback historical snapshot remains stable");
+  assert.equal(secondCard.handleMouse({ type: "click", button: "left", x: 2, y: 1 }), undefined, "even the actual question row cannot open a replacement-session question");
+  assert.equal(h.dialogs.length, 0, "matching scope/ID on a replacement session cannot make an old card actionable");
+});
+
+test("restoration reads one branch snapshot and validates each custom snapshot once at every history size", async t => {
+  for (const count of [25, 100, 400]) {
+    const manager = SessionManager.inMemory(scratch);
+    for (let id = 1; id <= count; id++) {
+      const record = { version: 1, id, source: "tool", status: "pending", question: `Question ${id}?`, options: [], toolCallId: `call-${id}` };
+      manager.appendCustomEntry(entryType, record);
+      const text = `Observed answer ${id}`;
+      const inputEntryId = manager.appendCustomEntry("compact-tools:question-input", { version: 1, source: "interactive", text, pendingIds: [id] });
+      const chatEntryId = manager.appendMessage(user(text));
+      manager.appendCustomEntry(entryType, { ...record, status: "answered", answer: { text }, delivery: "user", delivered: true,
+        resolution: { actor: "agent", reason: "Observed explicit choice.", toolCallId: `resolve-${id}`, evidence: { inputEntryId, inputSource: "interactive", chatEntryId, text } } });
+    }
+    const reads = { branch: 0, entries: 0, snapshots: 0 };
+    for (const entry of manager.getEntries()) if (entry.type === "custom" && entry.customType === entryType) {
+      const data = entry.data;
+      Object.defineProperty(entry, "data", { get() { reads.snapshots++; return data; } });
+    }
+    const getBranch = manager.getBranch.bind(manager), getEntries = manager.getEntries.bind(manager);
+    manager.getBranch = (...args) => { reads.branch++; return getBranch(...args); };
+    manager.getEntries = (...args) => { reads.entries++; return getEntries(...args); };
+    const h = await harness({ manager });
+    assert.deepEqual(reads, { branch: 1, entries: 1, snapshots: count * 2 });
+    assert.equal(h.widget(), "");
+    assert.equal(h.statuses.get(deliveryStatusKey), undefined);
+    assert.equal((await h.emit("before_agent_start"))[0], undefined, "all indexed evidence was accepted without reminders/retry recovery");
+    assert.equal(h.sent.length, 0);
+    t.diagnostic(`${count} resolved questions: one branch read, one session read, ${reads.snapshots} custom snapshots validated`);
+    await h.emit("session_shutdown");
+  }
+});
+
+test("delivery reconciliation does not scan every pending record for unrelated historical user messages", async () => {
+  const h = await harness();
+  let statusReads = 0;
+  for (let id = 1; id <= 30; id++) {
+    const result = await h.ask({ question: `Still pending ${id}?` });
+    const component = h.tool.renderResult(result, {}, themes.theme, { toolCallId: result.details.question.toolCallId });
+    const symbol = Object.getOwnPropertySymbols(Object.getPrototypeOf(component)).find(symbol => symbol.description === "question-content");
+    const record = component[symbol](80).identity;
+    Object.defineProperty(record, "status", { enumerable: true, get() { statusReads++; return "pending"; } });
+  }
+  for (let i = 0; i < 200; i++) h.manager.appendMessage(user(`Unrelated durable input ${i}`));
+  statusReads = 0;
+  await h.emit("agent_settled");
+  assert.ok(statusReads <= 60, `only the two refresh filters may inspect 30 pending records, never 200 per-user traversals (${statusReads})`);
+  assert.equal(h.sent.length, 0);
+});
+
+test("indexed evidence chooses the earliest eligible receipt and subsequent chat, never an earlier same-text chat", async () => {
+  const h = await harness();
+  await h.ask({ question: "Which local store?" });
+  const body = "Use SQLite only.";
+  await h.message(user(body)); // Same text without an observed pending-input receipt is insufficient.
+  await h.input(body, { persist: false });
+  const inputEntryId = h.manager.getLeafId();
+  await h.input(body, { persist: false });
+  await h.message(user(body));
+  const chatEntryId = h.manager.getLeafId();
+  await h.message(user(body));
+  const result = await h.resolveQuestion({ question_id: 1, resolution: "answered", reason: "Observed local choice.", user_message: body });
+  assert.notEqual(result.isError, true);
+  assert.deepEqual(h.latest().resolution.evidence, { inputEntryId, inputSource: "interactive", chatEntryId, text: body });
+  await h.emit("session_tree");
+  assert.equal(h.widget(), "");
+  await h.command("Q1 retry");
+  assert.equal(h.sent.length, 0);
 });
 
 test("invalid recommendation/reuse and manual UI rejection safely leave actionable unanswered results", async () => {

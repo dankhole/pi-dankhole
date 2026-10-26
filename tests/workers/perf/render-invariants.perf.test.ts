@@ -18,23 +18,27 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 /** Counters for the pi-tui leaves the viewer wraps its text with. */
-const counts = { wrap: 0, markdownNew: 0, markdownRender: 0 };
+const counts = { wrap: 0, markdownNew: 0, markdownRender: 0, truncate: 0 };
 
 vi.mock("@earendil-works/pi-tui", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@earendil-works/pi-tui")>();
-  class CountingMarkdown extends (actual.Markdown as any) {
-    constructor(...args: any[]) {
+  class CountingMarkdown extends actual.Markdown {
+    constructor(...args: ConstructorParameters<typeof actual.Markdown>) {
       super(...args);
       counts.markdownNew++;
     }
-    render(...args: any[]) {
+    render(width: number) {
       counts.markdownRender++;
-      return super.render(...args);
+      return super.render(width);
     }
   }
   return {
     ...actual,
     Markdown: CountingMarkdown,
+    truncateToWidth: (...args: Parameters<typeof actual.truncateToWidth>) => {
+      counts.truncate++;
+      return actual.truncateToWidth(...args);
+    },
     wrapTextWithAnsi: (...args: [string, number]) => {
       counts.wrap++;
       return actual.wrapTextWithAnsi(...args);
@@ -53,53 +57,121 @@ beforeEach(() => {
   counts.wrap = 0;
   counts.markdownNew = 0;
   counts.markdownRender = 0;
+  counts.truncate = 0;
 });
 
-describe("ConversationViewer — cost stays linear in transcript length", () => {
-  /** Leaf calls one render makes over a transcript of `n` messages. */
-  function wrapsFor(n: number, mode: string): number {
-    const viewer = mountViewer(ConversationViewer, makeSession(n), undefined, () => mode);
-    viewer.render(120); // prime, so caches are warm and only steady state counts
-    counts.wrap = 0;
-    counts.markdownRender = 0;
-    viewer.render(120);
-    return counts.wrap + counts.markdownRender;
+describe("ConversationViewer — stable blocks and history layout", () => {
+  function resetCounts() {
+    counts.wrap = counts.markdownNew = counts.markdownRender = counts.truncate = 0;
   }
 
-  // The viewer rebuilds every line of the transcript on every frame, so the work
-  // is expected to grow with it. What must not happen is growing FASTER than it:
-  // ten times the messages, at most ~ten times the work. A quadratic here is
-  // invisible on a short conversation and locks the TUI on a long one.
-  it("does ~10x the work for 10x the messages (raw wrap path)", () => {
-    const small = wrapsFor(30, "off");
-    const large = wrapsFor(300, "off");
+  it.each(["off", "assistant", "all"])("does no historical wrapping/parsing/clamping on unchanged frames or scroll (%s)", mode => {
+    for (const n of [30, 300, 2000]) {
+      const viewer = mountViewer(ConversationViewer, makeSession(n), undefined, () => mode);
+      try {
+        viewer.render(120);
+        resetCounts();
+        viewer.render(120);
+        viewer.handleInput("\x1b[A");
+        viewer.render(120);
+        viewer.handleInput("\x1b[5~");
+        viewer.render(120);
 
-    expect(small).toBeGreaterThan(0);
-    expect(large / small).toBeLessThanOrEqual(11);
+        expect(counts.wrap + counts.markdownRender + counts.markdownNew).toBe(0);
+        // Only visible rows/chrome, independent of transcript size. Three renders.
+        expect(counts.truncate).toBeLessThanOrEqual(120);
+      } finally {
+        viewer.dispose();
+      }
+    }
   });
 
-  it("does ~10x the work for 10x the messages (markdown path)", () => {
-    const small = wrapsFor(30, "assistant");
-    const large = wrapsFor(300, "assistant");
+  it.each(["off", "assistant"])("lays out only the appended or mutated message (%s)", mode => {
+    const session = makeSession(300);
+    const viewer = mountViewer(ConversationViewer, session, undefined, () => mode);
+    try {
+      viewer.render(120);
+      const message = { role: "assistant", content: [{ type: "text", text: "# New response" }] };
+      session.messages.push(message);
+      resetCounts();
+      viewer.render(120);
+      expect(counts.wrap + counts.markdownRender).toBeLessThanOrEqual(1);
+      expect(counts.markdownNew).toBeLessThanOrEqual(1);
 
-    expect(small).toBeGreaterThan(0);
-    expect(large / small).toBeLessThanOrEqual(11);
+      // Same message, content array, block object, and string length; no event.
+      message.content[0].text = "# New material";
+      resetCounts();
+      viewer.render(120);
+      expect(counts.wrap + counts.markdownRender).toBeLessThanOrEqual(1);
+      expect(counts.markdownNew).toBe(0);
+
+      resetCounts();
+      viewer.handleInput("\x1b[A");
+      viewer.render(120);
+      expect(counts.wrap + counts.markdownRender).toBe(0);
+    } finally {
+      viewer.dispose();
+    }
   });
 
-  // #259's WeakMap is keyed by the message object. If a refactor ever rebuilds
-  // messages, or keys the cache on something that changes per frame, every frame
-  // re-parses the whole transcript as Markdown — a cost this suite measured at
-  // roughly 10x the warm path. Nothing else in the suite would notice.
-  it("re-renders without re-parsing: the markdown cache survives a frame", () => {
-    const viewer = mountViewer(ConversationViewer, makeSession(60), undefined, () => "assistant");
-    viewer.render(120);
-    const afterFirst = counts.markdownNew;
-    expect(afterFirst).toBeGreaterThan(0);
+  it("invalidates the event's affected message, not unrelated history", () => {
+    const session = makeSession(300);
+    let emit: (event: unknown) => void = () => {};
+    session.subscribe = (callback: typeof emit) => { emit = callback; return () => {}; };
+    const viewer = mountViewer(ConversationViewer, session);
+    try {
+      viewer.render(120);
+      session.messages[1].content[0].text += "\nstreamed delta";
+      resetCounts();
+      emit({ type: "message_update", message: session.messages[1] });
+      viewer.render(120);
+      expect(counts.wrap).toBe(0);
+      expect(counts.markdownRender).toBeLessThanOrEqual(1);
+      expect(counts.markdownNew).toBe(0);
+    } finally {
+      viewer.dispose();
+    }
+  });
 
-    viewer.render(120);
-    viewer.render(120);
+  it("explicit invalidation also discards native Markdown's text/width cache", () => {
+    const viewer = mountViewer(ConversationViewer, makeSession(30));
+    try {
+      viewer.render(120);
+      resetCounts();
+      viewer.invalidate();
+      viewer.render(120);
+      expect(counts.markdownNew).toBeGreaterThan(0);
+      resetCounts();
+      viewer.render(120);
+      expect(counts.markdownNew + counts.markdownRender + counts.wrap).toBe(0);
+    } finally {
+      viewer.dispose();
+    }
+  });
 
-    expect(counts.markdownNew).toBe(afterFirst);
+  it("reuses surviving blocks across branch replacement and removes compacted layout", () => {
+    const session = makeSession(300);
+    const viewer = mountViewer(ConversationViewer, session);
+    try {
+      viewer.render(120);
+      const survivor = session.messages[1];
+      session.messages = [survivor];
+      resetCounts();
+      const output = viewer.render(120).join("\n");
+      expect(output).toContain("(message 1)");
+      expect(output).not.toContain("(result 299)");
+      expect(counts.wrap + counts.markdownRender).toBe(0);
+
+      resetCounts();
+      viewer.render(100); // new width invalidates layout, not native component ownership
+      expect(counts.markdownRender).toBeLessThanOrEqual(1);
+      expect(counts.markdownNew).toBe(0);
+      resetCounts();
+      viewer.render(100);
+      expect(counts.wrap + counts.markdownRender).toBe(0);
+    } finally {
+      viewer.dispose();
+    }
   });
 });
 

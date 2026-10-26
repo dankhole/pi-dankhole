@@ -3,6 +3,7 @@ import type { ExtensionAPI, Theme } from "@earendil-works/pi-coding-agent";
 import { type Component, Container, MouseRegion, Spacer, type TuiMouseEvent, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import type { Settings } from "../settings/interface.ts";
 import { toolBackground, toolStatus, toolStatusText } from "./palette.ts";
+import { registerTranscriptProjection, TranscriptMeasurement } from "./transcript-measurement.ts";
 
 // Pi 1.4's transcript container is not an extension API. Keep this adapter
 // instance-local, fail open, and leave the native tree authoritative for updates,
@@ -61,37 +62,25 @@ function eligible(item: Component, settings: Settings): item is NativeTool {
   return mode === "compact" && !item.result?.content.some(block => block.type === "image");
 }
 
-const projections = new WeakMap<object, { view: Container; render: NativeContainer["render"] }>();
-
 /** Line offset of a direct native chat child in the current displayed transcript.
  * Grouped tool members are not projected top-level children and return undefined.
  * Calling this refreshes layout at width, including streaming changes.
  */
 export function getChildLineOffset(chat: unknown, target: Component, width: number): number | undefined {
   if (!container(chat)) return undefined;
-  chat.render(width);
-  const projection = projections.get(chat);
-  const children = projection && chat.render === projection.render ? projection.view.children : chat.children;
-  let offset = 0;
-  for (const child of children) {
-    if (child === target) return offset;
-    offset += child.render(width).length;
-  }
-  return undefined;
+  return new TranscriptMeasurement().offsets(chat, width)?.get(target);
 }
 
 /** Measure all displayed direct children in one projection-aware pass. Refreshes the
  * projection once; callers can reuse their own per-pass component measurements.
  */
 export function getChildLineOffsets(chat: unknown, width: number,
-  measure: (component: Component) => number = component => component.render(width).length): Map<Component, number> | undefined {
+  measure?: (component: Component) => number): Map<Component, number> | undefined {
   if (!container(chat)) return undefined;
-  chat.render(width);
-  const projection = projections.get(chat);
-  const children = projection && chat.render === projection.render ? projection.view.children : chat.children;
-  const offsets = new Map<Component, number>();
+  const offsets = new TranscriptMeasurement().offsets(chat, width);
+  if (!offsets || !measure) return offsets;
   let offset = 0;
-  for (const child of children) {
+  for (const child of offsets.keys()) {
     offsets.set(child, offset);
     offset += measure(child);
   }
@@ -110,60 +99,78 @@ class ToolGroup implements Component {
   slots: Component[] = [];
   private view = new Container();
   private open = false;
+  private expanded = false;
+  private label = "";
+  private status = toolStatus(false, false);
+  private names: string[] = [];
+  private summary = "";
+  private readonly spacer = new Spacer(1);
+  private readonly footer = new MouseRegion({
+    invalidate() {},
+    render: (available: number) => {
+      if (available <= 0) return [];
+      const theme = this.options.theme();
+      const pad = " ".repeat(Math.min(this.members[0].outputPad, Math.max(0, available - 1)));
+      let line = pad + truncateToWidth(this.label, available - pad.length);
+      line = toolStatusText(theme, this.status, line + " ".repeat(Math.max(0, available - visibleWidth(line))));
+      const background = toolBackground(theme, "", this.settings.backgrounds === "none" ? "none" : "status", this.status);
+      if (background) line = background + line + "\x1b[49m";
+      return [line];
+    },
+  }, event => {
+    if (event.type !== "click" || event.button !== "left") return undefined;
+    try {
+      const before = this.view.render(event.width).length;
+      this.open = !this.expanded;
+      // Closing resets individually opened details; opening only reveals compact rows.
+      if (this.expanded) for (const member of this.members) member.setExpanded(false);
+      const after = this.render(event.width).length;
+      this.options.preserveFooter?.(after - before, event.width);
+      this.options.requestRender();
+    } catch (error) { this.fail(error); }
+    return { handled: true };
+  });
   constructor(private options: GroupingOptions, private fail: (error: unknown) => void, private settings: Settings) {}
 
   update(members: NativeTool[], slots: Component[]) {
     // Group visibility is independent of native per-tool detail expansion.
     // Newly appended calls retain their own compact/native expansion state.
-    this.members = members;
-    this.slots = slots;
+    if (members.length !== this.members.length || members.some((member, index) => member !== this.members[index])) this.members = members;
+    if (slots.length !== this.slots.length || slots.some((slot, index) => slot !== this.slots[index])) this.slots = slots;
   }
 
   invalidate() { this.view.invalidate(); }
 
   render(width: number): string[] {
-    const expanded = this.open || this.members.some(member => member.expanded);
-    const theme = this.options.theme();
-    const failed = this.members.filter(member => member.result?.isError).length;
-    const pending = this.members.filter(member => member.isPartial).length;
-    const status = toolStatus(failed > 0, pending > 0);
-    const counts = new Map<string, number>();
-    for (const member of this.members) counts.set(member.toolName, (counts.get(member.toolName) ?? 0) + 1);
-    const names = [...counts].map(([name, count]) => {
-      const clean = stripVTControlCharacters(name).replace(/[\x00-\x1f\x7f-\x9f]/g, " ");
-      return count > 1 ? `${clean} ×${count}` : clean;
-    }).join(", ");
-    const label = `${expanded ? "▴" : "▸"} ${failed ? "✗" : pending ? "●" : "✓"} ${this.members.length} tools · ${names}`
+    let failed = 0;
+    let pending = 0;
+    let expanded = this.open;
+    let namesChanged = this.names.length !== this.members.length;
+    for (let index = 0; index < this.members.length; index++) {
+      const member = this.members[index];
+      if (member.result?.isError) failed++;
+      if (member.isPartial) pending++;
+      if (member.expanded) expanded = true;
+      if (this.names[index] !== member.toolName) namesChanged = true;
+    }
+    if (namesChanged) {
+      this.names = this.members.map(member => member.toolName);
+      const counts = new Map<string, number>();
+      for (const name of this.names) counts.set(name, (counts.get(name) ?? 0) + 1);
+      this.summary = [...counts].map(([name, count]) => {
+        const clean = stripVTControlCharacters(name).replace(/[\x00-\x1f\x7f-\x9f]/g, " ");
+        return count > 1 ? `${clean} ×${count}` : clean;
+      }).join(", ");
+    }
+    this.expanded = expanded;
+    this.status = toolStatus(failed > 0, pending > 0);
+    this.label = `${expanded ? "▴" : "▸"} ${failed ? "✗" : pending ? "●" : "✓"} ${this.members.length} tools · ${this.summary}`
       + (failed ? ` · ${failed} failed` : "") + (pending ? ` · ${pending} pending` : "");
-    const footer: Component = {
-      invalidate() {},
-      render: available => {
-        if (available <= 0) return [];
-        const pad = " ".repeat(Math.min(this.members[0].outputPad, Math.max(0, available - 1)));
-        let line = pad + truncateToWidth(label, available - pad.length);
-        line = toolStatusText(theme, status, line + " ".repeat(Math.max(0, available - visibleWidth(line))));
-        const background = toolBackground(theme, "", this.settings.backgrounds === "none" ? "none" : "status", status);
-        if (background) line = background + line + "\x1b[49m";
-        return [line];
-      },
-    };
-    this.view.clear();
-    if (expanded) for (const slot of this.slots) this.view.addChild(slot);
-    this.view.addChild(new Spacer(1));
-    this.view.addChild(new MouseRegion(footer, event => {
-      if (event.type !== "click" || event.button !== "left") return undefined;
-      try {
-        const before = this.view.render(event.width).length;
-        this.open = !expanded;
-        // Opening only reveals compact rows. Closing also resets any individually
-        // opened details so the next opening starts with a compact list again.
-        if (expanded) for (const member of this.members) member.setExpanded(false);
-        const after = this.render(event.width).length;
-        this.options.preserveFooter?.(after - before, event.width);
-        this.options.requestRender();
-      } catch (error) { this.fail(error); }
-      return { handled: true };
-    }));
+    const count = (expanded ? this.slots.length : 0) + 2;
+    if (this.view.children.length !== count || this.view.children[0] !== (expanded ? this.slots[0] : this.spacer)
+      || expanded && this.slots.some((slot, index) => slot !== this.view.children[index])) {
+      this.view.children = [...(expanded ? this.slots : []), this.spacer, this.footer];
+    }
     return this.view.render(width);
   }
 
@@ -206,6 +213,7 @@ export function installGrouping(tui: unknown, settings: Settings, options: Group
   const originalMouse = chat.handleMouse;
   const projected = new Container();
   const groups = new WeakMap<NativeTool, ToolGroup>();
+  let unregisterProjection: (() => void) | undefined;
   let disposed = false;
 
   const dispose = () => {
@@ -219,7 +227,7 @@ export function installGrouping(tui: unknown, settings: Settings, options: Group
       if (mouseDescriptor) Object.defineProperty(chat, "handleMouse", mouseDescriptor);
       else delete (chat as Partial<NativeContainer>).handleMouse;
     }
-    if (projections.get(chat)?.view === projected) projections.delete(chat);
+    unregisterProjection?.();
     projected.clear();
     options.requestRender();
   };
@@ -231,7 +239,7 @@ export function installGrouping(tui: unknown, settings: Settings, options: Group
   function render(width: number): string[] {
     if (disposed) return originalRender.call(chat, width);
     try {
-      projected.clear();
+      const children: Component[] = [];
       let members: NativeTool[] = [];
       let slots: Component[] = [];
       const flush = () => {
@@ -242,8 +250,8 @@ export function installGrouping(tui: unknown, settings: Settings, options: Group
             groups.set(members[0], group);
           }
           group.update(members, slots);
-          projected.addChild(group);
-        } else for (const slot of slots) projected.addChild(slot);
+          children.push(group);
+        } else for (const slot of slots) children.push(slot);
         members = [];
         slots = [];
       };
@@ -255,10 +263,13 @@ export function installGrouping(tui: unknown, settings: Settings, options: Group
           slots.push(child);
         } else {
           flush();
-          projected.addChild(child);
+          children.push(child);
         }
       }
       flush();
+      if (children.length !== projected.children.length || children.some((child, index) => child !== projected.children[index])) {
+        projected.children = children;
+      }
       return projected.render(width);
     } catch (error) {
       fail(error);
@@ -276,7 +287,7 @@ export function installGrouping(tui: unknown, settings: Settings, options: Group
   try {
     Object.defineProperty(chat, "render", { configurable: true, writable: true, value: render });
     Object.defineProperty(chat, "handleMouse", { configurable: true, writable: true, value: handleMouse });
-    projections.set(chat, { view: projected, render });
+    unregisterProjection = registerTranscriptProjection(chat, { view: projected, render });
   } catch (error) { fail(error); }
   return dispose;
 }

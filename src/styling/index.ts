@@ -27,6 +27,8 @@ interface RowState {
   nativeState?: Record<string, unknown>;
   nativeCall?: Component;
   nativeResult?: Component;
+  summary?: { inputs: string[]; cwd: string; keys?: string[]; text: string };
+  compactCall?: { body: string; tail: string; padding: number; background: string; theme: Theme; component: Component };
 }
 
 const empty: Component = { render: () => [], invalidate() {} };
@@ -67,20 +69,43 @@ function shortPath(value: string, cwd: string): string {
   return value;
 }
 
-function summary(tool: string, input: unknown, cwd: string): string {
+const summaryFields = ["description", "command", "path", "file_path", "pattern", "query", "url", "agent_id"];
+const sameStrings = (left: string[], right: string[]) => left.length === right.length && left.every((value, index) => value === right[index]);
+
+function summary(tool: string, input: unknown, cwd: string, state: RowState): string {
   const args = input && typeof input === "object" ? input as Record<string, unknown> : {};
+  // Compare primitive fields, not the argument object: partial arguments can mutate in place.
+  const fields = tool === "codemode" ? [typeof args.code === "string" ? "code" : "script"] : summaryFields;
+  const inputs = fields.map(key => typeof args[key] === "string" ? args[key] as string : "");
+  const cached = state.summary;
+  if (cached && cached.cwd === cwd && sameStrings(cached.inputs, inputs)
+    && (!cached.keys || sameStrings(cached.keys, Object.keys(args).slice(0, 4)))) return cached.text;
+  let text = "";
+  let keys: string[] | undefined;
   if (tool === "codemode") {
-    const code = typeof args.code === "string" ? args.code : typeof args.script === "string" ? args.script : "";
+    const code = inputs[0];
     // A lightweight hint, not a parser or a claim about what actually executed.
-    const names = [...new Set([...code.matchAll(/\btools\.([\w$]+)\s*\(/g)].map(match => match[1]))];
-    return names.length ? names.slice(0, 4).join(", ") + (names.length > 4 ? ", …" : "") : "script";
+    const names = new Set<string>();
+    for (const match of code.matchAll(/\btools\.([\w$]+)\s*\(/g)) {
+      names.add(match[1]);
+      if (names.size > 4) break;
+    }
+    text = names.size ? [...names].slice(0, 4).join(", ") + (names.size > 4 ? ", …" : "") : "script";
+  } else {
+    for (let index = 0; index < fields.length; index++) {
+      const value = oneLine(inputs[index]);
+      if (!value) continue;
+      text = fields[index] === "path" || fields[index] === "file_path" ? shortPath(value, cwd) : value;
+      break;
+    }
+    if (!text) {
+      // Avoid dumping arbitrary payloads, prompts, file contents, or edit bodies.
+      keys = Object.keys(args).slice(0, 4);
+      text = keys.map(oneLine).join(", ");
+    }
   }
-  for (const key of ["description", "command", "path", "file_path", "pattern", "query", "url", "agent_id"]) {
-    const value = oneLine(args[key]);
-    if (value) return key === "path" || key === "file_path" ? shortPath(value, cwd) : value;
-  }
-  // Avoid dumping arbitrary payloads, prompts, file contents, or edit bodies.
-  return Object.keys(args).slice(0, 4).map(oneLine).join(", ");
+  state.summary = { inputs, cwd, keys, text };
+  return text;
 }
 
 function duration(ms: number | undefined): string {
@@ -91,16 +116,20 @@ function duration(ms: number | undefined): string {
 }
 
 function line(body: string, tail: string, padding: number): Component {
+  let cached: { width: number; lines: string[] } | undefined;
   return {
-    invalidate() {},
+    invalidate() { cached = undefined; },
     render(width) {
       if (width <= 0) return [];
+      if (cached?.width === width) return cached.lines;
       const pad = " ".repeat(Math.min(padding, Math.max(0, width - 1)));
       const available = width - pad.length;
       const tailWidth = visibleWidth(tail);
       // Keep the status/name first on very narrow terminals.
-      if (!tail || available < tailWidth + 12) return [pad + truncateToWidth(body, available)];
-      return [pad + truncateToWidth(body, available - tailWidth) + tail];
+      const lines = !tail || available < tailWidth + 12 ? [pad + truncateToWidth(body, available)]
+        : [pad + truncateToWidth(body, available - tailWidth) + tail];
+      cached = { width, lines };
+      return lines;
     },
   };
 }
@@ -170,11 +199,18 @@ export default function registerInterface(pi: ExtensionAPI) {
         const pending = context.isPartial;
         const icon = context.isError ? "✗" : pending ? (context.executionStarted ? "●" : "·") : "✓";
         const status = toolStatus(context.isError, pending);
-        const detail = summary(tool, args, context.cwd);
+        const detail = summary(tool, args, context.cwd, context.state);
         const body = toolChromeText(theme, "▸", "dim") + " " + toolStatusText(theme, status, icon) + " " + toolChromeText(theme, oneLine(tool))
           + (detail ? " · " + toolChromeText(theme, detail, "muted") : "");
         const elapsed = duration(context.durationMs);
-        return panel(line(body, elapsed ? toolChromeText(theme, ` · ${elapsed}`, "dim") : "", context.outputPad), tool, theme, context, settings.backgrounds);
+        const tail = elapsed ? toolChromeText(theme, ` · ${elapsed}`, "dim") : "";
+        const background = toolBackground(theme, tool, settings.backgrounds, status);
+        const cached = context.state.compactCall;
+        if (cached && cached.body === body && cached.tail === tail && cached.padding === context.outputPad
+          && cached.background === background && cached.theme === theme) return cached.component;
+        const component = panel(line(body, tail, context.outputPad), tool, theme, context, settings.backgrounds);
+        context.state.compactCall = { body, tail, padding: context.outputPad, background, theme, component };
+        return component;
       },
       renderResult(result, options, theme, context: ToolRenderContext<RowState>) {
         let native: Component | undefined;

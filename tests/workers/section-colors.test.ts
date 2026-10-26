@@ -59,7 +59,7 @@ function widgetLines(agent: AgentRecord, enabled?: boolean, width = 240, showMod
   const activity: AgentActivity = {
     activeTools: new Map([["t1", "read"]]), responseText: "", toolUses: 2, turnCount: 3,
     session: percent === undefined ? undefined : {
-      getSessionStats: () => ({ tokens: { input: 1000, output: 200, cacheWrite: 0 }, contextUsage: { percent } }),
+      getContextUsage: () => ({ tokens: percent * 2000, contextWindow: 200_000, percent }),
     },
   };
   const widget = new AgentWidget(

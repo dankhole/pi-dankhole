@@ -19,6 +19,9 @@ import type { AgentSession, AgentSessionEvent } from "@earendil-works/pi-coding-
  */
 let outputTranscriptDefault = true;
 
+/** Bound grouped appends; an individual JSONL record may already exceed this. */
+export const OUTPUT_BATCH_MAX_BYTES = 256 * 1024;
+
 export function getOutputTranscriptDefault(): boolean { return outputTranscriptDefault; }
 export function setOutputTranscriptDefault(b: boolean): void { outputTranscriptDefault = b; }
 
@@ -116,6 +119,16 @@ export function streamToOutputFile(
       if (prompt === -1) return;
       writtenCount = prompt + 1;
     }
+    let pending: string[] = [];
+    let pendingBytes = 0;
+    const appendPending = () => {
+      if (pending.length === 0) return;
+      try {
+        appendFileSync(path, pending.join(""), "utf-8");
+      } catch { /* best-effort; never retry an append that may have partially succeeded */ }
+      pending = [];
+      pendingBytes = 0;
+    };
     while (writtenCount < messages.length) {
       const msg = messages[writtenCount++];
       // Pi's prompt and tool-loadout records; a Claude Code transcript has no
@@ -130,9 +143,15 @@ export function streamToOutputFile(
         cwd,
       };
       try {
-        appendFileSync(path, JSON.stringify(entry) + "\n", "utf-8");
-      } catch { /* ignore write errors */ }
+        const line = JSON.stringify(entry) + "\n";
+        const bytes = Buffer.byteLength(line, "utf-8");
+        if (pendingBytes + bytes > OUTPUT_BATCH_MAX_BYTES) appendPending();
+        pending.push(line);
+        pendingBytes += bytes;
+        if (pendingBytes >= OUTPUT_BATCH_MAX_BYTES) appendPending();
+      } catch { /* ignore serialization errors, without losing the rest of the flush */ }
     }
+    appendPending();
   };
 
   const unsubscribe = session.subscribe((event: AgentSessionEvent) => {

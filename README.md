@@ -42,6 +42,8 @@ npm run typecheck
 
 `npm run check` remains the explicit full check: lint, typecheck, all worker/package Vitest suites, then all interface Node suites. Reserve it for cross-cutting changes, release validation, or an explicit full-suite request; do not automatically run it after focused tests. Tests use synthetic model responses or UI fixtures, not live provider calls. Interface tests use the Pi installation on PATH unless `PI_PACKAGE_DIR` points at another Pi package root.
 
+Performance changes and their validation are described in [extension performance](docs/performance.md). `npm run bench:interface` runs repeatable synthetic panel/pinning and text-transform CPU benchmarks; it does not measure end-to-end input latency.
+
 `migration:status` is read-only: it reports changes in the original projects since capture, including new files in the imported source areas. Use `npm run migration:status -- --check` to exit nonzero when reconciliation is needed. It never overwrites your styling work or the migrated code. It reports source drift, not merge status: changes deliberately applied to both copies will still appear until their baseline is explicitly reconciled.
 
 The latest completed interface reconciliation is recorded in [`migration/interface-sync.json`](migration/interface-sync.json), with source-to-destination paths and SHA-256 hashes for all imported interface files. It includes the question resolver, palette/panel updates, compaction countdown settings, and keep-awake changes. The original baseline is preserved, so `migration:status` still reports historical source drift.

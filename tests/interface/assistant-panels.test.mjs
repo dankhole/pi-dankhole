@@ -78,6 +78,100 @@ function tool() {
   return row;
 }
 
+test("painted rows reuse one bounded layout and invalidate for native values, styles and explicit invalidation", () => {
+  const a = assistant([text("payload")]);
+  const md = a.contentContainer.children.find(child => child instanceof Markdown);
+  const native = ["payload"];
+  md.render = () => native;
+  const originalRender = md.render;
+  const originalInvalidate = md.invalidate;
+  const f = fixture([a]);
+  const previous = process.env.NO_COLOR;
+  const dispose = f.install();
+  try {
+    const first = md.render(80);
+    for (let repeat = 0; repeat < 20; repeat++) assert.equal(md.render(80), first, "unchanged rows are not decorated/allocated again");
+    assert.equal(md.render(0), native);
+    assert.equal(md.render(80), first, "zero-width height probes do not evict painted rows");
+    const bottom = a.contentContainer.children.at(-1);
+    const buffer = bottom.render(80);
+    f.render(80);
+    assert.equal(bottom.render(80), buffer, "reconciliation does not repaint unchanged buffer spacers");
+    assert.deepEqual(native, ["payload"], "native arrays are never painted in place");
+    native[0] = "updated";
+    const updated = md.render(80);
+    assert.notEqual(updated, first, "same-array mutation is observed");
+    assert.match(updated[0], /updated/);
+    native.push("second row");
+    assert.equal(md.render(80).length, 2);
+    const beforeInvalidate = md.render(80);
+    md.invalidate();
+    assert.notEqual(md.render(80), beforeInvalidate);
+    const wide = md.render(80);
+    const narrow = md.render(40);
+    assert.notEqual(narrow, wide);
+    assert.notEqual(md.render(80), wide, "only the current width is retained");
+    const dark = md.render(80);
+    themes.initTheme("light", false);
+    const light = md.render(80);
+    assert.notEqual(light, dark);
+    assert.ok(light[0].includes(fill()));
+    process.env.NO_COLOR = "";
+    assert.equal(md.render(80), native);
+    if (previous === undefined) delete process.env.NO_COLOR; else process.env.NO_COLOR = previous;
+    assert.notEqual(md.render(80), light, "plain output discards the painted cache");
+    dispose();
+    assert.equal(md.render, originalRender);
+    assert.equal(md.invalidate, originalInvalidate);
+  } finally {
+    if (previous === undefined) delete process.env.NO_COLOR; else process.env.NO_COLOR = previous;
+    dispose();
+    themes.initTheme("dark", false);
+  }
+});
+
+test("panel cache observes same-theme foreground/color-mode changes and native Markdown invalidation", () => {
+  const a = assistant([text("answer")]);
+  const f = fixture([a]);
+  let foreground = "\x1b[38;2;1;2;3m";
+  let mode = "truecolor";
+  const theme = new Proxy(themes.theme, { get(target, key) {
+    if (key === "getFgAnsi") return () => foreground;
+    if (key === "getColorMode") return () => mode;
+    const value = Reflect.get(target, key, target);
+    return typeof value === "function" ? value.bind(target) : value;
+  } });
+  f.options.theme = () => theme;
+  const dispose = f.install();
+  const md = a.contentContainer.children.find(child => child instanceof Markdown);
+  try {
+    const first = md.render(80);
+    foreground = "\x1b[38;2;4;5;6m";
+    const recolored = md.render(80);
+    assert.notEqual(recolored, first);
+    assert.ok(recolored[0].includes(foreground));
+    mode = "256color";
+    const limited = md.render(80);
+    assert.notEqual(limited, recolored);
+    assert.ok(limited[0].includes(assistantBackground(theme)));
+    md.setText("same component, changed source");
+    const changed = md.render(80);
+    assert.notEqual(changed, limited);
+    assert.match(changed[0], /changed source/);
+  } finally { dispose(); }
+});
+
+test("panel cache teardown retains foreign invalidation ownership", () => {
+  const a = assistant([text("answer")]);
+  const f = fixture([a]);
+  const dispose = f.install();
+  const md = a.contentContainer.children.find(child => child instanceof Markdown);
+  const foreign = () => {};
+  md.invalidate = foreign;
+  dispose();
+  assert.equal(md.invalidate, foreign);
+});
+
 test("conversation surfaces tint native user padding and assistant prose/buffers, not thinking/tools/custom", () => {
   const a = assistant([thinking("private reasoning"), text("answer one"), toolCall, thinking("more reasoning"), text("answer two")]);
   const user = new UserMessageComponent("user input");

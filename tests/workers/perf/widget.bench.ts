@@ -1,12 +1,12 @@
 /**
  * widget.bench.ts — the two always-on surfaces, `AgentWidget` and `FleetList`.
  *
- * Neither caches anything about the agent list. `AgentWidget` scans it twice per
- * cycle — once in `update()`, once again in `renderWidget()` — and each scan is
- * a `listAgents()` copy-and-sort; `FleetList.update()` reaches `agentRecords()`
- * three times, and that is a sort on top of the manager's own sort. Both render
- * on every TUI frame, not just on their own timers, because both sit beside the
- * editor: a keystroke in the main session redraws them.
+ * Both surfaces read a fresh roster on each operation, while widget context
+ * percentages reuse canonical session state and hidden rows skip formatting.
+ * Both can render on every TUI frame, not just on their own timers, because
+ * they sit beside the editor: a keystroke in the main session redraws them.
+ * Context-aware fixtures below exercise the public-reader cache, not the
+ * getSessionStats-only legacy shared stub or an exception/catch fast path.
  *
  * `render` and `update` are measured apart because they run at different rates
  * (per frame vs. an 80 ms timer plus ~10 call sites in index.ts) and a
@@ -18,10 +18,34 @@
  * disposed in `teardown` and reported 33 million renders per second — it was
  * measuring an unregistered widget returning an empty array.
  */
+import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { afterAll, bench, describe } from "vitest";
 import { AgentWidget } from "../../../src/workers/ui/agent-widget.js";
 import { FleetList } from "../../../src/workers/ui/fleet-list.js";
-import { makeFleet, mountFleet, mountWidget } from "../helpers/perf-fixtures.js";
+import { makeActivity, makeFleet, makeManager, mountFleet, perfTheme, perfTui } from "../helpers/perf-fixtures.js";
+
+/** Local modern-API fixture; keep the cross-revision shared fixtures unchanged. */
+function mountWidget(Widget: typeof AgentWidget, records: ReturnType<typeof makeFleet>, opts: { mode?: "all" | "background"; showCost?: boolean; showModel?: boolean } = {}) {
+  const activities = makeActivity(records);
+  for (const activity of activities.values()) {
+    activity.session = {
+      sessionManager: SessionManager.inMemory(),
+      messages: [],
+      getContextUsage: () => ({ tokens: 84_000, contextWindow: 200_000, percent: 42 }),
+    };
+    activity.responseText = "Working on the fixture\n" + "Historical response line\n".repeat(10_000);
+  }
+  const widget = new Widget(makeManager(records), activities, () => opts.mode ?? "all", () => opts.showCost ?? false, () => opts.showModel ?? false);
+  let component: { render(): string[] } | undefined;
+  const tui = perfTui();
+  widget.setUICtx({
+    setStatus: () => {},
+    setWidget: (_key, factory) => { component = factory?.(tui, perfTheme); },
+  });
+  widget.update();
+  component?.render();
+  return { render: () => component?.render() ?? [], update: () => widget.update(), dispose: () => widget.dispose() };
+}
 
 /** Fleet sizes: one agent, a normal fan-out, and a pathological one. */
 const SIZES = [1, 10, 100];

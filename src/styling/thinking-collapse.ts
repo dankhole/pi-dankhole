@@ -102,6 +102,16 @@ export function installThinkingCollapse(tui: unknown, options: ThinkingCollapseO
     let active = true;
     let restoreGet: (() => void) | undefined;
     let restoreClear: (() => void) | undefined;
+    let restoreUpdate: (() => void) | undefined;
+    let updating = false;
+    let updateRuns: ReturnType<typeof runs> | undefined;
+    // Native updates may mutate the same message/content array. Cache only for
+    // one update invocation, never by message identity or across native actions.
+    const analyze = () => {
+      if (!updating) return runs(item.lastMessage);
+      updateRuns ??= runs(item.lastMessage);
+      return updateRuns;
+    };
     const refresh = () => {
       if (item.lastMessage && runs(item.lastMessage).length) item.updateContent(item.lastMessage, item.isStreaming);
     };
@@ -110,20 +120,31 @@ export function installThinkingCollapse(tui: unknown, options: ThinkingCollapseO
       active = false;
       restoreGet?.();
       restoreClear?.();
+      restoreUpdate?.();
+      updateRuns = undefined;
       // Native explicit click overrides were never changed and survive teardown.
       try { refresh(); } catch { warn(); }
     };
     try {
+      const updateContent = item.updateContent;
+      restoreUpdate = replace(item, "updateContent", (message: Message, isStreaming?: boolean) => {
+        const previousUpdating = updating;
+        const previousRuns = updateRuns;
+        updating = true;
+        updateRuns = undefined;
+        try { updateContent.call(item, message, isStreaming); }
+        finally { updating = previousUpdating; updateRuns = previousRuns; }
+      });
       restoreGet = replace(overrides, "get", (index: number) => {
         const explicit = get.call(overrides, index);
         if (!active || explicit !== undefined || nativePreference.has(index)) return explicit;
-        const run = runs(item.lastMessage)[index];
+        const run = analyze()[index];
         // A later content block closes an earlier thinking run even while a
         // subsequent run streams. A trailing run waits for native message_end.
         return run && (!item.isStreaming || run.end < item.lastMessage!.content.length - 1) ? true : undefined;
       });
       restoreClear = replace(overrides, "clear", () => {
-        runs(item.lastMessage).forEach((_run, index) => { nativePreference.add(index); });
+        analyze().forEach((_run, index) => { nativePreference.add(index); });
         clear.call(overrides);
       });
       patches.set(item, dispose);

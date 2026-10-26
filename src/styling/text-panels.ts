@@ -19,6 +19,14 @@ const isPlaintext = (language: string) => /^(?:text|plaintext|txt)$/i.test(langu
 // replays all preceding ANSI. Walk source graphemes and highlighted SGRs once;
 // only the effective foreground/attributes carry to each new row, never history.
 function hardWrap(source: string, highlighted: string, width: number): string[] {
+  const ascii = /^[\x20-\x7e]*$/.test(source);
+  // Sanitized literal ASCII has no style state or wide graphemes. Slice whole
+  // rows instead of allocating/measuring a segment for every source character.
+  if (ascii && highlighted === source) {
+    const rows: string[] = [];
+    for (let offset = 0; offset < source.length; offset += width) rows.push(source.slice(offset, offset + width));
+    return rows.length ? rows : [""];
+  }
   const styles = new Map<number, string>();
   const track = (parameters: string) => {
     const values = parameters.split(";").map(Number);
@@ -43,8 +51,13 @@ function hardWrap(source: string, highlighted: string, width: number): string[] 
   let cursor = 0;
   let columns = 0;
   let row = "";
-  for (const { segment } of graphemes.segment(source)) {
-    const size = visibleWidth(segment);
+  // Highlighted ASCII still needs the native style walk, but every character
+  // has width one. Unicode keeps segmentation over the unstyled source so ANSI
+  // boundaries cannot split combining/ZWJ graphemes.
+  const segments = ascii ? source : graphemes.segment(source);
+  for (const item of segments) {
+    const segment = typeof item === "string" ? item : item.segment;
+    const size = ascii ? 1 : visibleWidth(segment);
     if (columns && columns + size > width) {
       rows.push(row);
       row = [...styles.values()].join("");
@@ -73,10 +86,9 @@ function hardWrap(source: string, highlighted: string, width: number): string[] 
   return rows;
 }
 
-function panel(body: string[], width: number, theme: Theme, language: string): string {
+function panel(body: string[], width: number, theme: Theme, language: string, background: ReturnType<typeof mixColors>): string {
   const padding = width >= 4 ? 1 : 0;
   const available = Math.max(1, width - padding * 2);
-  const background = mixColors(theme.colors.userMessageBg, theme.colors.text, 0.08);
   const bg = backgroundAnsi(background, theme.getColorMode());
   const fg = theme.getFgAnsi("text");
   const rows: string[] = [];
@@ -149,8 +161,9 @@ function containerContent(line: string, containers: string[]): string | undefine
 function transform(markdown: string, context: MarkdownTransformContext, theme: Theme): string {
   // Thinking keeps Pi's native styling. Only interactive assistant/user Markdown
   // reaches this callback; no messages or provider/model context are modified.
-  if (context.messageType === "assistant-thinking") return markdown;
+  if (context.messageType === "assistant-thinking" || !markdown.includes("```") && !markdown.includes("~~~")) return markdown;
   const lines = markdown.split("\n");
+  let background: ReturnType<typeof mixColors> | undefined;
   const output: string[] = [];
   let htmlEnd: RegExp | "blank" | undefined;
   for (let i = 0; i < lines.length; i++) {
@@ -210,7 +223,8 @@ function transform(markdown: string, context: MarkdownTransformContext, theme: T
       const last = body.at(-1);
       const partialClosing = new RegExp(`^ {0,3}${marker[0]}{1,${marker.length - 1}}[ \\t]*$`);
       if (context.isStreaming && end === lines.length && last && partialClosing.test(last)) body.pop();
-      output.push("", panel(body, context.availableWidth, theme, language), "");
+      background ??= mixColors(theme.colors.userMessageBg, theme.colors.text, 0.08);
+      output.push("", panel(body, context.availableWidth, theme, language, background), "");
     }
     i = end;
   }

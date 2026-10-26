@@ -1,6 +1,7 @@
 import type { ExtensionAPI, Theme } from "@earendil-works/pi-coding-agent";
 import { type Component, Container, type DefaultTextStyle, Markdown, type MarkdownTheme, MouseRegion, Spacer, Text, visibleWidth } from "@earendil-works/pi-tui";
 import { assistantBackground, type ConversationTone, conversationProse, userBackground } from "./palette.ts";
+import { isTranscriptRendererSupported, registerTranscriptRenderer } from "./transcript-measurement.ts";
 
 interface Tree extends Component { children: Component[] }
 interface Assistant extends Tree {
@@ -127,8 +128,10 @@ export function installAssistantPanels(tui: unknown, options: AssistantPanelOpti
     return () => {};
   }
   const original = document.render;
+  const preservesCoordinates = isTranscriptRendererSupported(document);
+  let unregisterRenderer: (() => void) | undefined;
   const descriptor = Object.getOwnPropertyDescriptor(document, "render");
-  const patches = new Map<Component, { descriptor?: PropertyDescriptor; render: Component["render"]; restoreStyles: () => void }>();
+  const patches = new Map<Component, { descriptor?: PropertyDescriptor; render: Component["render"]; restoreStyles: () => void; restoreInvalidate: () => void }>();
   type OwnedSpacer = { container: Container; children: Component[]; anchor: Component; spacer: Spacer };
   const bottoms = new Map<Assistant, OwnedSpacer>();
   const gaps = new Map<Assistant, OwnedSpacer>();
@@ -163,6 +166,7 @@ export function installAssistantPanels(tui: unknown, options: AssistantPanelOpti
       if (patch.descriptor) Object.defineProperty(component, "render", patch.descriptor);
       else delete (component as Partial<Component>).render;
     }
+    patch.restoreInvalidate();
     patch.restoreStyles();
     patches.delete(component);
   };
@@ -173,6 +177,7 @@ export function installAssistantPanels(tui: unknown, options: AssistantPanelOpti
       if (descriptor) Object.defineProperty(document, "render", descriptor);
       else delete (document as Partial<Tree>).render;
     }
+    unregisterRenderer?.();
     for (const owners of [gaps, bottoms]) for (const assistant of owners.keys()) removeSpacer(assistant, owners);
     for (const component of patches.keys()) restore(component);
     options.requestRender();
@@ -231,24 +236,47 @@ export function installAssistantPanels(tui: unknown, options: AssistantPanelOpti
         let restoreStyles = () => {};
         try { if (component instanceof Markdown) restoreStyles = patchStyles(component, !!user, options); }
         catch { warn(); continue; }
+        const invalidateDescriptor = Object.getOwnPropertyDescriptor(component, "invalidate");
+        const originalInvalidate = component.invalidate;
+        // One current layout per component. Keep a value snapshot as native or
+        // foreign renderers may reuse and mutate their returned array in place.
+        let cache: { width: number; background: string; foreground: string; source: string[]; painted: string[] } | undefined;
+        const invalidate = () => {
+          cache = undefined;
+          originalInvalidate.call(component);
+        };
+        const restoreInvalidate = () => {
+          cache = undefined;
+          if (component.invalidate !== invalidate) return;
+          if (invalidateDescriptor) Object.defineProperty(component, "invalidate", invalidateDescriptor);
+          else delete (component as Partial<Component>).invalidate;
+        };
         const render = (width: number) => {
           const lines = original.call(component, width);
-          if (disposed || user) return lines;
+          // Spacer height probes use width zero during reconciliation. They do
+          // not paint and must not evict the current visible-width layout.
+          if (disposed || user || width <= 0) return lines;
           try {
             const theme = options.theme();
             const background = assistantBackground(theme);
-            if (!background) return lines;
+            if (!background) { cache = undefined; return lines; }
             // Never mutate the Markdown cache (nor assistant OSC zone markers).
             // Own only the default prose foreground; explicit nested colors and
             // opaque OSC/image payloads are never remapped. Applying it after
             // layout avoids changing native Markdown wrapping/style-context rules.
             const foreground = component instanceof Markdown ? theme.getFgAnsi("text") : "";
-            return lines.map(line => fillLine(line, width, background, foreground));
+            if (cache && cache.width === width && cache.background === background && cache.foreground === foreground
+              && cache.source.length === lines.length && cache.source.every((line, index) => line === lines[index])) return cache.painted;
+            const painted = lines.map(line => fillLine(line, width, background, foreground));
+            cache = { width, background, foreground, source: lines.slice(), painted };
+            return painted;
           } catch { warn(); return lines; }
         };
-        try { Object.defineProperty(component, "render", { configurable: true, writable: true, value: render }); }
-        catch { restoreStyles(); warn(); continue; }
-        patches.set(component, { descriptor, render, restoreStyles });
+        try {
+          Object.defineProperty(component, "invalidate", { configurable: true, writable: true, value: invalidate });
+          Object.defineProperty(component, "render", { configurable: true, writable: true, value: render });
+        } catch { restoreInvalidate(); restoreStyles(); warn(); continue; }
+        patches.set(component, { descriptor, render, restoreStyles, restoreInvalidate });
       }
     }
     // Streaming/invalidation rebuild Markdown instances. Restore and release old
@@ -266,6 +294,9 @@ export function installAssistantPanels(tui: unknown, options: AssistantPanelOpti
   try {
     Object.defineProperty(document, "render", { configurable: true, writable: true, value: render });
     sync();
+    // This wrapper reconciles native children, then returns original rows unchanged.
+    // Never certify a foreign renderer merely because it refreshes mouseLayout.
+    if (preservesCoordinates && document.render === render) unregisterRenderer = registerTranscriptRenderer(document, render);
     options.requestRender();
   } catch { warn(); dispose(); }
   return dispose;

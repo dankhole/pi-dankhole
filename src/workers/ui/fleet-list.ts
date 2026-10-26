@@ -168,9 +168,10 @@ export class FleetList {
   }
 
   /** Re-register/refresh the below-editor widget; clears it when nothing remains. */
-  update(): void {
+  update(snapshot?: FleetEntry[]): void {
     if (!this.ui) return;
-    const hasRows = this.enabled && this.roster().length > 1;
+    const roster = this.enabled ? snapshot ?? this.roster() : [];
+    const hasRows = roster.length > 1;
 
     if (!hasRows) {
       if (this.widgetRegistered) {
@@ -184,7 +185,7 @@ export class FleetList {
       return;
     }
 
-    this.clampSelection();
+    this.clampSelection(roster);
     this.ensureTimer(); // keep stats ticking whenever the list is shown (e.g. after a re-enable)
 
     if (!this.widgetRegistered) {
@@ -229,8 +230,8 @@ export class FleetList {
     ];
   }
 
-  private clampSelection(): void {
-    const max = this.roster().length - 1;
+  private clampSelection(roster: FleetEntry[]): void {
+    const max = roster.length - 1;
     if (this.selectedIndex > max) this.selectedIndex = Math.max(0, max);
     if (this.selectedIndex < 0) this.selectedIndex = 0;
   }
@@ -260,33 +261,38 @@ export class FleetList {
     if (!this.active) {
       // Activate: ↓ or ← at an empty prompt moves focus into the list.
       const isActivator = matchesKey(data, "down") || matchesKey(data, "left");
-      if (isActivator && this.roster().length > 1 && this.ui.getEditorText() === "") {
-        this.active = true;
-        this.selectedIndex = 0;
-        this.update();
-        return { consume: true };
+      if (isActivator && this.ui.getEditorText() === "") {
+        const roster = this.roster();
+        if (roster.length > 1) {
+          this.active = true;
+          this.selectedIndex = 0;
+          this.update(roster);
+          return { consume: true };
+        }
       }
       return undefined;
     }
 
+    // Share one fresh roster across selection, clamping and refresh.
+    const roster = this.roster();
     // Active — arrows navigate, Enter opens, Esc / Up-past-top exits.
     if (matchesKey(data, "down")) {
-      const max = this.roster().length - 1;
+      const max = roster.length - 1;
       this.selectedIndex = Math.min(max, this.selectedIndex + 1);
-      this.update();
+      this.update(roster);
       return { consume: true };
     }
     if (matchesKey(data, "up")) {
-      if (this.selectedIndex === 0) { this.deactivate(); return { consume: true }; }
+      if (this.selectedIndex === 0) { this.deactivate(roster); return { consume: true }; }
       this.selectedIndex -= 1;
-      this.update();
+      this.update(roster);
       return { consume: true };
     }
-    if (matchesKey(data, "escape")) { this.deactivate(); return { consume: true }; }
-    if (matchesKey(data, Key.enter)) { this.openSelected(); return { consume: true }; }
+    if (matchesKey(data, "escape")) { this.deactivate(roster); return { consume: true }; }
+    if (matchesKey(data, Key.enter)) { this.openSelected(roster); return { consume: true }; }
 
     // Any other key cancels navigation and flows to the editor.
-    this.deactivate();
+    this.deactivate(roster);
     return undefined;
   }
 
@@ -306,17 +312,17 @@ export class FleetList {
     return typeof c.getText === "function" && typeof c.setText === "function";
   }
 
-  private deactivate(): void {
+  private deactivate(roster?: FleetEntry[]): void {
     this.active = false;
     this.selectedIndex = 0;
-    this.update();
+    this.update(roster);
   }
 
-  private openSelected(): void {
-    const entry = this.roster()[this.selectedIndex];
+  private openSelected(roster: FleetEntry[]): void {
+    const entry = roster[this.selectedIndex];
     if (!entry || entry.kind === "main") {
       // `main` = return to the prompt; the native transcript is already shown.
-      this.deactivate();
+      this.deactivate(roster);
       return;
     }
     const record = entry.record;
@@ -366,14 +372,19 @@ export class FleetList {
     // still feels natural if the list reordered (an earlier agent finished)
     // while the overlay was open. If that agent is gone, leave the index for
     // update()'s clamp to settle.
+    const roster = this.roster();
     const viewed = this.viewingAgentId;
     if (viewed !== undefined) {
-      const idx = this.roster().findIndex(e => e.kind === "agent" && e.record.id === viewed);
+      const idx = roster.findIndex(e => e.kind === "agent" && e.record.id === viewed);
       if (idx >= 0) this.selectedIndex = idx;
     }
     this.viewerClose = undefined;
     this.viewingAgentId = undefined;
-    this.update();
+    const now = Date.now();
+    // Closing a viewer removes its special retention without another fetch/sort.
+    this.update(roster.filter(e => e.kind === "main"
+      || e.record.status === "running" || e.record.status === "queued"
+      || (e.record.completedAt != null && now - e.record.completedAt < FINISHED_LINGER_MS)));
   }
 
   // ---- Rendering ----

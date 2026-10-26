@@ -74,6 +74,61 @@ test("commands and huge successful output occupy one nonblank line", () => {
   assert.equal(plain(component).length, 2); // Pi retains one inter-message blank line.
 });
 
+test("stable summaries survive result updates without skipping downstream renderers", () => {
+  const args = { code: "tools.read({}); tools.bash({}); tools.read({}); " + "// padding\n".repeat(10000) };
+  let calls = 0;
+  let results = 0;
+  const component = row("codemode", args, {
+    renderCall() { calls++; return new Text("native call", 0, 0); },
+    renderResult() { results++; return new Text("native result", 0, 0); },
+  });
+  const cached = component.rendererState.summary;
+  const initialCalls = calls;
+  let compact;
+  for (let index = 0; index < 100; index++) {
+    component.updateResult(output("updated"));
+    if (index === 0) compact = component.rendererState.compactCall.component;
+    else assert.equal(component.rendererState.compactCall.component, compact, "unchanged compact rows reuse their layout component");
+  }
+  assert.equal(component.rendererState.summary, cached, "unchanged arguments reuse the computed summary");
+  assert.equal(calls - initialCalls, 100, "native lifecycle still runs for every update");
+  assert.equal(results, 100);
+  args.code = "tools.edit({}); tools.write({}); tools.bash({}); tools.read({}); tools.extra({});";
+  component.updateArgs(args);
+  assert.notEqual(component.rendererState.summary, cached, "in-place argument edits invalidate the summary");
+  assert.match(nonblank(component, 200)[0], /edit, write, bash, read, …/);
+  args.script = "tools.fallback({});";
+  args.code = "";
+  component.updateArgs(args);
+  assert.match(nonblank(component)[0], /script/);
+  delete args.code;
+  component.updateArgs(args);
+  assert.match(nonblank(component)[0], /fallback/, "empty code takes precedence but absent code uses script");
+});
+
+test("summary cache tracks selected fields, fallback keys and working directory", () => {
+  const args = { description: "\n", path: join(scratch, "file.ts") };
+  const component = row("read", args, {});
+  assert.match(nonblank(component)[0], /file\.ts/);
+  args.description = "changed description";
+  component.updateArgs(args);
+  assert.match(nonblank(component)[0], /changed description/);
+  delete args.description; delete args.path;
+  args.first = 1;
+  component.updateArgs(args);
+  assert.match(nonblank(component)[0], /first/);
+  delete args.first; args.second = 2;
+  component.updateArgs(args);
+  assert.match(nonblank(component)[0], /second/);
+  const renderers = resolver("read", () => undefined);
+  const state = {};
+  const context = { state, cwd: scratch, outputPad: 0, expanded: false, isPartial: false, isError: false };
+  const path = join(scratch, "nested", "file.ts");
+  assert.match(plain(renderers.renderCall({ path }, themeModule.theme, context))[0], /nested\/file\.ts/);
+  context.cwd = join(scratch, "nested");
+  assert.doesNotMatch(plain(renderers.renderCall({ path }, themeModule.theme, context))[0], /nested\//);
+});
+
 test("tool types have distinct full-width backgrounds in dark and light themes", () => {
   try {
     for (const appearance of ["dark", "light"]) {

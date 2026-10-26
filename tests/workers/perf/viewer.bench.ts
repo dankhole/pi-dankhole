@@ -1,35 +1,19 @@
 /**
- * viewer.bench.ts — `ConversationViewer.render()` against transcripts of
- * growing size.
- *
- * The highest-value benchmark in the repo: this is the only frame-rate path
- * whose cost is unbounded in the data it renders. `buildContentLines()` rebuilds
- * the *entire* transcript on every render — "rebuild every render (live data, no
- * cache needed)", conversation-viewer.ts — and the viewer subscribes to the
- * session, so a running agent redraws it on every token (coalesced by pi at
- * ~62 Hz). Everything above the viewport is built and thrown away, and
- * `handleInput` builds it a second time on every scroll key just to count lines.
- *
- * Both markdown modes are measured. `assistant` is the default and sends
- * assistant text through pi's Markdown parser; `off` is the raw wrap path. The
- * pair is the cost of #259, and the cap it introduced (RESULT_MAX_CHARS) is what
- * keeps a single large tool result from dominating the whole frame.
- *
- * Cold vs warm is the other axis worth knowing: the Markdown cache is a WeakMap
- * keyed by the message object, so the first frame parses and later frames reuse.
- * A regression that breaks cache identity would leave "warm" looking like
- * "cold" here while every other test stays green.
+ * Synthetic viewer CPU measurements; CI guards operation counts separately.
+ * Warm frames and scroll keys reuse stable history layout, while streaming
+ * lays out only the changed message. Cold viewers still render all history.
+ * No live providers, timers as acceptance thresholds, or transcript truncation.
  */
 import { bench, describe } from "vitest";
 import { ConversationViewer } from "../../../src/workers/ui/conversation-viewer.js";
 import { makeSession, mountViewer } from "../helpers/perf-fixtures.js";
 
-const SIZES = [50, 500, 5000];
+const SIZES = [50, 500, 2000, 5000];
 
 describe("ConversationViewer.render — markdown: assistant (default)", () => {
   for (const n of SIZES) {
     const viewer = mountViewer(ConversationViewer, makeSession(n));
-    viewer.render(120); // prime: first frame parses, the measured ones reuse
+    viewer.render(120); // prime per-message blocks and flattened layout
     bench(`${n} messages`, () => {
       viewer.render(120);
     });
@@ -44,6 +28,33 @@ describe("ConversationViewer.render — markdown: off (raw wrap)", () => {
       viewer.render(120);
     });
   }
+});
+
+describe("ConversationViewer — scroll input plus repaint", () => {
+  for (const mode of ["off", "assistant"]) {
+    const viewer = mountViewer(ConversationViewer, makeSession(2000), undefined, () => mode);
+    viewer.render(120);
+    let up = false;
+    bench(`2000 messages, ${mode}`, () => {
+      up = !up;
+      viewer.handleInput(up ? "\x1b[A" : "\x1b[B");
+      viewer.render(120);
+    });
+  }
+});
+
+describe("ConversationViewer — one same-object streaming update", () => {
+  const session = makeSession(2000); // final message is an assistant
+  const viewer = mountViewer(ConversationViewer, session);
+  const block = session.messages.at(-1).content[0];
+  const prefix = block.text;
+  let alternate = false;
+  viewer.render(120);
+  bench("2000 messages, one changed block", () => {
+    alternate = !alternate;
+    block.text = prefix + (alternate ? "delta A" : "delta B");
+    viewer.render(120);
+  });
 });
 
 describe("ConversationViewer.render — cold cache (first frame)", () => {

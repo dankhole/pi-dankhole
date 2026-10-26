@@ -9,7 +9,7 @@ import { truncateToWidth } from "@earendil-works/pi-tui";
 import { renderAgentName } from "../agent-color.js";
 import type { AgentManager } from "../agent-manager.js";
 import type { AgentInvocation, AgentRecord, WidgetMode } from "../types.js";
-import { getLifetimeCost, getLifetimeTotal, getSessionContextPercent, type SessionLike } from "../usage.js";
+import { type ContextSessionLike, getLifetimeCost, getLifetimeTotal, getSessionContextPercent } from "../usage.js";
 
 // ---- Constants ----
 
@@ -54,7 +54,7 @@ export interface AgentActivity {
   activeTools: Map<string, string>;
   toolUses: number;
   responseText: string;
-  session?: SessionLike;
+  session?: ContextSessionLike;
   /** Current turn count. */
   turnCount: number;
   /** Effective max turns for this agent (undefined = unlimited). */
@@ -197,9 +197,17 @@ export function colorInvocationSections(theme: Theme, modelName: string | undefi
 
 /** Truncate text to a single line, max `len` chars. */
 function truncateLine(text: string, len = 60): string {
-  const line = text.split("\n").find(l => l.trim())?.trim() ?? "";
-  if (line.length <= len) return line;
-  return line.slice(0, len) + "…";
+  // Scan only through the first nonblank line, never allocate every response
+  // line just to show its opening words on each animation frame.
+  let start = 0;
+  while (start < text.length) {
+    const newline = text.indexOf("\n", start);
+    const end = newline < 0 ? text.length : newline;
+    const line = text.slice(start, end).trim();
+    if (line) return line.length <= len ? line : line.slice(0, len) + "…";
+    start = end + 1;
+  }
+  return "";
 }
 
 /** Build a human-readable activity string from currently-running tools or response text. */
@@ -223,8 +231,9 @@ export function describeActivity(activeTools: Map<string, string>, responseText?
   }
 
   // No tools active — show truncated response text if available
-  if (responseText && responseText.trim().length > 0) {
-    return truncateLine(responseText);
+  if (responseText) {
+    const preview = truncateLine(responseText);
+    if (preview) return preview;
   }
 
   return "thinking…";
@@ -286,8 +295,7 @@ export class AgentWidget {
    *     only proven-foreground runs drop out — nothing else silently vanishes.
    *   - `all`: every agent.
    */
-  private widgetAgents() {
-    const all = this.manager.listAgents();
+  private widgetAgents(all = this.manager.listAgents()) {
     switch (this.mode()) {
       case "off": return [];
       case "background": return all.filter(a => a.isBackground !== false);
@@ -320,10 +328,17 @@ export class AgentWidget {
     this.update();
   }
 
-  /** Ensure the widget update timer is running. */
+  /** Animate only when a visible running row has a spinner. Queues are static. */
   ensureTimer() {
-    if (!this.widgetInterval) {
+    this.setAnimating(!!this.uiCtx && this.widgetAgents().some(a => a.status === "running"));
+  }
+
+  private setAnimating(animate: boolean) {
+    if (animate && !this.widgetInterval) {
       this.widgetInterval = setInterval(() => this.update(), 80);
+    } else if (!animate && this.widgetInterval) {
+      clearInterval(this.widgetInterval);
+      this.widgetInterval = undefined;
     }
   }
 
@@ -418,20 +433,33 @@ export class AgentWidget {
     // Build sections separately for overflow-aware assembly.
     // Each running agent = 2 lines (header + activity), finished = 1 line, queued = 1 line.
 
+    // Allocate the line budget before context reads, activity previews, theme
+    // painting or width measurement. Hidden rows need only status/count data.
+    const maxBody = MAX_WIDGET_LINES - 1;
+    const queuedReserve = queued.length > 0 ? 1 : 0;
+    const totalBody = finished.length + running.length * 2 + queuedReserve;
+    const overflow = totalBody > maxBody;
+    let budget = maxBody - (overflow ? 1 : 0) - queuedReserve;
+    const visibleRunning = Math.min(running.length, Math.floor(budget / 2));
+    budget -= visibleRunning * 2;
+    const visibleFinished = Math.min(finished.length, budget);
+    const hiddenRunning = running.length - visibleRunning;
+    const hiddenFinished = finished.length - visibleFinished;
+
     const finishedLines: string[] = [];
-    for (const a of finished) {
+    for (const a of finished.slice(0, visibleFinished)) {
       finishedLines.push(truncate(theme.fg("dim", "├─") + " " + this.renderFinishedLine(a, theme)));
     }
 
     const runningLines: string[][] = []; // each entry is [header, activity]
-    for (const a of running) {
+    for (const a of running.slice(0, visibleRunning)) {
       const elapsed = formatMs(Date.now() - a.startedAt);
 
       const bg = this.agentActivity.get(a.id);
       // Spend comes from the record, never from the activity tracker, so the
       // same lifetime total remains visible while running and after completion.
       const tokens = getLifetimeTotal(a.lifetimeUsage);
-      const contextPercent = getSessionContextPercent(bg?.session);
+      const contextPercent = tokens > 0 ? getSessionContextPercent(bg?.session) : null;
       const tokenText = tokens > 0 ? formatSessionTokens(tokens, contextPercent, theme, a.compactionCount) : "";
       const costText = this.showCost() ? formatCost(getLifetimeCost(a.lifetimeUsage)) : "";
 
@@ -467,13 +495,9 @@ export class AgentWidget {
       ? truncate(theme.fg("dim", "├─") + ` ${theme.fg("muted", "◦")} ${theme.fg("dim", `${queued.length} queued`)}`)
       : undefined;
 
-    // Assemble with overflow cap (heading + overflow indicator = 2 reserved lines).
-    const maxBody = MAX_WIDGET_LINES - 1; // heading takes 1 line
-    const totalBody = finishedLines.length + runningLines.length * 2 + (queuedLine ? 1 : 0);
-
     const lines: string[] = [truncate(theme.fg(headingColor, headingIcon) + " " + theme.fg(headingColor, "Agents"))];
 
-    if (totalBody <= maxBody) {
+    if (!overflow) {
       // Everything fits — add all lines and fix up connectors for the last item.
       lines.push(...finishedLines);
       for (const pair of runningLines) lines.push(...pair);
@@ -494,48 +518,11 @@ export class AgentWidget {
         }
       }
     } else {
-      // Overflow — prioritize: running > queued > finished.
-      // Reserve 1 line for overflow indicator.
-      let budget = maxBody - 1;
-      let hiddenRunning = 0;
-      let hiddenFinished = 0;
-
-      // Reserve the queued line's row up front. It is a single summary of N
-      // waiting agents, so it cannot be folded into the "+N more" count (which
-      // is denominated in agents) without either under-reporting it as 1 or
-      // inflating the total with agents that were never getting their own rows.
-      // Reserving costs at most one running agent — which IS counted below —
-      // and makes the drop unreachable. It matters most exactly when it used to
-      // vanish: the pool is saturated and the queue is what the user needs to see.
-      const queuedReserve = queuedLine ? 1 : 0;
-      budget -= queuedReserve;
-
-      // 1. Running agents (2 lines each)
-      for (const pair of runningLines) {
-        if (budget >= 2) {
-          lines.push(...pair);
-          budget -= 2;
-        } else {
-          hiddenRunning++;
-        }
-      }
-
-      // 2. Queued line (always fits — its row was reserved above)
-      if (queuedLine) {
-        budget += queuedReserve;
-        lines.push(queuedLine);
-        budget--;
-      }
-
-      // 3. Finished agents
-      for (const fl of finishedLines) {
-        if (budget >= 1) {
-          lines.push(fl);
-          budget--;
-        } else {
-          hiddenFinished++;
-        }
-      }
+      // Overflow — prioritize running > queued > finished, preserving the
+      // queue summary separately from the count of hidden individual agents.
+      for (const pair of runningLines) lines.push(...pair);
+      if (queuedLine) lines.push(queuedLine);
+      lines.push(...finishedLines);
 
       // Overflow summary
       const overflowParts: string[] = [];
@@ -551,8 +538,13 @@ export class AgentWidget {
 
   /** Force an immediate widget update. */
   update() {
+    const records = this.manager.listAgents();
+    const retainedIds = new Set(records.map(a => a.id));
+    for (const id of this.finishedTurnAge.keys()) {
+      if (!retainedIds.has(id)) this.finishedTurnAge.delete(id);
+    }
     if (!this.uiCtx) return;
-    const allAgents = this.widgetAgents();
+    const allAgents = this.widgetAgents(records);
 
     // Lightweight existence checks — full categorization happens in renderWidget()
     let runningCount = 0;
@@ -564,6 +556,7 @@ export class AgentWidget {
       else if (a.completedAt && this.shouldShowFinished(a.id, a.status)) { hasFinished = true; }
     }
     const hasActive = runningCount > 0 || queuedCount > 0;
+    this.setAnimating(runningCount > 0);
 
     // Nothing to show — clear widget
     if (!hasActive && !hasFinished) {
@@ -577,10 +570,6 @@ export class AgentWidget {
         this.lastStatusText = undefined;
       }
       if (this.widgetInterval) { clearInterval(this.widgetInterval); this.widgetInterval = undefined; }
-      // Clean up stale entries
-      for (const [id] of this.finishedTurnAge) {
-        if (!allAgents.some(a => a.id === id)) this.finishedTurnAge.delete(id);
-      }
       return;
     }
 
@@ -608,9 +597,11 @@ export class AgentWidget {
         return {
           render: () => this.renderWidget(tui, theme),
           invalidate: () => {
-            // Theme changed — force re-registration so factory captures fresh theme.
+            // Settled widgets have no animation tick to pick up a fresh theme.
+            // Re-register on explicit invalidation as well as lifecycle updates.
             this.widgetRegistered = false;
             this.tui = undefined;
+            this.update();
           },
         };
       }, { placement: "aboveEditor" });

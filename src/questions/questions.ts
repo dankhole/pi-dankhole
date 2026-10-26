@@ -1,4 +1,4 @@
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext, SessionEntry, Theme } from "@earendil-works/pi-coding-agent";
 import { stripTerminalSequences, Text, type TuiMouseEvent, truncateToWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { questionPaint, questionPlain, questionStyle } from "./question-palette.ts";
@@ -115,6 +115,68 @@ function readRecord(value: unknown): QuestionRecord | undefined {
   return structuredClone(record);
 }
 
+type AnswerEvidence = NonNullable<QuestionResolution["evidence"]>;
+
+/** One immutable branch snapshot; no evidence or ancestry is cached across operations. */
+function indexEvidence(branch: readonly SessionEntry[], recordFor: (entry: SessionEntry) => QuestionRecord | undefined) {
+  type Receipt = { id: string; position: number; source: QuestionInputReceipt["source"]; text: string; pending: Set<number> };
+  const pending = new Map<number, boolean>();
+  const positions = new Map<string, number>();
+  const receipts = new Map<string, Receipt>();
+  const firstReceipts = new Map<number, Map<string, Receipt>>();
+  const chats = new Map<string, { id: string; position: number }[]>();
+  const chatText = new Map<string, string>();
+  for (const [position, entry] of branch.entries()) {
+    positions.set(entry.id, position);
+    if (entry.type === "custom" && entry.customType === QUESTION_ENTRY_TYPE) {
+      const record = recordFor(entry);
+      if (record) pending.set(record.id, record.status === "pending");
+    } else if (entry.type === "message" && entry.message.role === "assistant") {
+      for (const question of parseProseQuestions(textContent(entry.message))) if (!pending.has(question.id)) pending.set(question.id, true);
+    } else if (entry.type === "custom" && entry.customType === QUESTION_INPUT_ENTRY_TYPE) {
+      const receipt = entry.data as QuestionInputReceipt | undefined;
+      if (receipt?.version !== 1 || !["interactive", "rpc"].includes(receipt.source)
+        || typeof receipt.text !== "string" || !Array.isArray(receipt.pendingIds)) continue;
+      const observed = new Set<number>(receipt.pendingIds.filter(id => pending.get(id) === true));
+      const indexed: Receipt = { id: entry.id, position, source: receipt.source, text: receipt.text, pending: observed };
+      receipts.set(entry.id, indexed);
+      for (const id of observed) {
+        let byText = firstReceipts.get(id);
+        if (!byText) { byText = new Map(); firstReceipts.set(id, byText); }
+        if (!byText.has(receipt.text)) byText.set(receipt.text, indexed);
+      }
+    } else if (entry.type === "message" && entry.message.role === "user") {
+      const text = textContent(entry.message);
+      let matches = chats.get(text);
+      if (!matches) { matches = []; chats.set(text, matches); }
+      matches.push({ id: entry.id, position });
+      chatText.set(entry.id, text);
+    }
+  }
+  return (id: number, text: string, expected?: AnswerEvidence, beforeEntryId?: string): AnswerEvidence | undefined => {
+    const before = beforeEntryId === undefined ? branch.length : positions.get(beforeEntryId);
+    if (before === undefined) return;
+    const receipt = expected ? receipts.get(expected.inputEntryId) : firstReceipts.get(id)?.get(text);
+    if (!receipt?.pending.has(id) || receipt.text !== text || receipt.position >= before
+      || (expected && receipt.source !== expected.inputSource)) return;
+    if (expected) {
+      const position = positions.get(expected.chatEntryId);
+      if (position === undefined || position <= receipt.position || position >= before || chatText.get(expected.chatEntryId) !== text) return;
+      return { inputEntryId: receipt.id, inputSource: receipt.source, chatEntryId: expected.chatEntryId, text };
+    }
+    const matches = chats.get(text) ?? [];
+    // Find the first corroborating chat AFTER the first eligible receipt, not a later echo.
+    let low = 0, high = matches.length;
+    while (low < high) {
+      const middle = (low + high) >>> 1;
+      if (matches[middle].position <= receipt.position) low = middle + 1;
+      else high = middle;
+    }
+    const chat = matches[low];
+    if (chat && chat.position < before) return { inputEntryId: receipt.id, inputSource: receipt.source, chatEntryId: chat.id, text };
+  };
+}
+
 function questionLines(question: QuestionView): string[] {
   return [
     `Q${question.id}: ${safe(question.question)}`,
@@ -126,9 +188,22 @@ function questionLines(question: QuestionView): string[] {
 class QuestionTranscript extends Text {
   private lastWidth = 0;
   private lastHeight = 0;
-  constructor(private readonly currentText: () => { text: string; bufferAfterText?: string }, private readonly paint: (line: string, separator?: boolean) => string, private readonly buffers: "top" | "both",
+  private cached?: { width: number; revision: unknown; appearance: Theme["appearance"]; mode: ReturnType<Theme["getColorMode"]>;
+    plain: boolean; colors: Theme["colors"]; lines: string[] };
+  private cachedContent?: { width: number; revision: unknown; value: { identity: object; rows: number[] } | undefined };
+  constructor(private readonly currentText: () => { text: string; bufferAfterText?: string }, private readonly paint: (line: string, separator?: boolean) => string,
+    private readonly theme: Theme, private readonly revision: () => unknown, private readonly buffers: "top" | "both",
     private readonly open?: () => boolean, private readonly content?: (width: number) => { identity: object; rows: number[] } | undefined) { super("", 0, 0); }
-  [QUESTION_CONTENT](width: number) { return this.content?.(width); }
+  invalidate(): void { super.invalidate(); this.cached = undefined; this.cachedContent = undefined; }
+  [QUESTION_CONTENT](width: number) {
+    // Metadata proves visibility only while our own renderer still paints it.
+    if (this.render !== QuestionTranscript.prototype.render) return undefined;
+    const revision = this.revision();
+    if (this.cachedContent?.width !== width || this.cachedContent.revision !== revision) {
+      this.cachedContent = { width, revision, value: this.content?.(width) };
+    }
+    return this.cachedContent.value;
+  }
   handleMouse(event: TuiMouseEvent) {
     if (event.type !== "click" || event.button !== "left" || event.x < 0 || event.x >= this.lastWidth
       || event.y < 0 || event.y >= this.lastHeight || !this.open?.()) return;
@@ -136,27 +211,36 @@ class QuestionTranscript extends Text {
   }
   render(width: number): string[] {
     this.lastWidth = width;
+    const revision = this.revision();
+    const appearance = this.theme.appearance, mode = this.theme.getColorMode(), plain = questionPlain(), colors = this.theme.colors;
+    if (this.cached?.width === width && this.cached.revision === revision && this.cached.appearance === appearance
+      && this.cached.mode === mode && this.cached.plain === plain && this.cached.colors === colors) {
+      this.lastHeight = this.cached.lines.length;
+      return this.cached.lines;
+    }
     this.lastHeight = 0;
+    if (width <= 0) return [];
     const { text, bufferAfterText } = this.currentText();
     this.setText(text);
-    if (width <= 0) return [];
     // Text may emit a two-column grapheme into a one-column wrap. The self-rendered shell avoids
     // native Box padding overflow and this final clamp preserves the component width contract.
     const lines = super.render(width).map(line => {
       const content = truncateToWidth(line, width, "", true);
-      if (!stripTerminalSequences(content).trim()) return !questionPlain() ? this.paint(" ".repeat(width), true) : "";
-      return questionPlain() ? stripTerminalSequences(content) : this.paint(content);
+      if (!stripTerminalSequences(content).trim()) return !plain ? this.paint(" ".repeat(width), true) : "";
+      return plain ? stripTerminalSequences(content) : this.paint(content);
     });
     // Keep the question's own bottom buffer light, before the darker separators
     // between content groups. Match Text's tab normalization when measuring wrapping.
     const buffer = this.paint(" ".repeat(width));
     if (bufferAfterText !== undefined) {
       const row = wrapTextWithAnsi(bufferAfterText.replace(/\t/g, "   "), width).length;
-      lines.splice(row, 0, questionPlain() ? "" : buffer);
+      lines.splice(row, 0, plain ? "" : buffer);
     }
     // Outer buffers retain the card fill. Native tool/editor spacing is untouched.
-    this.lastHeight = lines.length + (this.buffers === "both" ? 2 : 1);
-    return this.buffers === "both" ? [buffer, ...lines, buffer] : [buffer, ...lines];
+    const painted = this.buffers === "both" ? [buffer, ...lines, buffer] : [buffer, ...lines];
+    this.lastHeight = painted.length;
+    this.cached = { width, revision, appearance, mode, plain, colors, lines: painted };
+    return painted;
   }
 }
 
@@ -187,6 +271,40 @@ const parameters = Type.Object({
 export function registerQuestions(pi: ExtensionAPI, enabled: boolean): void {
   if (!enabled) return;
   let records = new Map<number, QuestionRecord>();
+  const toolRecords = new Map<string, QuestionRecord>();
+  const continuations = new Map<string, Set<number>>();
+  const optionScopes = new WeakMap<QuestionView["options"], string>();
+  const optionsKey = (options: QuestionView["options"]) => {
+    let key = optionScopes.get(options);
+    if (key === undefined) { key = JSON.stringify(options); optionScopes.set(options, key); }
+    return key;
+  };
+  const changedCalls = new Set<string>();
+  const changedQuestions = new Set<number>();
+  let stateVersion = 0;
+  let attentionVersion = -1;
+  let cachedAttention: QuestionRecord[] = [];
+  let publishedPending: QuestionRecord[] | undefined;
+  let publishedDelivery: string | undefined;
+  const setRecord = (record: QuestionRecord) => {
+    const previous = records.get(record.id);
+    if (previous === record) return;
+    if (previous?.toolCallId) { toolRecords.delete(previous.toolCallId); changedCalls.add(previous.toolCallId); }
+    if (previous?.continuation !== undefined) {
+      const ids = continuations.get(previous.continuation);
+      ids?.delete(previous.id);
+      if (!ids?.size) continuations.delete(previous.continuation);
+    }
+    records.set(record.id, record);
+    changedQuestions.add(record.id);
+    if (record.toolCallId) { toolRecords.set(record.toolCallId, record); changedCalls.add(record.toolCallId); }
+    if (record.status === "answered" && !record.delivered && record.delivery === "user" && record.continuation !== undefined) {
+      let ids = continuations.get(record.continuation);
+      if (!ids) { ids = new Set(); continuations.set(record.continuation, ids); }
+      ids.add(record.id);
+    }
+    stateVersion++;
+  };
   let nextId = 1;
   let generation = 0;
   let currentContext: ExtensionContext | undefined;
@@ -197,18 +315,27 @@ export function registerQuestions(pi: ExtensionAPI, enabled: boolean): void {
   // Native tool components cache their layout. Invalidate their public renderer
   // contexts when status changes; never mutate old results or append UI messages.
   const transcriptInvalidators = new Map<string, () => void>();
+  // A re-ask can leave several native cards for one question ID on the current branch.
+  const questionCalls = new Map<number, Set<string>>();
+  const retireTranscript = () => { transcriptInvalidators.clear(); questionCalls.clear(); };
   const viewportDisposers = new Set<() => void>();
   const disposeViewports = () => { for (const dispose of viewportDisposers) dispose(); };
 
   const persist = (record: QuestionRecord) => {
     pi.appendEntry(QUESTION_ENTRY_TYPE, structuredClone(record));
-    records.set(record.id, record);
+    setRecord(record);
   };
-  const attention = () => [...records.values()].filter(record => record.status === "pending" || (record.status === "answered" && !record.delivered));
+  const attention = () => {
+    if (attentionVersion !== stateVersion) {
+      cachedAttention = [...records.values()].filter(record => record.status === "pending" || (record.status === "answered" && !record.delivered));
+      attentionVersion = stateVersion;
+    }
+    return cachedAttention;
+  };
   const liveQuestion = (snapshot: QuestionRecord | undefined, renderedSession: string | undefined) => {
     const live = snapshot && renderedSession === sessionId ? records.get(snapshot.id) : undefined;
     return live && live.source === snapshot?.source && live.toolCallId === snapshot.toolCallId
-      && live.question === snapshot.question && JSON.stringify(live.options) === JSON.stringify(snapshot.options) ? live : undefined;
+      && live.question === snapshot.question && optionsKey(live.options) === optionsKey(snapshot.options) ? live : undefined;
   };
   const openCard = (snapshot: QuestionRecord | undefined, renderedSession: string | undefined) => {
     const live = liveQuestion(snapshot, renderedSession);
@@ -218,25 +345,31 @@ export function registerQuestions(pi: ExtensionAPI, enabled: boolean): void {
     return true;
   };
   const refresh = () => {
-    disposeViewports();
+    const calls = new Set(changedCalls);
+    for (const id of changedQuestions) for (const call of questionCalls.get(id) ?? []) calls.add(call);
+    changedCalls.clear();
+    changedQuestions.clear();
     const ctx = currentContext;
     if (ctx?.mode !== "tui" || !ctx.hasUI) return;
-    for (const invalidate of transcriptInvalidators.values()) invalidate();
+    for (const call of calls) transcriptInvalidators.get(call)?.();
     const waiting = attention();
     const pending = waiting.filter(record => record.status === "pending");
     const saved = waiting.filter(record => record.status === "answered");
-    // Pending reminders need no separate count or footer/input-border status.
-    ctx.ui.setStatus(QUESTION_STATUS_KEY, undefined);
     // Pi already displays its native steering queue. Busy/queued is not a failed send;
     // expose recovery only once idle, without claiming absence from the queue proves failure.
     const waitingForDelivery = saved.length > 0 && (!ctx.isIdle() || ctx.hasPendingMessages());
-    ctx.ui.setStatus(QUESTION_DELIVERY_STATUS_KEY, saved.length && !waitingForDelivery ? `${saved.length} saved answer${saved.length === 1 ? "" : "s"} · delivery unconfirmed · /q Q${saved[0].id} retry` : undefined);
+    const delivery = saved.length && !waitingForDelivery ? `${saved.length} saved answer${saved.length === 1 ? "" : "s"} · delivery unconfirmed · /q Q${saved[0].id} retry` : undefined;
+    if (delivery !== publishedDelivery) { ctx.ui.setStatus(QUESTION_DELIVERY_STATUS_KEY, delivery); publishedDelivery = delivery; }
+    if (publishedPending?.length === pending.length && pending.every((record, index) => record === publishedPending![index])) return;
+    disposeViewports();
+    publishedPending = pending;
     const stamp = generation;
     ctx.ui.setWidget(QUESTION_STATUS_KEY, pending.length ? (tui, theme) => {
       let proseLeaf: string | null | undefined;
       let proseSources: ProseQuestionSource[] | undefined;
+      const pendingProse = new Map(pending.filter(record => record.source === "prose").map(record => [record.id, record]));
       const shouldShow = questionListVisibility(tui, pending, () => {
-        if (!sameGeneration(stamp) || !pending.some(record => record.source === "prose")
+        if (!sameGeneration(stamp) || !pendingProse.size
           || typeof ctx.sessionManager.buildContextEntries !== "function") return;
         const leaf = ctx.sessionManager.getLeafId();
         if (leaf === proseLeaf && proseSources) return proseSources;
@@ -245,8 +378,8 @@ export function registerQuestions(pi: ExtensionAPI, enabled: boolean): void {
         proseSources = ctx.sessionManager.buildContextEntries().flatMap(entry => {
           if (entry.type !== "message" || entry.message.role !== "assistant") return [];
           const questions = parseProseQuestions(textContent(entry.message)).flatMap(question => {
-            const record = pending.find(record => record.source === "prose" && record.id === question.id && record.question === question.question);
-            if (!record || seen.has(record.id)) return [];
+            const record = pendingProse.get(question.id);
+            if (!record || record.question !== question.question || seen.has(record.id)) return [];
             seen.add(record.id);
             return [{ identity: record, id: record.id, question: record.question }];
           });
@@ -327,6 +460,11 @@ export function registerQuestions(pi: ExtensionAPI, enabled: boolean): void {
   const clearUI = () => {
     generation++;
     disposeViewports();
+    retireTranscript();
+    changedCalls.clear();
+    changedQuestions.clear();
+    publishedPending = undefined;
+    publishedDelivery = undefined;
     listOffset = 0;
     active?.close({ kind: "defer" });
     active = undefined;
@@ -345,7 +483,7 @@ export function registerQuestions(pi: ExtensionAPI, enabled: boolean): void {
       // A repeated prose label cannot replace an answered question or silently change its scope.
       if (records.has(question.id)) continue;
       const record: QuestionRecord = { ...question, options: [], version: 1, source: "prose", status: "pending" };
-      if (write) { listOffset = 0; persist(record); } else records.set(record.id, record);
+      if (write) { listOffset = 0; persist(record); } else setRecord(record);
     }
   };
   // message_end precedes the host's appendMessage. Confirmation is intentionally memory-only;
@@ -361,62 +499,45 @@ export function registerQuestions(pi: ExtensionAPI, enabled: boolean): void {
         // must neither append another full snapshot nor replace a later confirmed continuation.
         if (existing?.status !== "answered" || !existing.delivered) {
           const confirmed = { ...resultRecord, delivered: true };
-          records.set(confirmed.id, confirmed);
+          setRecord(confirmed);
         }
       }
     }
     if (message.role !== "user") return;
     const text = textContent(message);
-    for (const record of records.values()) {
-      if (record.status !== "answered" || record.delivered || record.delivery !== "user" || record.continuation !== text) continue;
-      const confirmed = { ...record, delivered: true };
-      records.set(record.id, confirmed);
+    for (const id of [...(continuations.get(text) ?? [])]) {
+      const record = records.get(id)!;
+      setRecord({ ...record, delivered: true });
     }
   };
   // The durable native-input receipt is the authoritative observed-text anchor. A later
   // matching user-role chat entry corroborates visibility ONLY: it can be an extension echo.
   // No public causal ID proves raw authorship, original delivery, semantic relevance or intent.
-  const evidenceFor = (ctx: ExtensionContext, id: number, text: string, expected?: QuestionResolution["evidence"], beforeEntryId?: string) => {
-    const receipts: { id: string; receipt: QuestionInputReceipt }[] = [];
-    let scopeSeen = false;
-    let pending = false;
-    for (const entry of ctx.sessionManager.getBranch()) {
-      if (entry.id === beforeEntryId) break; // Both anchors must precede the resolution snapshot.
-      if (entry.type === "custom" && entry.customType === QUESTION_ENTRY_TYPE) {
-        const record = readRecord(entry.data);
-        if (record?.id === id) { scopeSeen = true; pending = record.status === "pending"; }
-      } else if (entry.type === "message" && entry.message.role === "assistant") {
-        if (!scopeSeen && parseProseQuestions(textContent(entry.message)).some(question => question.id === id)) { scopeSeen = true; pending = true; }
-      } else if (entry.type === "custom" && entry.customType === QUESTION_INPUT_ENTRY_TYPE) {
-        const receipt = entry.data as QuestionInputReceipt | undefined;
-        if (pending && receipt?.version === 1 && ["interactive", "rpc"].includes(receipt.source)
-          && receipt.text === text && Array.isArray(receipt.pendingIds) && receipt.pendingIds.includes(id)
-          && (!expected || (entry.id === expected.inputEntryId && receipt.source === expected.inputSource))) receipts.push({ id: entry.id, receipt });
-      } else if (entry.type === "message" && entry.message.role === "user" && textContent(entry.message) === text
-        && receipts.length && (!expected || entry.id === expected.chatEntryId)) {
-        const { id: inputEntryId, receipt } = receipts[0];
-        return { inputEntryId, inputSource: receipt.source, chatEntryId: entry.id, text };
-      }
-    }
-  };
-  const verifiedEvidence = (ctx: ExtensionContext, record: QuestionRecord, snapshotEntryId: string) => {
-    const evidence = record.resolution?.evidence;
-    return Boolean(evidence && evidenceFor(ctx, record.id, evidence.text, evidence, snapshotEntryId));
-  };
+  const evidenceFor = (ctx: ExtensionContext, id: number, text: string) => indexEvidence(ctx.sessionManager.getBranch(),
+    entry => entry.type === "custom" && entry.customType === QUESTION_ENTRY_TYPE ? readRecord(entry.data) : undefined)(id, text);
   const restore = (ctx: ExtensionContext) => {
     clearUI();
     currentContext = ctx;
-    if (sessionId !== ctx.sessionManager.getSessionId()) transcriptInvalidators.clear();
     sessionId = ctx.sessionManager.getSessionId();
     records = new Map();
+    toolRecords.clear();
+    continuations.clear();
+    cachedAttention = [];
+    attentionVersion = -1;
     nextId = 1;
     const branch = ctx.sessionManager.getBranch();
+    const snapshots = new Map<SessionEntry, QuestionRecord | undefined>();
+    const recordFor = (entry: SessionEntry) => {
+      if (!snapshots.has(entry)) snapshots.set(entry, entry.type === "custom" && entry.customType === QUESTION_ENTRY_TYPE ? readRecord(entry.data) : undefined);
+      return snapshots.get(entry);
+    };
+    const evidenceForSnapshot = indexEvidence(branch, recordFor);
     const manualDismissed = new Map<number, QuestionRecord>();
     // Allocation and explicit USER dismissal consult the full session. Agent decisions that
     // a question is obsolete are branch-local: another branch may still need that answer.
     for (const entry of ctx.sessionManager.getEntries()) {
       if (entry.type === "custom" && entry.customType === QUESTION_ENTRY_TYPE) {
-        const record = readRecord(entry.data);
+        const record = recordFor(entry);
         if (record) {
           reserve(record.id);
           if (record.status === "dismissed" && !record.resolution) manualDismissed.set(record.id, record);
@@ -434,12 +555,13 @@ export function registerQuestions(pi: ExtensionAPI, enabled: boolean): void {
     }
     for (const entry of branch) {
       if (entry.type === "custom" && entry.customType === QUESTION_ENTRY_TYPE) {
-        const record = readRecord(entry.data);
+        const record = recordFor(entry);
         // Agent-recorded answers can never enter resend/retry recovery. delivered=true means
         // handled/no-resend here, NOT confirmation that the original input caused a chat turn.
         // Validate the exact receipt/chat IDs and their chronology, never the latest text match.
-        if (record?.resolution?.evidence && !verifiedEvidence(ctx, record, entry.id)) continue;
-        if (record) records.set(record.id, record.status === "answered" ? { ...record, delivered: Boolean(record.resolution?.evidence) } : record);
+        const evidence = record?.resolution?.evidence;
+        if (evidence && !evidenceForSnapshot(record.id, evidence.text, evidence, entry.id)) continue;
+        if (record) setRecord(record.status === "answered" ? { ...record, delivered: Boolean(evidence) } : record);
       } else if (entry.type === "message") {
         if (entry.message.role === "assistant") captureProse(textContent(entry.message), false);
         confirmMessage(entry.message);
@@ -452,7 +574,7 @@ export function registerQuestions(pi: ExtensionAPI, enabled: boolean): void {
       const record = records.get(id);
       // A manual user dismissal on another branch suppresses pending UI, not an explicit
       // saved answer already given here. Agent dismissals are restored only from this branch.
-      if (record?.status === "pending" && record.question === dismissal.question) records.set(id, dismissal);
+      if (record?.status === "pending" && record.question === dismissal.question) setRecord(dismissal);
     }
     refresh();
   };
@@ -506,7 +628,11 @@ export function registerQuestions(pi: ExtensionAPI, enabled: boolean): void {
 
   pi.on("session_start", (_event, ctx) => restore(ctx));
   pi.on("session_tree", (_event, ctx) => restore(ctx));
-  pi.on("session_shutdown", () => { clearUI(); records.clear(); transcriptInvalidators.clear(); sessionId = undefined; });
+  // Compaction rebuilds native transcript components; callbacks belong to that old tree.
+  pi.on("session_compact", retireTranscript);
+  pi.on("session_shutdown", () => {
+    clearUI(); records.clear(); toolRecords.clear(); continuations.clear(); cachedAttention = []; attentionVersion = -1; sessionId = undefined;
+  });
   pi.on("message_end", (event, ctx) => {
     ensureContext(ctx);
     if (event.message.role === "assistant") captureProse(textContent(event.message), true);
@@ -585,7 +711,7 @@ export function registerQuestions(pi: ExtensionAPI, enabled: boolean): void {
       }
       const previous = params.question_id === undefined ? undefined : records.get(params.question_id);
       if (params.question_id !== undefined && (!previous || previous.status !== "pending" || previous.question !== question
-        || (previous.source !== "prose" && JSON.stringify(previous.options) !== JSON.stringify(options)))) {
+        || (previous.source !== "prose" && optionsKey(previous.options) !== optionsKey(options)))) {
         return resultFor(previous, "error", `Q${params.question_id} cannot be reassigned: it must be an existing unanswered question with unchanged wording/options. No new ID was allocated and no approval was given.`);
       }
       if (previous && active?.id === previous.id) {
@@ -612,17 +738,24 @@ export function registerQuestions(pi: ExtensionAPI, enabled: boolean): void {
       return resultFor(record, "pending");
     },
     renderCall(_args, theme, context) {
-      const record = [...records.values()].find(question => question.toolCallId === context.toolCallId);
+      const record = toolRecords.get(context.toolCallId);
       const renderedSession = sessionId;
       return new QuestionTranscript(() => ({ text: questionStyle(theme, `Ask user${record ? ` · Q${record.id}` : ""}`, "questionText", "question") }),
-        line => questionPaint(theme, line, "question"), "top", () => openCard(record, renderedSession));
+        line => questionPaint(theme, line, "question"), theme, () => record, "top", () => openCard(record, renderedSession));
     },
     renderResult(result, _options, theme, context) {
       const details = result.details as QuestionDetails | undefined;
       const snapshot = readRecord(details?.question);
       const associated = snapshot?.toolCallId !== undefined && snapshot.toolCallId === context?.toolCallId;
       const renderedSession = sessionId;
-      if (context?.invalidate) transcriptInvalidators.set(context.toolCallId, context.invalidate);
+      if (context?.invalidate) {
+        transcriptInvalidators.set(context.toolCallId, context.invalidate);
+        if (snapshot) {
+          let calls = questionCalls.get(snapshot.id);
+          if (!calls) { calls = new Set(); questionCalls.set(snapshot.id, calls); }
+          calls.add(context.toolCallId);
+        }
+      }
       const current = () => liveQuestion(snapshot, renderedSession) ?? snapshot;
       const labelFor = (record: QuestionRecord | undefined) => {
         const status = details?.status === "error" ? "error" : record?.status ?? details?.status;
@@ -648,7 +781,7 @@ export function registerQuestions(pi: ExtensionAPI, enabled: boolean): void {
           ].join("\n"),
           bufferAfterText: record ? [...heading, body[0]].join("\n") : undefined,
         };
-      }, (line, separator) => questionPaint(theme, line, separator ? "questionSeparator" : "question"), "both",
+      }, (line, separator) => questionPaint(theme, line, separator ? "questionSeparator" : "question"), theme, current, "both",
       () => associated && details?.status !== "error" && openCard(snapshot, renderedSession), width => {
         const live = associated ? liveQuestion(snapshot, renderedSession) : undefined;
         if (details?.status === "error" || live?.status !== "pending" || width <= 0) return;

@@ -129,6 +129,38 @@ describe("child session shutdown (#242)", () => {
     expect(pruneWorktrees).toHaveBeenCalled();
   });
 
+  it("clears the shutdown deadline when handlers finish before it", async () => {
+    vi.useFakeTimers();
+    manager = new AgentManager();
+    const session = boundSession();
+    await spawnCompleted(manager, session);
+    await manager.dispose();
+    expect(session.dispose).toHaveBeenCalledOnce();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("clears the deadline on rejected shutdown handlers too", async () => {
+    vi.useFakeTimers();
+    manager = new AgentManager();
+    const session = boundSession(async () => { throw new Error("shutdown failed"); });
+    await spawnCompleted(manager, session);
+    await manager.dispose();
+    expect(session.dispose).toHaveBeenCalledOnce();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("leaves no deadline after the timeout wins", async () => {
+    vi.useFakeTimers();
+    manager = new AgentManager();
+    const session = boundSession(() => new Promise<void>(() => {}));
+    await spawnCompleted(manager, session);
+    const disposed = manager.dispose();
+    await vi.advanceTimersByTimeAsync(5000);
+    await disposed;
+    expect(session.dispose).toHaveBeenCalledOnce();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
   it("skips the emit when no extension handles session_shutdown", async () => {
     manager = new AgentManager();
     const session = boundSession();

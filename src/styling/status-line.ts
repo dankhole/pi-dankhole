@@ -71,7 +71,10 @@ export function registerStatusLine(pi: ExtensionAPI, enabled: boolean, keepAwake
       const repaint = () => { if (!disposed) tui.requestRender(); };
       refresh = repaint;
       const unsubscribe = footerData.onBranchChange(repaint);
-      let cached: { session: string; leaf: string | null; totals: ReturnType<typeof sessionTotals> } | undefined;
+      let cached: { manager: ExtensionContext["sessionManager"]; session: string; leaf: string | null; totals: ReturnType<typeof sessionTotals> } | undefined;
+      let cachedDestination: {
+        manager: ExtensionContext["sessionManager"]; session: string; leaf: string | null; destination?: string;
+      } | undefined;
       let cachedCompaction: {
         key: string; provider: string | undefined; modelId: string | undefined;
         settings: CompactionState | undefined;
@@ -122,8 +125,8 @@ export function registerStatusLine(pi: ExtensionAPI, enabled: boolean, keepAwake
         // Public session entries are append-only; every append moves the leaf.
         const session = manager.getSessionId();
         const leaf = manager.getLeafId();
-        if (!cached || cached.session !== session || cached.leaf !== leaf) {
-          cached = { session, leaf, totals: sessionTotals(manager.getEntries()) };
+        if (!cached || cached.manager !== manager || cached.session !== session || cached.leaf !== leaf) {
+          cached = { manager, session, leaf, totals: sessionTotals(manager.getEntries()) };
         }
         // getContextUsage rebuilds Pi's session projection. Cache even unknown/absent
         // results, but recheck after history/model changes or an in-place limit update.
@@ -167,15 +170,20 @@ export function registerStatusLine(pi: ExtensionAPI, enabled: boolean, keepAwake
         if (totals.cost || sub) add(paint(theme, "cost", `${sub ? "~" : ""}$${totals.cost.toFixed(0)}`), 60);
         // Virtual selections name the router; successful branch responses name the destination.
         if (current.model?.api === "pi-virtual") {
-          const branchEntries = manager.getBranch();
-          for (let i = branchEntries.length - 1; i >= 0; i--) {
-            const entry = branchEntries[i];
-            if (entry.type === "message" && entry.message.role === "assistant"
-              && entry.message.stopReason !== "error" && entry.message.stopReason !== "aborted") {
-              const message = entry.message;
-              add(fg("dim", `${plain ? "->" : "→"} ${clean(`${message.provider}/${message.model}`)}`), 10, true);
-              break;
+          if (!cachedDestination || cachedDestination.manager !== manager || cachedDestination.session !== session || cachedDestination.leaf !== leaf) {
+            cachedDestination = { manager, session, leaf };
+            const branchEntries = manager.getBranch();
+            for (let i = branchEntries.length - 1; i >= 0; i--) {
+              const entry = branchEntries[i];
+              if (entry.type === "message" && entry.message.role === "assistant"
+                && entry.message.stopReason !== "error" && entry.message.stopReason !== "aborted") {
+                cachedDestination.destination = `${entry.message.provider}/${entry.message.model}`;
+                break;
+              }
             }
+          }
+          if (cachedDestination.destination !== undefined) {
+            add(fg("dim", `${plain ? "->" : "→"} ${clean(cachedDestination.destination)}`), 10, true);
           }
         }
         const statuses = footerData.getExtensionStatuses();
@@ -208,7 +216,7 @@ export function registerStatusLine(pi: ExtensionAPI, enabled: boolean, keepAwake
       };
       return {
         dispose,
-        invalidate() { cached = undefined; cachedContext = undefined; cachedCompaction = undefined; },
+        invalidate() { cached = undefined; cachedContext = undefined; cachedCompaction = undefined; cachedDestination = undefined; },
         render(width) {
           // The public footer still supplies branch/status data. Only paint a
           // separate row if our editor cannot own the input's top border.

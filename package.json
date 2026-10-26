@@ -24,7 +24,8 @@
     "test:interface": "node --test tests/interface/*.test.mjs",
     "build": "tsc",
     "migration:status": "node scripts/migration-status.mjs",
-    "bench:workers": "vitest bench tests/workers/perf/spawn.bench.ts"
+    "bench:workers": "vitest bench tests/workers/perf/spawn.bench.ts",
+    "bench:interface": "node scripts/bench-interface.mjs"
   },
   "peerDependencies": {
     "@earendil-works/pi-ai": "*",

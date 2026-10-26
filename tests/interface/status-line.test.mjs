@@ -170,6 +170,36 @@ test("unchanged frames cache context projection and totals without freezing live
   await emit(extension, "session_shutdown", f.ctx);
 });
 
+test("virtual destinations cache branch reads including absent responses and follow manager replacement", async () => {
+  const { extension } = await load();
+  const f = fixture();
+  f.ctx.model.api = "pi-virtual";
+  let scans = 0;
+  f.ctx.sessionManager.getBranch = () => { scans++; return f.data.entries; };
+  await emit(extension, "session_start", f.ctx);
+  for (let i = 0; i < 100; i++) text(f, i % 2 ? 100 : 240);
+  assert.equal(scans, 1, "absent destinations are cached too");
+  f.data.entries = [assistant(usage(), { provider: "routed", model: "destination" }),
+    assistant(usage(), { model: "failed", stopReason: "error" })];
+  f.data.leaf = "response";
+  assert.match(text(f), /routed\/destination/);
+  for (let i = 0; i < 100; i++) text(f);
+  assert.equal(scans, 2);
+  f.statuses.set("live", "changed status");
+  assert.match(text(f), /changed status/);
+  assert.equal(scans, 2);
+  f.data.session = "replacement-session";
+  text(f);
+  assert.equal(scans, 3);
+  f.ctx.sessionManager = { ...f.ctx.sessionManager, getBranch() { scans++; return []; } };
+  assert.doesNotMatch(text(f), /routed\/destination/);
+  assert.equal(scans, 4, "manager identity matters even with equal session and leaf IDs");
+  f.component.invalidate();
+  text(f);
+  assert.equal(scans, 5);
+  await emit(extension, "session_shutdown", f.ctx);
+});
+
 test("context cache invalidates on public session, leaf, model, limit and component changes", async t => {
   intervals(t);
   const { extension } = await load();

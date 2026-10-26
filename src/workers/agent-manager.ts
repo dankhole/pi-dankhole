@@ -245,10 +245,18 @@ async function shutdownChildSession(session: AgentSession | undefined): Promise<
       // Raced, not awaited outright. `emit` runs every handler serially with no timeout of
       // its own, and dispose() is reached from pi's own `session_shutdown` with the TUI
       // already torn down — one hung handler would leave a dead terminal.
-      await Promise.race([
-        runner.emit({ type: "session_shutdown", reason: "quit" }),
-        new Promise<void>(resolve => setTimeout(resolve, CHILD_SHUTDOWN_TIMEOUT_MS).unref()),
-      ]);
+      let timeout: ReturnType<typeof setTimeout> | undefined;
+      try {
+        await Promise.race([
+          runner.emit({ type: "session_shutdown", reason: "quit" }),
+          new Promise<void>(resolve => {
+            timeout = setTimeout(resolve, CHILD_SHUTDOWN_TIMEOUT_MS);
+            timeout.unref();
+          }),
+        ]);
+      } finally {
+        if (timeout !== undefined) clearTimeout(timeout);
+      }
     }
   } catch { /* a partial session must degrade, not take the teardown down with it */ }
   // Always, even on timeout: disposal is what this function ultimately exists to do.

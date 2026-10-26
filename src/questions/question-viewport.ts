@@ -1,5 +1,5 @@
 import { type Component, getOsc8LinkAtColumn, stripTerminalSequences, type TUI } from "@earendil-works/pi-tui";
-import { getChildLineOffsets } from "../styling/grouping.ts";
+import { withTranscriptMeasurement } from "../styling/transcript-measurement.ts";
 
 /** Only question renderers owned by this registration can supply these identities. */
 export const QUESTION_CONTENT = Symbol("question-content");
@@ -135,72 +135,69 @@ export function questionListVisibility(tui: TUI, pending: readonly PendingIdenti
       || entry.shrink !== 0 || entry.minSize !== 0 || entry.maxSize !== 1 || typeof entry.visible !== "function")) return fallback();
     measuring = true;
     try {
-      let reserved = Math.max(1, dock.component.render(columns).length);
-      for (const entry of extras) if (entry.visible!({ width: columns, height })) reserved += entry.component.render(columns).length;
-      const viewport = Math.min(height, Math.max(1, height - reserved));
-      const contentWidth = transcript.getContentWidth(columns);
-      const measured = new Map<Component, string[]>();
-      const render = (component: Component) => {
-        let lines = measured.get(component);
-        if (!lines) { lines = component.render(contentWidth); measured.set(component, lines); }
-        return lines;
-      };
-      const lines = render(document);
-      const maxTop = Math.max(0, lines.length - viewport);
-      const top = transcript.isFollowingEnd ? maxTop : Math.max(0, Math.min(transcript.scrollTop, maxTop));
-      const visible = new Set<object>();
-      const pendingIdentities = new Set<object>(pending);
-      const visit = (component: QuestionContent, start: number) => {
-        const content = component[QUESTION_CONTENT]?.(contentWidth);
-        if (content && pendingIdentities.has(content.identity)
-          && content.rows.some(row => start + row >= top && start + row < top + viewport)) visible.add(content.identity);
-        const child = (component as Component & { child?: Component }).child;
-        const children = tree(component) ? component.children : component.constructor.name === "MouseRegion" && child ? [child] : [];
-        if (!children.length || children.reduce((sum, item) => sum + render(item).length, 0) !== render(component).length) return;
-        let offset = start;
-        for (const item of children) { visit(item, offset); offset += render(item).length; }
-      };
-      const chat = document.children[2] as Tree;
-      const preceding = document.children.slice(0, 2).reduce((sum, child) => sum + render(child).length, 0);
-      // Refresh the grouped projection once, then share offsets and measurements across
-      // every pending question. Historical resolved cards need no metadata traversal.
-      const offsets = getChildLineOffsets(chat, contentWidth, component => render(component).length);
-      if (!offsets) return fallback();
-      const pendingCalls = new Set(pending.flatMap(identity => identity.toolCallId ? [identity.toolCallId] : []));
-      for (const [child, offset] of offsets) {
-        const tool = child as Component & { toolName?: string; toolCallId?: string };
-        if (tool.toolName === "ask_user" && tool.toolCallId && pendingCalls.has(tool.toolCallId)) visit(child, preceding + offset);
-      }
-      const sources = new Map((proseSources?.() ?? []).map(source => [source.message, source]));
-      const candidates = new Map<object, Component[]>();
-      for (const child of chat.children) {
-        const message = (child as Component & { lastMessage?: object }).lastMessage;
-        if (child.constructor.name !== "AssistantMessageComponent" || !message || !sources.has(message)) continue;
-        const matches = candidates.get(message) ?? [];
-        matches.push(child); candidates.set(message, matches);
-      }
-      const retained = new Set<Component>();
-      for (const [message, source] of sources) {
-        const matches = candidates.get(message);
-        if (matches?.length !== 1) continue;
-        const child = matches[0];
-        const offset = offsets.get(child);
-        if (offset === undefined) continue;
-        const rows = render(child);
-        const targets = new Map<number, ProseQuestion>();
-        const ambiguous = new Set<number>();
-        for (const question of source.questions) for (const row of proseRows(rows, question.id, question.question) ?? []) {
-          if (targets.has(row)) ambiguous.add(row);
-          else targets.set(row, question);
+      return withTranscriptMeasurement(tui, measurement => {
+        let reserved = Math.max(1, dock.component.render(columns).length);
+        for (const entry of extras) if (entry.visible!({ width: columns, height })) reserved += entry.component.render(columns).length;
+        const viewport = Math.min(height, Math.max(1, height - reserved));
+        const contentWidth = transcript.getContentWidth(columns);
+        const render = (component: Component) => measurement.render(component, contentWidth);
+        const lines = render(document);
+        const maxTop = Math.max(0, lines.length - viewport);
+        const top = transcript.isFollowingEnd ? maxTop : Math.max(0, Math.min(transcript.scrollTop, maxTop));
+        const visible = new Set<object>();
+        const pendingIdentities = new Set<object>(pending);
+        const visit = (component: QuestionContent, start: number) => {
+          const content = component[QUESTION_CONTENT]?.(contentWidth);
+          if (content && pendingIdentities.has(content.identity)
+            && content.rows.some(row => start + row >= top && start + row < top + viewport)) visible.add(content.identity);
+          const offsets = measurement.offsets(component, contentWidth);
+          // Unknown renderers may reorder/replace same-height rows. Native-looking
+          // children and matching heights cannot prove their displayed coordinates.
+          if (offsets) for (const [child, offset] of offsets) visit(child, start + offset);
+        };
+        const chat = document.children[2] as Tree;
+        const preceding = measurement.offsets(document, contentWidth)?.get(chat);
+        if (preceding === undefined) return fallback();
+        // Refresh the grouped projection once, then share offsets and measurements across
+        // every pending question. Historical resolved cards need no metadata traversal.
+        const offsets = measurement.offsets(chat, contentWidth);
+        if (!offsets) return fallback();
+        const pendingCalls = new Set(pending.flatMap(identity => identity.toolCallId ? [identity.toolCallId] : []));
+        for (const [child, offset] of offsets) {
+          const tool = child as Component & { toolName?: string; toolCallId?: string };
+          if (tool.toolName === "ask_user" && tool.toolCallId && pendingCalls.has(tool.toolCallId)) visit(child, preceding + offset);
         }
-        for (const row of ambiguous) targets.delete(row);
-        if (!bindProse(child, source, rows, contentWidth, targets)) continue;
-        retained.add(child);
-        // Visibility can suppress the only reminder only after native click routing exists.
-        for (const [row, question] of targets) if (preceding + offset + row >= top && preceding + offset + row < top + viewport) visible.add(question.identity);
-      }
-      for (const child of bindings.keys()) if (!retained.has(child)) removeBinding(child);
-      return pending.some(identity => !visible.has(identity));
+        const sources = new Map((proseSources?.() ?? []).map(source => [source.message, source]));
+        const candidates = new Map<object, Component[]>();
+        for (const child of chat.children) {
+          const message = (child as Component & { lastMessage?: object }).lastMessage;
+          if (child.constructor.name !== "AssistantMessageComponent" || !message || !sources.has(message)) continue;
+          const matches = candidates.get(message) ?? [];
+          matches.push(child); candidates.set(message, matches);
+        }
+        const retained = new Set<Component>();
+        for (const [message, source] of sources) {
+          const matches = candidates.get(message);
+          if (matches?.length !== 1) continue;
+          const child = matches[0];
+          const offset = offsets.get(child);
+          if (offset === undefined) continue;
+          const rows = render(child);
+          const targets = new Map<number, ProseQuestion>();
+          const ambiguous = new Set<number>();
+          for (const question of source.questions) for (const row of proseRows(rows, question.id, question.question) ?? []) {
+            if (targets.has(row)) ambiguous.add(row);
+            else targets.set(row, question);
+          }
+          for (const row of ambiguous) targets.delete(row);
+          if (!bindProse(child, source, rows, contentWidth, targets)) continue;
+          retained.add(child);
+          // Visibility can suppress the only reminder only after native click routing exists.
+          for (const [row, question] of targets) if (preceding + offset + row >= top && preceding + offset + row < top + viewport) visible.add(question.identity);
+        }
+        for (const child of bindings.keys()) if (!retained.has(child)) removeBinding(child);
+        return pending.some(identity => !visible.has(identity));
+      });
     } catch {
       return fallback(); // Unknown renderer/layout contracts must not hide pending questions.
     } finally {

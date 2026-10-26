@@ -5,7 +5,7 @@
  * Subscribes to session events for real-time streaming updates.
  */
 
-import { type AgentSession, getMarkdownTheme } from "@earendil-works/pi-coding-agent";
+import { type AgentSession, getMarkdownTheme, type Theme as PiTheme } from "@earendil-works/pi-coding-agent";
 import { type Component, type Focusable, Input, Markdown, type MarkdownOptions, type MarkdownTheme, matchesKey, type OverlayOptions, ScrollView, type ScrollViewScrollbar, stripTerminalSequences, type TUI, type TuiMouseEvent, type TuiMouseEventResult, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import { renderAgentName } from "../agent-color.js";
 import { extractText } from "../context.js";
@@ -32,11 +32,9 @@ export function getConversationOverlayOptions(tui: Pick<TUI, "mode">): OverlayOp
 /**
  * Cap on a single tool result or bash output before the viewer elides the rest.
  *
- * The cap is not cosmetic — it bounds render cost. `buildContentLines()` runs on
- * every render *and* on every scroll key (`handleInput` calls it to compute
- * `maxScroll`), so an uncapped 200 KB result costs ~6 ms per keystroke to parse
- * as Markdown, against ~0.5 ms once capped and effectively nothing on a cache
- * hit (best of 5, width 76). 16 KB is roughly a screenful at every terminal size
+ * The cap is not cosmetic — it bounds cold/changed-message render cost, even
+ * though unchanged blocks and scroll-only layout are cached. 16 KB is roughly
+ * a screenful at every terminal size
  * and still ~30x the 500 characters this replaces, which was small enough to cut
  * most real results mid-sentence.
  */
@@ -151,6 +149,16 @@ function truncationNote(elided: number): string {
   return `... (truncated, ${humanCount(elided)} more character${elided === 1 ? "" : "s"})`;
 }
 
+type ViewerMessage = AgentSession["messages"][number];
+
+interface MessageBlock {
+  /** Primitive render inputs, never references to mutable content blocks. */
+  state: readonly string[];
+  width: number;
+  mode: ViewerMarkdownMode;
+  lines: string[];
+}
+
 export class ConversationViewer implements Component, Focusable {
   private scrollOffset = 0;
   private autoScroll = true;
@@ -170,8 +178,19 @@ export class ConversationViewer implements Component, Focusable {
   private keys: ViewerKeys;
   /** Steering composer — present while the user is typing a message to the agent. */
   private composer: Input | undefined;
-  /** Resolved once: pi's Markdown theme is fixed for the life of the process. */
-  private readonly markdownTheme: MarkdownTheme;
+  private markdownTheme: MarkdownTheme;
+  private appearanceKey: string | undefined;
+  private resolvedColors: PiTheme["colors"] | undefined;
+  /** One layout variant per message; weak keys do not retain compacted history. */
+  private blockCache = new WeakMap<ViewerMessage, MessageBlock>();
+  /** Only the current history is strongly retained, with prefix line offsets. */
+  private layoutBlocks: MessageBlock[] = [];
+  private layoutEnds: number[] = [];
+  private contentLines: string[] = [];
+  private historyLength = 0;
+  private activityLine: string | undefined;
+  private layoutWidth = 0;
+  private layoutMode: ViewerMarkdownMode | undefined;
   /** Set by the `m` key. Wins over the setting so `m` works without a persist hook. */
   private markdownModeOverride: ViewerMarkdownMode | undefined;
   /**
@@ -180,7 +199,7 @@ export class ConversationViewer implements Component, Focusable {
    * keystroke — the component caches, but only across calls to the same object.
    * Weak so a compacted-away message doesn't pin its render.
    */
-  private readonly markdownCache = new WeakMap<object, { md: Markdown; text: string; failed?: boolean }>();
+  private markdownCache = new WeakMap<object, { md: Markdown; text: string; dim: boolean; failed?: boolean }>();
 
   constructor(
     private tui: TUI,
@@ -226,10 +245,16 @@ export class ConversationViewer implements Component, Focusable {
     this.keys = createViewerKeys(keybindings);
     this.scrollView = new ScrollView({
       render: width => this.buildContentLines(width),
-      invalidate: () => {},
+      invalidate: () => this.invalidate(),
     }, { follow: "end", scrollbar: this.fullscreen ? scrollbarMode : "hidden" });
     this.unsubscribe = session.subscribe(event => {
       if (this.closed) return;
+      if (event.type === "message_start" || event.type === "message_update" || event.type === "message_end") {
+        // Streaming may mutate the same message/content objects in place.
+        this.blockCache.delete(event.message);
+      } else if (event.type === "compaction_end") {
+        this.invalidate();
+      }
       if (this.fullscreen && !this.scrollView.isFollowingEnd && event.type === "message_start" && ["user", "assistant", "toolResult", "bashExecution"].includes(event.message.role)) {
         this.newMessages++;
       }
@@ -468,7 +493,7 @@ export class ConversationViewer implements Component, Focusable {
     if (invocationLine) lines.push(row(invocationLine));
     lines.push(hrMid);
 
-    // Content area — rebuild every render (live data, no cache needed)
+    // Stable history layout is reused; activity and chrome remain live.
     const contentLines = this.fullscreen ? this.scrollView.render(width - 1) : this.buildContentLines(innerW);
     const viewportHeight = this.viewportHeight();
     const maxScroll = Math.max(0, contentLines.length - viewportHeight);
@@ -593,7 +618,7 @@ export class ConversationViewer implements Component, Focusable {
   /** Render `text` as Markdown, reusing this message's component instance. */
   private markdownLines(msg: AgentSession["messages"][number], text: string, width: number, dim: boolean): string[] {
     let entry = this.markdownCache.get(msg);
-    if (!entry) {
+    if (!entry || entry.dim !== dim) {
       entry = {
         md: new Markdown(
           text,
@@ -608,6 +633,7 @@ export class ConversationViewer implements Component, Focusable {
           MARKDOWN_OPTIONS,
         ),
         text,
+        dim,
       };
       this.markdownCache.set(msg, entry);
     } else if (entry.text !== text) {
@@ -667,11 +693,26 @@ export class ConversationViewer implements Component, Focusable {
     this.tui.requestRender();
   }
 
-  invalidate(): void { /* no cached state to clear */ }
+  invalidate(): void {
+    // Recreate native Markdown too: its text/width cache embeds theme ANSI and
+    // otherwise survives a theme change (including changes behind Pi's Proxy).
+    this.markdownTheme = resolveMarkdownTheme(this.theme);
+    this.markdownCache = new WeakMap();
+    this.blockCache = new WeakMap();
+    this.layoutBlocks = [];
+    this.layoutEnds = [];
+    this.contentLines = [];
+    this.historyLength = 0;
+    this.activityLine = undefined;
+    this.layoutWidth = 0;
+    this.layoutMode = undefined;
+    this.composer?.invalidate();
+  }
 
   dispose(): void {
     this.closed = true;
     this.scrollView.setScrollbar("hidden"); // clears Pi's auto-hide timer
+    this.invalidate();
     if (this.unsubscribe) {
       this.unsubscribe();
       this.unsubscribe = undefined;
@@ -704,84 +745,158 @@ export class ConversationViewer implements Component, Focusable {
     return this.theme.fg("dim", `  ↳ ${parts.join(" · ")}`);
   }
 
-  private buildContentLines(width: number): string[] {
-    if (width <= 0) return [];
-
-    const th = this.theme;
-    const messages = this.session.messages;
-    const lines: string[] = [];
-
-    if (messages.length === 0) {
-      lines.push(th.fg("dim", "(waiting for first message...)"));
-      return lines;
+  /**
+   * Pi passes a stable global Proxy, not a new theme object on each switch.
+   * Public resolved colors also cover syntax-only changes; rendered probes catch
+   * ANSI/color-mode changes and minimal embedded themes without that metadata.
+   */
+  private refreshAppearance(): void {
+    const th = this.theme as Theme & Partial<Pick<PiTheme, "colors" | "appearance" | "getColorMode">>;
+    const md = resolveMarkdownTheme(th);
+    const key = [
+      th.appearance, th.getColorMode?.(),
+      th.fg("accent", "probe"), th.fg("dim", "probe"), th.fg("muted", "probe"), th.bold("probe"),
+      md.heading("probe"), md.link("probe"), md.linkUrl("probe"), md.code("probe"),
+      md.codeBlock("probe"), md.codeBlockBorder("probe"), md.quote("probe"), md.quoteBorder("probe"),
+      md.hr("probe"), md.listBullet("probe"), md.bold("probe"), md.italic("probe"),
+      md.underline("probe"), md.strikethrough("probe"),
+    ].join("\0");
+    const colors = th.colors;
+    if (this.appearanceKey !== key || this.resolvedColors !== colors) {
+      this.invalidate();
+      this.markdownTheme = md;
+      this.appearanceKey = key;
+      this.resolvedColors = colors;
     }
+  }
 
-    const mode = this.markdownMode();
-    let needsSeparator = false;
-    for (const msg of messages) {
-      if (msg.role === "user") {
-        const text = typeof msg.content === "string"
-          ? msg.content
-          : extractText(msg.content);
-        if (!text.trim()) continue;
-        if (needsSeparator) lines.push(th.fg("dim", "───"));
-        lines.push(th.fg("accent", "[User]"));
-        for (const line of wrapTextWithAnsi(text.trim(), width)) {
-          lines.push(line);
-        }
-      } else if (msg.role === "assistant") {
-        const textParts: string[] = [];
-        const toolCalls: string[] = [];
+  /** Snapshot only inputs actually displayed; no joins/trims of unchanged text. */
+  private messageState(msg: ViewerMessage): string[] {
+    const state: string[] = [msg.role];
+    if (msg.role === "bashExecution") {
+      state.push(msg.command, msg.output);
+    } else if (msg.role === "user" || msg.role === "assistant" || msg.role === "toolResult") {
+      if (typeof msg.content === "string") {
+        state.push(msg.content);
+      } else {
         for (const c of msg.content) {
-          if (c.type === "text" && c.text) textParts.push(c.text);
-          else if (c.type === "toolCall") {
-            toolCalls.push((c as any).name ?? (c as any).toolName ?? "unknown");
+          if (c.type === "text") state.push("text", c.text);
+          else if (msg.role === "assistant" && c.type === "toolCall") {
+            state.push("toolCall", c.name ?? (c as { toolName?: string }).toolName ?? "unknown");
           }
         }
-        if (needsSeparator) lines.push(th.fg("dim", "───"));
-        lines.push(th.bold("[Assistant]"));
-        if (textParts.length > 0) {
-          const text = textParts.join("\n").trim();
-          lines.push(...(mode === "off"
-            ? this.rawLines(text, width, false)
-            : this.markdownLines(msg, text, width, false)));
-        }
-        for (const name of toolCalls) {
-          lines.push(truncateToWidth(th.fg("muted", `  [Tool: ${name}]`), width));
-        }
-      } else if (msg.role === "toolResult") {
-        const { text, elided } = capResult(extractText(msg.content).trim());
-        if (!text) continue;
-        if (needsSeparator) lines.push(th.fg("dim", "───"));
-        lines.push(th.fg("dim", "[Result]"));
-        lines.push(...(mode === "all"
-          ? this.markdownLines(msg, text, width, true)
-          : this.rawLines(text, width, true)));
-        if (elided) lines.push(truncateToWidth(th.fg("dim", truncationNote(elided)), width));
-      } else if ((msg as any).role === "bashExecution") {
-        const bash = msg as any;
-        if (needsSeparator) lines.push(th.fg("dim", "───"));
-        lines.push(truncateToWidth(th.fg("muted", `  $ ${bash.command}`), width));
-        if (bash.output?.trim()) {
-          // Same cap as a tool result, never Markdown: command output is the one
-          // thing here that is definitionally not authored as Markdown.
-          const { text, elided } = capResult(bash.output.trim());
-          lines.push(...this.rawLines(text, width, true));
-          if (elided) lines.push(truncateToWidth(th.fg("dim", truncationNote(elided)), width));
-        }
-      } else {
-        continue;
       }
-      needsSeparator = true;
+    }
+    return state;
+  }
+
+  private buildMessageLines(msg: ViewerMessage, width: number, mode: ViewerMarkdownMode): string[] {
+    const th = this.theme;
+    const lines: string[] = [];
+    if (msg.role === "user") {
+      const text = typeof msg.content === "string" ? msg.content : extractText(msg.content);
+      if (!text.trim()) return lines;
+      lines.push(th.fg("accent", "[User]"));
+      for (const line of wrapTextWithAnsi(text.trim(), width)) lines.push(line);
+    } else if (msg.role === "assistant") {
+      const textParts: string[] = [];
+      const toolCalls: string[] = [];
+      for (const c of msg.content) {
+        if (c.type === "text" && c.text) textParts.push(c.text);
+        else if (c.type === "toolCall") {
+          toolCalls.push(c.name ?? (c as { toolName?: string }).toolName ?? "unknown");
+        }
+      }
+      lines.push(th.bold("[Assistant]"));
+      if (textParts.length > 0) {
+        const text = textParts.join("\n").trim();
+        const rendered = mode === "off"
+          ? this.rawLines(text, width, false)
+          : this.markdownLines(msg, text, width, false);
+        for (const line of rendered) lines.push(line);
+      }
+      for (const name of toolCalls) lines.push(truncateToWidth(th.fg("muted", `  [Tool: ${name}]`), width));
+    } else if (msg.role === "toolResult") {
+      const { text, elided } = capResult(extractText(msg.content).trim());
+      if (!text) return lines;
+      lines.push(th.fg("dim", "[Result]"));
+      const rendered = mode === "all"
+        ? this.markdownLines(msg, text, width, true)
+        : this.rawLines(text, width, true);
+      for (const line of rendered) lines.push(line);
+      if (elided) lines.push(truncateToWidth(th.fg("dim", truncationNote(elided)), width));
+    } else if (msg.role === "bashExecution") {
+      lines.push(truncateToWidth(th.fg("muted", `  $ ${msg.command}`), width));
+      if (msg.output?.trim()) {
+        const { text, elided } = capResult(msg.output.trim());
+        for (const line of this.rawLines(text, width, true)) lines.push(line);
+        if (elided) lines.push(truncateToWidth(th.fg("dim", truncationNote(elided)), width));
+      }
+    }
+    // Do not modify arrays returned by native Markdown.
+    return lines.map(line => truncateToWidth(line, width));
+  }
+
+  private buildContentLines(width: number): string[] {
+    if (width <= 0) return [];
+    this.refreshAppearance();
+    const messages = this.session.messages;
+    const mode = this.markdownMode();
+    const previousLength = this.layoutBlocks.length;
+    const dimensionsChanged = this.layoutWidth !== width || this.layoutMode !== mode;
+    let changedFrom = dimensionsChanged ? 0 : previousLength;
+    this.layoutWidth = width;
+    this.layoutMode = mode;
+
+    for (let i = 0; i < messages.length; i++) {
+      const msg = messages[i];
+      const state = this.messageState(msg);
+      let block = this.blockCache.get(msg);
+      const previousState = block?.state;
+      if (!block || block.width !== width || block.mode !== mode ||
+        previousState?.length !== state.length || state.some((value, index) => value !== previousState[index])) {
+        block = { state, width, mode, lines: this.buildMessageLines(msg, width, mode) };
+        this.blockCache.set(msg, block);
+      }
+      if (this.layoutBlocks[i] !== block) changedFrom = Math.min(changedFrom, i);
+      this.layoutBlocks[i] = block;
     }
 
-    // Streaming indicator for running agents
-    if (this.record.status === "running" && this.activity) {
-      const act = describeActivity(this.activity.activeTools, this.activity.responseText);
-      lines.push("");
-      lines.push(truncateToWidth(th.fg("accent", "▍ ") + th.fg("dim", act), width));
+    const historyChanged = dimensionsChanged || changedFrom < messages.length || previousLength !== messages.length;
+    if (historyChanged || this.contentLines.length === 0) {
+      changedFrom = Math.min(changedFrom, messages.length);
+      const prefixEnd = changedFrom > 0 ? this.layoutEnds[changedFrom - 1] : 0;
+      this.contentLines.length = prefixEnd;
+      for (let i = changedFrom; i < messages.length; i++) {
+        const block = this.layoutBlocks[i];
+        if (block.lines.length > 0) {
+          if (this.contentLines.length > 0) this.contentLines.push(truncateToWidth(this.theme.fg("dim", "───"), width));
+          // Avoid spread argument limits on uncapped assistant/user history.
+          for (const line of block.lines) this.contentLines.push(line);
+        }
+        this.layoutEnds[i] = this.contentLines.length;
+      }
+      this.historyLength = this.contentLines.length;
+      this.activityLine = undefined;
+      if (messages.length === 0) {
+        this.contentLines.push(truncateToWidth(this.theme.fg("dim", "(waiting for first message...)"), width));
+      }
     }
+    // Bound strong references to the current history, even after compaction or
+    // same-length branch replacement. Width/mode variants never accumulate.
+    this.layoutBlocks.length = messages.length;
+    this.layoutEnds.length = messages.length;
 
-    return lines.map(l => truncateToWidth(l, width));
+    // Activity can change without a message event; never cache it with history.
+    const activityLine = messages.length > 0 && this.record.status === "running" && this.activity
+      ? truncateToWidth(this.theme.fg("accent", "▍ ") + this.theme.fg("dim",
+        describeActivity(this.activity.activeTools, this.activity.responseText)), width)
+      : undefined;
+    if (activityLine !== this.activityLine) {
+      this.contentLines.length = this.historyLength;
+      if (activityLine !== undefined) this.contentLines.push("", activityLine);
+      this.activityLine = activityLine;
+    }
+    return this.contentLines;
   }
 }

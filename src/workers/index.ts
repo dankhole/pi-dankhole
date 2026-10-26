@@ -109,7 +109,8 @@ function createActivityTracker(maxTurns?: number, onStreamUpdate?: () => void) {
     },
     onTextDelta: (_delta: string, fullText: string) => {
       state.responseText = fullText;
-      onStreamUpdate?.();
+      // Text deltas update state immediately; foreground presentation samples
+      // it on the existing animation tick instead of rebuilding every delta.
     },
     onTurnEnd: (turnCount: number) => {
       state.turnCount = turnCount;
@@ -1233,13 +1234,17 @@ Terse command-style prompts produce shallow, generic work.
         // Live foreground resumes do not fire onStarted; reopened IDs do.
         if (existing.session) wireTranscript();
         try {
-          record = await manager.resume(params.resume, params.prompt, signal, {
+          const resuming = manager.resume(params.resume, params.prompt, signal, {
             maxTurns: params.max_turns ?? resumeMaxTurns,
             onTurnEnd: resumeCallbacks.onTurnEnd,
             onToolActivity: resumeCallbacks.onToolActivity,
             onAssistantUsage: resumeCallbacks.onAssistantUsage,
             onStarted: wireTranscript,
           });
+          // Live foreground resumes synchronously transition the record to
+          // running without onStarted. Mount/re-arm after that transition.
+          widget.update();
+          record = await resuming;
           if (record) record.description = resumeDescription;
         } finally {
           const rec = manager.getRecord(existing.id);
@@ -1409,8 +1414,9 @@ Terse command-style prompts produce shallow, generic work.
       // always when the limit is unset.
       let queuedAhead: number | undefined;
 
+      let presentationStopped = false;
       const streamUpdate = () => {
-        if (backgrounded) return;
+        if (backgrounded || presentationStopped || signal?.aborted) return;
         // Spend from the record, everything else from the live tracker. `fgId`
         // is set in onSessionCreated below, which fires before the first
         // assistant message — so nothing is spent while this reads zero.
@@ -1482,6 +1488,12 @@ Terse command-style prompts produce shallow, generic work.
         spinnerFrame++;
         streamUpdate();
       }, 80);
+      const stopPresentation = () => {
+        presentationStopped = true;
+        clearInterval(spinnerInterval);
+      };
+      signal?.addEventListener("abort", stopPresentation, { once: true });
+      if (signal?.aborted) stopPresentation();
 
       streamUpdate();
 
@@ -1524,6 +1536,7 @@ Terse command-style prompts produce shallow, generic work.
             // Completion names the call that handed this run to the background.
             if (fgRec) fgRec.toolCallId = toolCallId;
             backgrounded = true;
+            stopPresentation();
             wakeBackgrounded();
           });
         }), handedOff]);
@@ -1531,7 +1544,8 @@ Terse command-style prompts produce shallow, generic work.
         // Runs on both paths, so a startup throw — which now propagates, see
         // the background spawn above (#179) — no longer leaves the spinner
         // ticking or a finished agent on the widget.
-        clearInterval(spinnerInterval);
+        stopPresentation();
+        signal?.removeEventListener("abort", stopPresentation);
         if (handoffId !== undefined) foregroundHandoffs.delete(handoffId);
         // A handed-off run is still working: its row stays, and the
         // background settle in `onComplete` tears it down when it really ends.

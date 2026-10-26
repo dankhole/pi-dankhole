@@ -1,8 +1,8 @@
 import { stripVTControlCharacters } from "node:util";
 import { type ExtensionAPI, parseSkillBlock, type Theme } from "@earendil-works/pi-coding-agent";
 import { type Component, type TUI, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
-import { getChildLineOffset } from "./grouping.ts";
 import { userBackground } from "./palette.ts";
+import { isTranscriptRendererSupported, withTranscriptMeasurement } from "./transcript-measurement.ts";
 
 interface Tree extends Component { children: Component[] }
 interface Stack extends Tree {
@@ -107,22 +107,19 @@ export function installPinnedPrompt(tui: TUI, getTheme: () => Theme, fromHistory
     && scrollEntry.maxSize === undefined && scrollEntry.visible === undefined
     && dockEntry?.basis === "auto" && dockEntry.grow === 0 && dockEntry.shrink === 1 && dockEntry.minSize === 1
     && dockEntry.maxSize === undefined && dockEntry.visible === undefined;
-  const show = ({ width: columns, height }: { width: number; height: number }) => {
-    const latest = currentPrompt();
+  const show = ({ width: columns, height }: { width: number; height: number }) => withTranscriptMeasurement(tui, measurement => {
+    const latest = measurement.memo(identities, currentPrompt);
     shown = !disposed && !!latest.text;
-    if (!shown || !measurable() || !latest.identified || !latest.component || !Number.isFinite(transcript.scrollTop)
+    if (!shown || !measurable() || !latest.identified || !latest.component || !isTranscriptRendererSupported(latest.component) || !Number.isFinite(transcript.scrollTop)
       || typeof transcript.isFollowingEnd !== "boolean" || height >= Number.MAX_SAFE_INTEGER) return shown;
     width = columns;
     const contentWidth = transcript.getContentWidth(columns);
-    const lines = document.render(contentWidth);
-    const offset = getChildLineOffset(chat, latest.component, contentWidth);
-    if (offset === undefined) return shown;
-    let start = offset;
-    for (const child of document.children) {
-      if (child === chat) break;
-      start += child.render(contentWidth).length;
-    }
-    const rows = latest.component.render(contentWidth);
+    const lines = measurement.render(document, contentWidth);
+    const preceding = measurement.offsets(document, contentWidth)?.get(chat);
+    const offset = measurement.offsets(chat, contentWidth)?.get(latest.component);
+    if (preceding === undefined || offset === undefined) return shown;
+    const start = preceding + offset;
+    const rows = measurement.render(latest.component, contentWidth);
     // Blank padding and blank markdown lines are not visible message content.
     const contentRows = rows.flatMap((line, index) => clean(line) ? [start + index] : []);
     if (!contentRows.length) return shown;
@@ -131,33 +128,38 @@ export function installPinnedPrompt(tui: TUI, getTheme: () => Theme, fromHistory
     const top = transcript.isFollowingEnd ? maxTop : Math.min(Math.max(0, transcript.scrollTop), maxTop);
     shown = !contentRows.some(row => row >= top && row < top + viewport);
     return shown;
-  };
-  const jump = () => {
+  });
+  const jump = () => withTranscriptMeasurement(tui, measurement => {
     if (disposed) return;
-    const latest = currentPrompt();
+    const latest = measurement.memo(identities, currentPrompt);
     if (!latest?.component) {
       notify("The latest input is not in the displayed transcript (image-only input or removed by compaction).");
       return;
     }
+    if (!isTranscriptRendererSupported(latest.component)) {
+      notify("The latest input cannot be located in this transcript layout; native scrolling is unchanged.");
+      return;
+    }
     if (width <= 0) return;
     const contentWidth = transcript.getContentWidth(width);
-    const offset = getChildLineOffset(chat, latest.component, contentWidth);
-    if (offset === undefined) return;
-    let preceding = 0;
-    for (const child of document.children) {
-      if (child === chat) break;
-      preceding += child.render(contentWidth).length;
+    const lines = measurement.render(document, contentWidth);
+    const preceding = measurement.offsets(document, contentWidth)?.get(chat);
+    const offset = measurement.offsets(chat, contentWidth)?.get(latest.component);
+    if (preceding === undefined || offset === undefined) {
+      notify("The latest input cannot be located in this transcript layout; native scrolling is unchanged.");
+      return;
     }
     // Refresh bounds first: streaming, resize or a rebuilt transcript may have changed its height.
-    transcript.updateLayout(document.render(contentWidth).length, transcript.viewportHeight, () => tui.requestRender());
+    transcript.updateLayout(lines.length, transcript.viewportHeight, () => tui.requestRender());
     transcript.scrollTo(preceding + offset, { disableFollow: true });
     tui.requestRender();
-  };
+  });
   const bar: Component = {
     invalidate() {},
     render(columns) {
       width = columns;
-      const text = currentPrompt()?.text;
+      // Painting needs history text only, not another provenance/row association pass.
+      const text = fromHistory()?.text ?? latestInput(chat)?.text;
       if (disposed || !shown || !text || columns <= 0) return [];
       const body = truncateToWidth(` ↑ You: ${clean(text)}  · click to jump`, columns);
       const theme = getTheme();

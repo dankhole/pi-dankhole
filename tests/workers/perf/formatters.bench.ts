@@ -6,13 +6,14 @@
  * widget or fleet-list benchmark moves, this file answers "was it the render or
  * something underneath it?" without bisecting. `buildInvocationTags` in
  * particular is called once per running row when `showModel` is on, and
- * `getSessionContextPercent` reaches into the live session on every row
- * regardless.
+ * `getSessionContextPercent` reuses the public context reader's result while
+ * its canonical session/history/model state is unchanged.
  *
  * Absolute numbers here are nanoseconds and will look irrelevant next to a
  * frame. They are — until one of them stops being O(1).
  */
-import { bench, describe } from "vitest";
+import { SessionManager } from "@earendil-works/pi-coding-agent";
+import { bench, describe, expect } from "vitest";
 import {
   buildInvocationTags,
   describeActivity,
@@ -22,7 +23,7 @@ import {
   formatTurns,
 } from "../../../src/workers/ui/agent-widget.js";
 import { getLifetimeCost, getLifetimeTotal, getSessionContextPercent } from "../../../src/workers/usage.js";
-import { NOW, perfSession, perfTheme } from "../helpers/perf-fixtures.js";
+import { NOW, perfTheme } from "../helpers/perf-fixtures.js";
 
 const INVOCATION = {
   modelName: "sonnet 4.6",
@@ -40,7 +41,13 @@ const INVOCATION_DISCLOSED = {
 } as any;
 
 const USAGE = { input: 12_000, output: 3_000, cacheRead: 400, cacheWrite: 500 };
-const SESSION = perfSession();
+const SESSION = {
+  sessionManager: SessionManager.inMemory(),
+  messages: [],
+  getContextUsage: () => ({ tokens: 84_000, contextWindow: 200_000, percent: 42 }),
+};
+// Fail setup rather than silently benchmark the helper's exception/null path.
+expect(getSessionContextPercent(SESSION)).toBe(42);
 
 const ACTIVE_TOOLS = new Map([
   ["t1", "read"],

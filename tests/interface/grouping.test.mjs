@@ -15,7 +15,7 @@ const jiti = createJiti(import.meta.url, { alias: {
   "@earendil-works/pi-coding-agent": join(root, "dist/index.js"),
   "@earendil-works/pi-tui": requirePi.resolve("@earendil-works/pi-tui"),
 } });
-const { getChildLineOffset, installGrouping, registerGrouping } = await jiti.import(resolve(dirname(fileURLToPath(import.meta.url)), "../../src/styling/grouping.ts"));
+const { getChildLineOffset, getChildLineOffsets, installGrouping, registerGrouping } = await jiti.import(resolve(dirname(fileURLToPath(import.meta.url)), "../../src/styling/grouping.ts"));
 const { Container, ScrollView, Text, VStack, visibleWidth } = await import(pathToFileURL(requirePi.resolve("@earendil-works/pi-tui")).href);
 const { ToolExecutionComponent } = await fromPi("dist/modes/interactive/components/tool-execution.js");
 const { AssistantMessageComponent } = await fromPi("dist/modes/interactive/components/assistant-message.js");
@@ -319,6 +319,40 @@ test("child offsets follow collapsed/expanded projection, rebuilds, and native f
   assert.equal(getChildLineOffset(f.chat, target, 100), a.render(100).length);
   assert.equal(getChildLineOffset(f.chat, new Text("missing"), 100), undefined);
   assert.equal(getChildLineOffset({}, target, 100), undefined);
+});
+
+test("unchanged groups retain projection, summary widgets and native slots while live primitives stay fresh", () => {
+  const a = row("read", false);
+  const b = row("read");
+  const f = fixture([a, b]);
+  try {
+    const group = [...getChildLineOffsets(f.chat, 100).keys()][0];
+    const members = group.members;
+    const slots = group.slots;
+    const closedChildren = group.view.children;
+    const spacer = closedChildren[0];
+    const footer = closedChildren[1];
+    for (let index = 0; index < 100; index++) {
+      assert.equal([...getChildLineOffsets(f.chat, 100).keys()][0], group);
+      assert.equal(group.members, members);
+      assert.equal(group.slots, slots);
+      assert.equal(group.view.children, closedChildren);
+      assert.equal(group.view.children[1], footer);
+    }
+    assert.match(plain(f.chat).at(-1), /read ×2.*1 pending/);
+    a.updateResult(result("failed", { isError: true }));
+    b.toolName = "bash";
+    assert.match(plain(f.chat).at(-1), /read, bash.*1 failed/);
+    click(f.chat);
+    const openChildren = group.view.children;
+    for (let index = 0; index < 10; index++) f.chat.render(100);
+    assert.equal(group.view.children, openChildren);
+    assert.equal(openChildren.at(-2), spacer);
+    assert.equal(openChildren.at(-1), footer);
+    assert.equal(openChildren[0], a);
+    a.setExpanded(true);
+    assert.match(plain(f.chat).join("\n"), /failed/);
+  } finally { f.dispose(); }
 });
 
 test("registration guards modes and cleans both widget disposal and shutdown", async () => {
