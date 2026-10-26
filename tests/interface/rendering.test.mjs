@@ -488,7 +488,7 @@ test("new UI settings default on and persist independently", async () => {
     for (const [label, steps, key] of [
       ["Powerline input and status", 5, "powerlineStatus"],
       ["Interactive questions", 7, "questionUI"],
-      ["Plain-text code panels", 8, "textBlockPanels"],
+      ["Code block panels", 8, "textBlockPanels"],
       ["Conversation panels", 9, "assistantPanels"],
       ["Collapse finished thinking", 10, "collapseThinking"],
     ]) {

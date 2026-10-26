@@ -103,7 +103,7 @@ export function registerSettings(pi: ExtensionAPI, path: string) {
               description: "Show when this percentage or less remains. 0%: at the threshold; 100%: always.",
               values: [...new Set([0, 5, 10, 20, 30, 50, 100, settings.compactionNoticePercent])].sort((a, b) => a - b).map(value => `${value}%`) },
             { id: "questions", label: "Interactive questions", currentValue: settings.questionUI ? "on" : "off", values: ["on", "off"] },
-            { id: "text-panels", label: "Plain-text code panels", currentValue: settings.textBlockPanels ? "on" : "off", values: ["on", "off"] },
+            { id: "text-panels", label: "Code block panels", currentValue: settings.textBlockPanels ? "on" : "off", values: ["on", "off"] },
             { id: "assistant-panels", label: "Conversation panels", currentValue: settings.assistantPanels ? "on" : "off", values: ["on", "off"] },
             { id: "thinking", label: "Collapse finished thinking", currentValue: settings.collapseThinking ? "on" : "off", values: ["on", "off"] },
             { id: "errors", label: "Collapsed error preview", currentValue: settings.errorPreview ? "show" : "hide", values: ["hide", "show"] },
