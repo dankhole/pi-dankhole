@@ -720,8 +720,9 @@ test("every scrolled continuation row keeps its question ID at the smallest list
     for (let offset = 0; offset < expected.length; offset++) {
       const lines = widget.render(width);
       assert.equal(lines.length, 4, "tiny list reserves one scrollable content row and a hint within both spacers");
-      assert.equal(stripTerminalSequences(lines[0]), " ".repeat(width), "one filled top separator remains");
-      assert.equal(lines[3], lines[0], "matching bottom separator remains inside the same row budget");
+      assert.equal(stripTerminalSequences(lines[0]), " ".repeat(width), "one filled top buffer remains");
+      assert.equal(lines[3], lines[0], "matching bottom buffer remains inside the same row budget");
+      assert.ok(lines[0].includes(backgroundAnsi(parseColor(themes.theme.appearance === "light" ? "#fff0bf" : "#594515"), themes.theme.getColorMode())), "outer buffers use regular question amber even while scrolling");
       assert.ok(lines.every(line => visibleWidth(line) <= width));
       const row = expected[offset];
       visited.add(offset);
@@ -863,26 +864,33 @@ test("list is always expanded and headerless across refresh; only entries open o
   assert.equal(h.dialogs.length, 1, "new questions never open automatically");
 });
 
-test("Questions widget has matching amber outer buffers and inter-question gap, without residual empty padding", async () => {
+test("Questions widget has regular amber outer buffers and a darker inter-question gap, without residual empty padding", async () => {
   const h = await harness();
   assert.equal(h.widgets.has(statusKey), false);
   for (const question of ["First?", "Second?"]) await h.ask({ question });
-  const widget = h.widgetComponent();
-  const lines = widget.render(80);
-  assert.equal(lines.length, 5, "one top and one bottom spacer surround separated entries, without a heading");
-  assert.doesNotMatch(lines.map(stripTerminalSequences).join("\n"), /Questions ·|\d+ pending/);
-  for (const y of [0, 2, 4]) {
-    assert.equal(stripTerminalSequences(lines[y]), " ".repeat(80), "outer buffers and inter-question gap have full-width amber fill");
-    assert.ok(lines[y].includes(backgroundAnsi(parseColor(themes.theme.appearance === "light" ? "#e6d58c" : "#3d351b"), themes.theme.getColorMode())));
-    assert.equal(lines[y], lines[2], "all three spacers use the same darker amber");
-    assert.equal(widget.handleMouse({ type: "click", button: "left", x: 3, y }), undefined, "padding and separator are not click targets");
+  for (const appearance of ["dark", "light"]) for (const mode of ["truecolor", "256color"]) {
+    const theme = themes.loadThemeFromPath(join(root, `dist/modes/interactive/theme/${appearance}.json`), mode);
+    const widget = h.widgets.get(statusKey).factory({ terminal: { rows: 24 }, requestRender() {} }, theme);
+    const lines = widget.render(80);
+    const background = line => line.match(/\x1b\[48;[^m]+m/)?.[0];
+    const bufferBg = backgroundAnsi(parseColor(appearance === "dark" ? "#594515" : "#fff0bf"), mode);
+    const separatorBg = backgroundAnsi(parseColor(appearance === "dark" ? "#3d351b" : "#e6d58c"), mode);
+    assert.equal(lines.length, 5, "one top and one bottom spacer surround separated entries, without a heading");
+    assert.doesNotMatch(lines.map(stripTerminalSequences).join("\n"), /Questions ·|\d+ pending/);
+    for (const y of [0, 2, 4]) {
+      assert.equal(stripTerminalSequences(lines[y]), " ".repeat(80), "outer buffers and inter-question gap have full-width amber fill");
+      assert.equal(background(lines[y]), y === 2 ? separatorBg : bufferBg, `${appearance}/${mode}: only the inter-question separator is darker`);
+      assert.equal(widget.handleMouse({ type: "click", button: "left", x: 3, y }), undefined, "padding and separator are not click targets");
+    }
+    assert.match(stripTerminalSequences(lines[1]), /Q1: First/);
+    assert.match(stripTerminalSequences(lines[3]), /Q2: Second/);
+    assert.equal(background(lines[1]), bufferBg, "outer buffers match the ordinary question-row fill");
+    assert.equal(background(lines[3]), bufferBg, "question rows share the same amber fill");
+    assert.equal(lines.at(-1), lines[0]);
+    widget.dispose();
   }
-  assert.match(stripTerminalSequences(lines[1]), /Q1: First/);
-  assert.match(stripTerminalSequences(lines[3]), /Q2: Second/);
-  const background = line => line.match(/\x1b\[48;[^m]+m/)?.[0];
-  assert.ok(background(lines[1]), "question row has an explicit background");
-  assert.equal(background(lines[3]), background(lines[1]), "question rows share the same amber fill");
-  assert.equal(lines.at(-1), lines[0]);
+  const widget = h.widgetComponent();
+  widget.render(80);
   for (const [x, y] of [[3, 5], [80, 3], [-1, 3], [3, -1]]) {
     assert.equal(widget.handleMouse({ type: "click", button: "left", x, y }), undefined, "out-of-bounds positions are inert");
   }
@@ -1317,7 +1325,7 @@ test("native tool renderers remain readable at all expansion states and widths w
       assert.match(text, /Recommended/);
       assert.match(text, /Safe option/);
       assert.match(text, /Preserves current data/);
-      assert.match(text, /Q1/);
+      assert.equal((text.match(/\bQ1\b/g) ?? []).length, 1, "pending native card identifies the question only in its body");
       assert.doesNotMatch(text, /Pending|click to answer/);
       assert.doesNotMatch(text, /\/q/);
     }
@@ -1397,7 +1405,7 @@ test("question transcript uses amber buffers and darker amber separators without
       assert.notEqual(stripTerminalSequences(call.at(-1)).trim(), "", "title has no extra bottom buffer");
       if (width === 80) {
         assert.equal(call.filter(line => line === buffer).length, 1, "exactly one title buffer when spaces do not wrap onto their own rows");
-        assert.match(stripTerminalSequences(call[1]), /Ask user · Q1/);
+        assert.equal(stripTerminalSequences(call[1]).trim(), "Ask user", "title omits the redundant question ID");
       }
     }
   }
@@ -1470,10 +1478,12 @@ test("native transcript keeps one question/choice copy and live Answered/Dismiss
     assert.match(text, /No remote changes/);
   };
   check(frame());
+  assert.equal((frame().match(/\bQ1\b/g) ?? []).length, 1, "pending native full card shows Q1 only in the question body");
   assert.doesNotMatch(frame(), /Q1 · Pending|click to answer/);
   const painted = component.render(100);
   const header = painted.find(line => stripTerminalSequences(line).includes("Ask user"));
   const body = painted.find(line => stripTerminalSequences(line).includes("Q1: Choose"));
+  assert.equal(stripTerminalSequences(header).trim(), "Ask user", "tool-call label is unchanged apart from removing the ID");
   assert.match(body, /\x1b\[48;/, "question body has a full-width colored panel");
   assert.equal(body.match(/\x1b\[48;[^m]+m/)?.[0], header.match(/\x1b\[48;[^m]+m/)?.[0], "transcript body shares the header background");
   assert.equal(visibleWidth(body), 100);

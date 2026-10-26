@@ -393,7 +393,7 @@ test("real host mouse submission restores ordinary editor focus and accepts subs
 
 test("native host keyboard and quick double-click submission restore the ordinary editor", async t => {
   t.mock.method(Date, "now", () => 1000);
-  for (const action of ["first", "second", "custom", "close", "escape", "dismiss", "double-click"]) {
+  for (const action of ["first", "second", "custom", "close", "escape", "dismiss", "double-click", "double-click-drift"]) {
     const terminal = { rows: 32, columns: 120, kittyProtocolActive: false,
       start(input) { this.input = input; }, stop() {}, write() {}, hideCursor() {}, showCursor() {}, moveBy() {},
       clearLine() {}, clearFromCursor() {}, clearScreen() {}, setTitle() {}, setProgress() {} };
@@ -424,21 +424,23 @@ test("native host keyboard and quick double-click submission restore the ordinar
       if (action === "second") key("\x1b[A");
       if (action === "close") { key("\t"); key("\t"); }
       if (action === "dismiss") { key("\t"); key("\t"); key("\t"); }
-      if (action === "double-click") {
+      if (action.startsWith("double-click")) {
         const box = handle.getBounds();
         const lines = plain(component.render(box.width));
         const row = lines.findIndex(line => /2\. Second/.test(line));
         const x = box.col + lines[row].indexOf("Second") + 1;
         const y = box.row + row + 1;
         for (let click = 0; click < 2; click++) {
-          terminal.input(`\x1b[<0;${x};${y}M`);
-          terminal.input(`\x1b[<0;${x};${y}m`);
+          const clickX = x + (action === "double-click-drift" ? click : 0);
+          terminal.input(`\x1b[<0;${clickX};${y}M`);
+          assert.equal(tui.hasActiveSelection(), false, "option presses must not start native word selection");
+          terminal.input(`\x1b[<0;${clickX};${y}m`);
           if (!click) assert.equal(tui.hasOverlay(), true, "first native click only selects");
         }
         assert.equal(tui.hasOverlay(), false, "second native click submits and closes the overlay");
       } else key(action === "escape" ? "\x1b" : "\r");
       const expected = action === "custom" ? { kind: "answer", answer: { text: "typed draft" } }
-        : ["first", "second", "double-click"].includes(action) ? { kind: "answer", answer: { text: action === "first" ? "First" : "Second", optionIndex: action === "first" ? 0 : 1 } }
+        : ["first", "second", "double-click", "double-click-drift"].includes(action) ? { kind: "answer", answer: { text: action === "first" ? "First" : "Second", optionIndex: action === "first" ? 0 : 1 } }
         : { kind: action === "dismiss" ? "dismiss" : "defer" };
       assert.deepEqual(await pending, expected);
       assert.equal(tui.hasOverlay(), false);
@@ -631,7 +633,7 @@ test("Escape and Ctrl+C always defer, from every keyboard focus, exactly once", 
 test("fullscreen mouse stages options, focuses/edits custom text, and explicitly submits", () => {
   const f = setup();
   const y = f.row(/2\. Second/);
-  assert.equal(f.mouse(y, "press"), undefined);
+  assert.equal(f.mouse(y, "press").handled, true, "own the gesture instead of falling back to text selection");
   assert.equal(f.mouse(y).handled, true);
   assert.deepEqual(f.results, [], "a single click only stages the option");
   assert.equal(f.mouse(f.row(/>\* 2\./), "click", { button: "right" }), undefined);
@@ -643,16 +645,16 @@ test("fullscreen mouse stages options, focuses/edits custom text, and explicitly
   assert.deepEqual(f.results, [{ kind: "answer", answer: { text: "mouse answer" } }]);
 });
 
-test("only a quick native double-click submits an option, exactly once", t => {
+test("only quick repeated clicks submit an option, exactly once, without requiring native click counts", t => {
   let now = 1000;
   t.mock.method(Date, "now", () => now);
-  for (const delay of [0, 100, 300, 301, 500]) {
+  for (const clickCount of [undefined, 1, 2]) for (const delay of [0, 100, 300, 301, 500]) {
     const f = setup();
     const y = f.row(/2\. Second/);
     f.mouse(y, "click", { clickCount: 1 });
     assert.deepEqual(f.results, []);
     now += delay;
-    const result = f.mouse(y, "click", { clickCount: 2 });
+    const result = f.mouse(y, "click", { clickCount });
     if (delay <= 300) {
       assert.deepEqual(f.results, [{ kind: "answer", answer: { text: "Second", optionIndex: 1 } }]);
       assert.equal(result.focus, false, "a completed overlay must not reclaim editor focus");
@@ -671,6 +673,10 @@ test("double-click submission requires the same option without an intervening in
     f => f.mouse(f.row(/2\. Second/), "wheel", { button: "none", wheelDelta: 1 }),
     f => f.mouse(f.row(/Which target/)),
     f => f.mouse(f.row(/Custom answer:/), "press"),
+    f => f.mouse(f.row(/Which target/), "press"),
+    f => f.mouse(f.row(/2\. Second/), "press", { ctrl: true }),
+    f => f.mouse(f.row(/2\. Second/), "drag"),
+    f => f.mouse(-1, "drag"),
     f => { f.ui.focused = false; f.ui.focused = true; },
     f => f.lines(60),
   ]) {
@@ -684,6 +690,21 @@ test("double-click submission requires the same option without an intervening in
   const fresh = setup();
   fresh.mouse(fresh.row(/2\. Second/), "click", { clickCount: 2 });
   assert.deepEqual(fresh.results, [], "an opening click cannot double-click-submit a fresh overlay");
+});
+
+test("double-clicks tolerate small pointer drift but not distant clicks on the same option", t => {
+  let now = 1000;
+  t.mock.method(Date, "now", () => now);
+  for (const [dx, dy, submits] of [[1, 0, true], [2, 1, true], [3, 0, false]]) {
+    const f = setup();
+    const y = f.row(/2\. Second/);
+    f.mouse(y, "press"); f.mouse(y, "release"); f.mouse(y);
+    now += 100;
+    f.mouse(y + dy, "press", { x: 3 + dx });
+    f.mouse(y + dy, "release", { x: 3 + dx });
+    f.mouse(y + dy, "click", { x: 3 + dx, clickCount: 1 });
+    assert.equal(f.results.length, submits ? 1 : 0);
+  }
 });
 
 test("long cards stay bounded and all content is reachable through keyboard and wheel scrolling", () => {

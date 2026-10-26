@@ -613,7 +613,8 @@ test("full extension wiring combines all UI features and cleans on reload", asyn
     assert.equal(pendingRows.length, 3, "one top spacer, question text, and one bottom spacer without a header");
     assert.equal(plain(pendingRows[0]), " ".repeat(90));
     assert.match(pendingRows[0], /\x1b\[48;/, "top buffer is filled rather than terminal gray");
-    assert.equal(pendingRows.at(-1), pendingRows[0], "bottom buffer uses the same dark amber");
+    assert.equal(pendingRows.at(-1), pendingRows[0], "bottom buffer uses the same regular amber");
+    assert.equal(pendingRows[0].match(/\x1b\[48;[^m]+m/)?.[0], pendingRows[1].match(/\x1b\[48;[^m]+m/)?.[0], "reminder buffers match the ordinary question fill rather than darker separators");
     assert.equal(pending.handleMouse({ type: "click", button: "left", x: 3, y: 2 }), undefined, "reminder bottom spacing has no answer target");
     assert.match(plain(pendingRows[1]), /Q1: Keep the ordinary input available/);
     assert.doesNotMatch(pendingRows.map(plain).join("\n"), /Questions ·|\d+ pending/);

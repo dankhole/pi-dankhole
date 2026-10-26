@@ -62,7 +62,7 @@ export class QuestionComponent implements Component, Focusable {
   private inputWidth = 0;
   private paste: string | undefined;
   private pasteOverflow = false;
-  private optionClick?: { option: number; at: number };
+  private optionClick?: { option: number; at: number; x: number; y: number };
   private lastAvailable = 0;
 
   constructor(
@@ -229,7 +229,11 @@ export class QuestionComponent implements Component, Focusable {
     this.refresh();
   }
   handleMouse(event: TuiMouseEvent): TuiMouseEventResult | undefined {
-    if (this.finished || event.x < 0 || event.x >= this.lastWidth || event.y < 0 || event.y >= this.lastHeight) return undefined;
+    if (this.finished) return undefined;
+    if (event.x < 0 || event.x >= this.lastWidth || event.y < 0 || event.y >= this.lastHeight) {
+      if (event.type !== "move") this.optionClick = undefined;
+      return undefined;
+    }
     if (event.type === "wheel" && event.wheelDelta) {
       this.scrollBy(Math.sign(event.wheelDelta) * Math.min(this.bodyRows, Math.max(1, Math.abs(event.wheelDelta))));
       return { handled: true, render: true };
@@ -245,17 +249,25 @@ export class QuestionComponent implements Component, Focusable {
       }
       return { handled: true, focus: true, render: true };
     }
-    if (event.type !== "click") return undefined;
+    if (event.type !== "press" && event.type !== "click") return undefined;
     if (event.x >= this.bodyColumn && event.x < this.bodyColumn + this.bodyWidth
       && event.y >= this.bodyRow && event.y < this.bodyRow + this.bodyRows) {
       const option = this.rows[this.scroll + event.y - this.bodyRow]?.option;
       if (option !== undefined) {
+        const plainClick = !event.shift && !event.alt && !event.ctrl;
+        if (event.type === "press") {
+          if (!plainClick || this.optionClick?.option !== option) this.optionClick = undefined;
+          // Own the press so fullscreen word-selection cannot steal the gesture.
+          return { handled: true, focus: !this.hasFocus };
+        }
         const now = Date.now();
         const previous = this.optionClick;
-        const plainClick = !event.shift && !event.alt && !event.ctrl;
-        const doubleClick = plainClick && event.clickCount === 2 && previous?.option === option
-          && now >= previous.at && now - previous.at <= 300;
-        this.optionClick = plainClick ? { option, at: now } : undefined;
+        // Native click counts require identical cells. Recognize two completed
+        // clicks ourselves, allowing slight pointer drift on the same choice.
+        const doubleClick = plainClick && previous?.option === option
+          && now >= previous.at && now - previous.at <= 300
+          && Math.abs(event.x - previous.x) <= 2 && Math.abs(event.y - previous.y) <= 1;
+        this.optionClick = plainClick ? { option, at: now, x: event.x, y: event.y } : undefined;
         this.select(option);
         if (doubleClick) this.submit();
         // Refocusing the current component toggles its focus off/on in Pi,
@@ -264,6 +276,7 @@ export class QuestionComponent implements Component, Focusable {
       }
     }
     this.optionClick = undefined;
+    if (event.type !== "click") return undefined;
     const button = this.buttons.find(button => event.y === button.row && event.x >= button.column && event.x < button.end);
     if (button) {
       this.focus = button.action;

@@ -409,8 +409,9 @@ export function registerQuestions(pi: ExtensionAPI, enabled: boolean): void {
           targets = [];
           lastHeight = 0;
           if (width <= 0 || !shouldShow(width)) return [];
+          const buffer = questionPlain() ? "" : questionPaint(theme, " ".repeat(width), "question");
           const separator = questionPlain() ? "" : questionPaint(theme, " ".repeat(width), "questionSeparator");
-          const lines = [separator]; // Match the outer buffers to the inter-question separators.
+          const lines = [buffer];
           if (wrappedWidth !== width) {
             wrappedWidth = width;
             body = [];
@@ -436,7 +437,7 @@ export function registerQuestions(pi: ExtensionAPI, enabled: boolean): void {
               : separator);
           }
           if (hint) lines.push(questionStyle(theme, truncateToWidth(`  Rows ${listOffset + 1}–${Math.min(body.length, listOffset + capacity)}/${body.length} · wheel to scroll`, width), "muted"));
-          lines.push(separator); // Buffer rows are never question click targets.
+          lines.push(buffer); // Buffer rows are never question click targets.
           lastHeight = lines.length;
           // Width helpers can add reset sequences even to otherwise plain text.
           return questionPlain() ? lines.map(stripTerminalSequences) : lines;
@@ -741,7 +742,7 @@ export function registerQuestions(pi: ExtensionAPI, enabled: boolean): void {
     renderCall(_args, theme, context) {
       const record = toolRecords.get(context.toolCallId);
       const renderedSession = sessionId;
-      return new QuestionTranscript(() => ({ text: questionStyle(theme, `Ask user${record ? ` · Q${record.id}` : ""}`, "questionText", "question") }),
+      return new QuestionTranscript(() => ({ text: questionStyle(theme, "Ask user", "questionText", "question") }),
         line => questionPaint(theme, line, "question"), theme, () => record, "top", () => openCard(record, renderedSession));
     },
     renderResult(result, _options, theme, context) {
