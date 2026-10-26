@@ -126,7 +126,7 @@ function questionLines(question: QuestionView): string[] {
 class QuestionTranscript extends Text {
   private lastWidth = 0;
   private lastHeight = 0;
-  constructor(private readonly currentText: () => string, private readonly paint: (line: string) => string, private readonly buffered = false,
+  constructor(private readonly currentText: () => string, private readonly paint: (line: string, separator?: boolean) => string, private readonly buffered = false,
     private readonly open?: () => boolean, private readonly content?: (width: number) => { identity: object; rows: number[] } | undefined) { super("", 0, 0); }
   [QUESTION_CONTENT](width: number) { return this.content?.(width); }
   handleMouse(event: TuiMouseEvent) {
@@ -143,11 +143,11 @@ class QuestionTranscript extends Text {
     // native Box padding overflow and this final clamp preserves the component width contract.
     const lines = super.render(width).map(line => {
       const content = truncateToWidth(line, width, "", true);
-      if (!stripTerminalSequences(content).trim()) return "";
+      if (!stripTerminalSequences(content).trim()) return this.buffered && !questionPlain() ? this.paint(" ".repeat(width), true) : "";
       return questionPlain() ? stripTerminalSequences(content) : this.paint(content);
     });
-    // Only these intentional transcript buffers receive fill. Internal blank
-    // separators and native tool/editor outer spacing remain unpainted.
+    // Outer buffers retain the card fill; internal blank rows use a darker amber
+    // separator. Native tool/editor outer spacing remains untouched.
     if (!this.buffered) { this.lastHeight = lines.length; return lines; }
     const buffer = this.paint(" ".repeat(width));
     this.lastHeight = lines.length + 2;
@@ -645,7 +645,7 @@ export function registerQuestions(pi: ExtensionAPI, enabled: boolean): void {
           ...(status === "dismissed" && record?.resolution ? ["", `Reason: ${safe(record.resolution.reason)}`] : []),
           ...(details?.reason && status === "error" ? [safe(details.reason)] : []),
         ].join("\n");
-      }, line => questionPaint(theme, line, "question"), true,
+      }, (line, separator) => questionPaint(theme, line, separator ? "questionSeparator" : "question"), true,
       () => associated && details?.status !== "error" && openCard(snapshot, renderedSession), width => {
         const live = associated ? liveQuestion(snapshot, renderedSession) : undefined;
         if (details?.status === "error" || live?.status !== "pending" || width <= 0) return;

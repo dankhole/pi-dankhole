@@ -5,15 +5,15 @@ import { backgroundAnsi, foregroundAnsi, parseColor, type TextAttributes } from 
 // apart from gray chat chrome; opaque neutral popup controls remain separate.
 // WCAG targets: text >= 4.5:1; meaningful focus/border cues >= 3:1.
 const colors = {
-  dark: { surface: "#1c1c1c", choice: "#262626", focused: "#3a3a3a", selected: "#303030", question: "#594515",
+  dark: { surface: "#1c1c1c", choice: "#262626", focused: "#3a3a3a", selected: "#303030", question: "#594515", questionSeparator: "#3d351b",
     questionMuted: "#d7d7d7", questionAccent: "#afffff",
     text: "#eeeeee", muted: "#c6c6c6", accent: "#87d7ff", success: "#afffaf", warning: "#ffd787", border: "#a8a8a8" },
-  light: { surface: "#eeeeee", choice: "#e4e4e4", focused: "#d0d0d0", selected: "#dadada", question: "#fff0bf",
+  light: { surface: "#eeeeee", choice: "#e4e4e4", focused: "#d0d0d0", selected: "#dadada", question: "#fff0bf", questionSeparator: "#e6d58c",
     questionMuted: "#444444", questionAccent: "#005f87",
     text: "#1c1c1c", muted: "#444444", accent: "#005f87", success: "#005f00", warning: "#5f0000", border: "#626262" },
 };
 type Tone = "text" | "questionText" | "questionMuted" | "questionAccent" | "muted" | "accent" | "success" | "warning" | "border";
-type Surface = "surface" | "choice" | "focused" | "selected" | "question";
+type Surface = "surface" | "choice" | "focused" | "selected" | "question" | "questionSeparator";
 const palettes = Object.fromEntries(Object.entries(colors).map(([appearance, values]) => [appearance,
   Object.fromEntries(Object.entries({ ...values, questionText: values.warning }).map(([key, value]) => [key, parseColor(value)])),
 ])) as Record<Theme["appearance"], Record<Tone | Surface, ReturnType<typeof parseColor>>>;

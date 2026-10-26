@@ -1331,7 +1331,7 @@ test("transcript separates the question, each choice, rationale and recorded ans
   assert.equal(h.sent.length, 0);
 });
 
-test("question transcript fills exactly one outer buffer per side, never internal separators or expanded duplicates", async () => {
+test("question transcript uses amber buffers and darker amber separators without expanded duplicates", async () => {
   const h = await harness({ mode: "print", hasUI: false });
   const args = { question: "Choose 界?\n\nKeep this internal gap.", options: [{ label: "Keep", description: "Local only" }] };
   const result = await h.ask(args);
@@ -1346,9 +1346,11 @@ test("question transcript fills exactly one outer buffer per side, never interna
       const buffer = `\x1b[${fg}m\x1b[${bg}m${" ".repeat(width)}\x1b[0m`;
       assert.equal(lines[0], buffer, `${appearance}/${mode}/${width}: exact top fill`);
       assert.equal(lines.at(-1), buffer, `${appearance}/${mode}/${width}: exact bottom fill`);
-      assert.equal(lines.filter(line => line === buffer).length, 2);
-      assert.ok(lines.slice(1, -1).some(line => line === ""), "internal blank separator remains present");
-      assert.ok(lines.slice(1, -1).filter(line => !stripTerminalSequences(line).trim()).every(line => line === ""), "only explicit outer buffers receive fill");
+      if (mode === "truecolor") assert.equal(lines.filter(line => line === buffer).length, 2);
+      const separatorBg = backgroundAnsi(parseColor(appearance === "dark" ? "#3d351b" : "#e6d58c"), mode);
+      const separators = lines.slice(1, -1).filter(line => !stripTerminalSequences(line).trim());
+      assert.ok(separators.length >= 3, "header, internal question gap and choice separation remain present");
+      assert.ok(separators.every(line => line.includes(separatorBg) && visibleWidth(line) === width), "blank card rows have full-width amber fill, never terminal-gray gaps");
       assert.ok(lines.every(line => visibleWidth(line) <= width));
       const call = h.tool.renderCall(args, theme, { toolCallId: "call-1" }).render(width);
       assert.notEqual(stripTerminalSequences(call[0]).trim(), "");
@@ -1361,7 +1363,9 @@ test("question transcript fills exactly one outer buffer per side, never interna
   for (const expanded of [false, true]) {
     native.setExpanded(expanded);
     const lines = native.render(80);
-    assert.equal(lines.filter(line => !stripTerminalSequences(line).trim() && /\x1b\[48;/.test(line)).length, 2, "native shell does not duplicate intentional buffers");
+    const tintedBlanks = rows => rows.filter(line => !stripTerminalSequences(line).trim() && /\x1b\[48;/.test(line)).length;
+    const resultRows = h.tool.renderResult(result, { expanded }, themes.theme).render(80);
+    assert.equal(tintedBlanks(lines), tintedBlanks(resultRows), "native shell does not duplicate card buffers or separators");
     assert.doesNotMatch(lines.map(stripTerminalSequences).join("\n"), /No answer or approval|receipt|Interactive question UI unavailable/);
   }
 });
@@ -1428,7 +1432,8 @@ test("native transcript keeps one question/choice copy and live Answered/Dismiss
   assert.equal(background(resultRows.at(-1)), background(body), "transcript bottom buffer matches the question body");
   assert.equal(visibleWidth(resultRows[0]), 100);
   assert.equal(visibleWidth(resultRows.at(-1)), 100);
-  assert.ok(resultRows.slice(1, -1).filter(line => !stripTerminalSequences(line).trim()).every(line => line === ""), "internal transcript separators remain unfilled");
+  const separatorBg = backgroundAnsi(parseColor("#3d351b"), themes.theme.getColorMode());
+  assert.ok(resultRows.slice(1, -1).filter(line => !stripTerminalSequences(line).trim()).every(line => line.includes(separatorBg)), "internal transcript separators retain a darker amber fill");
   if (process.env.QUESTION_TRANSCRIPT_SAMPLE) {
     const widget = h.widgetComponent();
     writeFileSync(process.env.QUESTION_TRANSCRIPT_SAMPLE, [...painted, "", ...widget.render(100)].join("\n") + "\n");

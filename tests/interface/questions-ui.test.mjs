@@ -858,6 +858,22 @@ test("amber transcript/list cards match the header, contrast with gray chrome, a
   }
 });
 
+test("blank question separators keep a darker amber tint rather than terminal-gray stripes", () => {
+  for (const appearance of ["dark", "light"]) for (const mode of ["truecolor", "256color"]) {
+    const theme = themes.loadThemeFromPath(join(root, `dist/modes/interactive/theme/${appearance}.json`), mode);
+    const body = ansiCells(questionPaint(theme, " ", "question"))[0];
+    const cells = ansiCells(questionPaint(theme, " ".repeat(80), "questionSeparator"));
+    const [red, green, blue] = rgbFromAnsi(cells[0].bg);
+    assert.ok(red >= green && green > blue, `${appearance}/${mode}: separators remain yellow/amber`);
+    assert.equal(cells.length, 80);
+    assert.ok(cells.every(cell => cell.bg === cells[0].bg), "every spacer cell is opaque");
+    const brightness = bg => rgbFromAnsi(bg).reduce((sum, channel) => sum + channel, 0);
+    assert.ok(brightness(cells[0].bg) <= brightness(body.bg));
+    if (mode === "truecolor") assert.ok(brightness(cells[0].bg) < brightness(body.bg), "spacers are darker than text rows");
+    // The 256-color cube has only one sufficiently dark amber; its two shades may coincide.
+  }
+});
+
 test("actual ANSI paint pairs meet text/state contrast in dark/light truecolor and 256color", () => {
   for (const appearance of ["dark", "light"]) for (const mode of ["truecolor", "256color"]) {
     const theme = themes.loadThemeFromPath(join(root, `dist/modes/interactive/theme/${appearance}.json`), mode);
