@@ -826,13 +826,18 @@ function contrast(fg, bg) {
 test("amber transcript/list cards match the header, contrast with gray chrome, and keep readable text", () => {
   for (const appearance of ["dark", "light"]) for (const mode of ["truecolor", "256color"]) {
     const theme = themes.loadThemeFromPath(join(root, `dist/modes/interactive/theme/${appearance}.json`), mode);
-    const header = ansiCells(questionStyle(theme, "Header", "warning", "question"))[0];
+    const header = ansiCells(questionStyle(theme, "Header", "questionText", "question"))[0];
     const body = ansiCells(questionStyle(theme, "Body", "text", "question"))[0];
     const modal = ansiCells(questionStyle(theme, "Modal", "text", "surface"))[0];
     assert.ok(contrast(header.fg, header.bg) >= 4.5, "restored warm header retains readable contrast");
     assert.equal(body.fg, header.fg, "question text matches the header foreground");
     assert.equal(body.bg, header.bg, "question text matches the header background");
-    assert.deepEqual(rgbFromAnsi(body.fg), appearance === "dark" ? [255, 215, 135] : [95, 0, 0], "question foreground stays warm yellow/dark red");
+    const expectedForeground = appearance === "light" ? [95, 0, 0] : mode === "truecolor" ? [255, 240, 191] : [255, 255, 175];
+    assert.deepEqual(rgbFromAnsi(body.fg), expectedForeground, "question foreground uses brighter pale yellow/dark red");
+    if (appearance === "dark") {
+      const previous = ansiCells(questionStyle(theme, "Previous", "warning", "question"))[0];
+      assert.ok(contrast(body.fg, body.bg) > contrast(previous.fg, previous.bg), "question text stands out more than the previous amber-yellow text");
+    }
     const expectedBackground = mode === "truecolor"
       ? appearance === "dark" ? [89, 69, 21] : [255, 240, 191]
       : appearance === "dark" ? [95, 95, 0] : [255, 255, 175];

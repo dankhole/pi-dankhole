@@ -126,7 +126,7 @@ function questionLines(question: QuestionView): string[] {
 class QuestionTranscript extends Text {
   private lastWidth = 0;
   private lastHeight = 0;
-  constructor(private readonly currentText: () => string, private readonly paint: (line: string, separator?: boolean) => string, private readonly buffered = false,
+  constructor(private readonly currentText: () => string, private readonly paint: (line: string, separator?: boolean) => string, private readonly buffers: "top" | "both",
     private readonly open?: () => boolean, private readonly content?: (width: number) => { identity: object; rows: number[] } | undefined) { super("", 0, 0); }
   [QUESTION_CONTENT](width: number) { return this.content?.(width); }
   handleMouse(event: TuiMouseEvent) {
@@ -143,15 +143,14 @@ class QuestionTranscript extends Text {
     // native Box padding overflow and this final clamp preserves the component width contract.
     const lines = super.render(width).map(line => {
       const content = truncateToWidth(line, width, "", true);
-      if (!stripTerminalSequences(content).trim()) return this.buffered && !questionPlain() ? this.paint(" ".repeat(width), true) : "";
+      if (!stripTerminalSequences(content).trim()) return !questionPlain() ? this.paint(" ".repeat(width), true) : "";
       return questionPlain() ? stripTerminalSequences(content) : this.paint(content);
     });
     // Outer buffers retain the card fill; internal blank rows use a darker amber
     // separator. Native tool/editor outer spacing remains untouched.
-    if (!this.buffered) { this.lastHeight = lines.length; return lines; }
     const buffer = this.paint(" ".repeat(width));
-    this.lastHeight = lines.length + 2;
-    return [buffer, ...lines, buffer];
+    this.lastHeight = lines.length + (this.buffers === "both" ? 2 : 1);
+    return this.buffers === "both" ? [buffer, ...lines, buffer] : [buffer, ...lines];
   }
 }
 
@@ -220,7 +219,7 @@ export function registerQuestions(pi: ExtensionAPI, enabled: boolean): void {
     const waiting = attention();
     const pending = waiting.filter(record => record.status === "pending");
     const saved = waiting.filter(record => record.status === "answered");
-    // The widget already owns the pending count; never repeat it in the footer/input border.
+    // Pending reminders need no separate count or footer/input-border status.
     ctx.ui.setStatus(QUESTION_STATUS_KEY, undefined);
     // Pi already displays its native steering queue. Busy/queued is not a failed send;
     // expose recovery only once idle, without claiming absence from the queue proves failure.
@@ -271,39 +270,31 @@ export function registerQuestions(pi: ExtensionAPI, enabled: boolean): void {
           targets = [];
           lastHeight = 0;
           if (width <= 0 || !shouldShow(width)) return [];
-          const lines = [
-            "", // Keep breathing room above; the native editor owns the gap below.
-            questionStyle(theme, truncateToWidth(`Questions · ${pending.length} pending`, width, "", true), "warning", "question", { bold: true }),
-          ];
-          {
-            if (wrappedWidth !== width) {
-              wrappedWidth = width;
-              body = [];
-              const indent = width >= 12 ? "  " : "";
-              for (const record of pending) {
-                if (body.length) body.push({ text: "" }); // Separation is not a click target.
-                for (const line of wrapTextWithAnsi(`Q${record.id}: ${safe(record.question).replace(/\n/g, " ")}`, width - indent.length)) {
-                  body.push({ text: indent + line, record });
-                }
+          const lines = [""]; // Keep breathing room above; the native editor owns the gap below.
+          if (wrappedWidth !== width) {
+            wrappedWidth = width;
+            body = [];
+            const indent = width >= 12 ? "  " : "";
+            for (const record of pending) {
+              if (body.length) body.push({ text: "" }); // Separation is not a click target.
+              for (const line of wrapTextWithAnsi(`Q${record.id}: ${safe(record.question).replace(/\n/g, " ")}`, width - indent.length)) {
+                body.push({ text: indent + line, record });
               }
             }
-            // Leave room for ordinary input/footer even in a small terminal. On tiny screens
-            // omit decorative padding and the hint before sacrificing the one content row.
-            const budget = Math.max(4, Math.min(16, (tui.terminal?.rows ?? 24) - 5));
-            const padding = budget >= 7 ? 1 : 0;
-            const available = budget - 2 - padding;
-            const overflow = body.length > available;
-            const hint = overflow && available > 1;
-            const capacity = available - (hint ? 1 : 0);
-            maxOffset = Math.max(0, body.length - capacity);
-            listOffset = Math.max(0, Math.min(listOffset, maxOffset));
-            if (padding) lines.push("");
-            for (const row of body.slice(listOffset, listOffset + capacity)) {
-              targets[lines.length] = row.record;
-              lines.push(row.record ? questionStyle(theme, truncateToWidth(row.text, width, "", true), "text", "question") : "");
-            }
-            if (hint) lines.push(questionStyle(theme, truncateToWidth(`  Rows ${listOffset + 1}–${Math.min(body.length, listOffset + capacity)}/${body.length} · wheel to scroll`, width), "muted"));
           }
+          // Keep the bounded list and hint clear of ordinary input/footer controls.
+          const budget = Math.max(4, Math.min(16, (tui.terminal?.rows ?? 24) - 5));
+          const available = budget - lines.length;
+          const overflow = body.length > available;
+          const hint = overflow && available > 1;
+          const capacity = available - (hint ? 1 : 0);
+          maxOffset = Math.max(0, body.length - capacity);
+          listOffset = Math.max(0, Math.min(listOffset, maxOffset));
+          for (const row of body.slice(listOffset, listOffset + capacity)) {
+            targets[lines.length] = row.record;
+            lines.push(row.record ? questionStyle(theme, truncateToWidth(row.text, width, "", true), "text", "question") : "");
+          }
+          if (hint) lines.push(questionStyle(theme, truncateToWidth(`  Rows ${listOffset + 1}–${Math.min(body.length, listOffset + capacity)}/${body.length} · wheel to scroll`, width), "muted"));
           lastHeight = lines.length;
           // Width helpers can add reset sequences even to otherwise plain text.
           return questionPlain() ? lines.map(stripTerminalSequences) : lines;
@@ -615,8 +606,8 @@ export function registerQuestions(pi: ExtensionAPI, enabled: boolean): void {
     renderCall(_args, theme, context) {
       const record = [...records.values()].find(question => question.toolCallId === context.toolCallId);
       const renderedSession = sessionId;
-      return new QuestionTranscript(() => questionStyle(theme, `Ask user${record ? ` · Q${record.id}` : ""}`, "warning", "question"),
-        line => questionPaint(theme, line, "question"), false, () => openCard(record, renderedSession));
+      return new QuestionTranscript(() => questionStyle(theme, `Ask user${record ? ` · Q${record.id}` : ""}`, "questionText", "question"),
+        line => questionPaint(theme, line, "question"), "top", () => openCard(record, renderedSession));
     },
     renderResult(result, _options, theme, context) {
       const details = result.details as QuestionDetails | undefined;
@@ -630,14 +621,14 @@ export function registerQuestions(pi: ExtensionAPI, enabled: boolean): void {
         return { status, label: `${record ? `Q${record.id} · ` : ""}${status === "answered"
           ? `Answered${record?.resolution || record?.delivered ? "" : " · saved, delivery unconfirmed"}`
           : status === "dismissed" ? record?.resolution ? "Dismissed by agent" : "Dismissed"
-          : status === "error" ? "Not answered (error)" : "Pending · click to answer"}` };
+          : status === "error" ? "Not answered (error)" : "Pending"}` };
       };
       return new QuestionTranscript(() => {
         const record = current();
         const { status, label } = labelFor(record);
         return [
-          questionStyle(theme, label, status === "answered" ? "success" : status === "error" ? "warning" : "muted", "question"),
-          ...(record ? [""] : []),
+          ...(status === "pending" ? [] : [questionStyle(theme, label,
+            status === "answered" ? "success" : status === "error" ? "warning" : "muted", "question"), ...(record ? [""] : [])]),
           // The actual question and all choices are always in the ordinary
           // transcript, once, independently of expansion and the optional popup.
           ...(record ? questionLines(record) : []),
@@ -645,11 +636,11 @@ export function registerQuestions(pi: ExtensionAPI, enabled: boolean): void {
           ...(status === "dismissed" && record?.resolution ? ["", `Reason: ${safe(record.resolution.reason)}`] : []),
           ...(details?.reason && status === "error" ? [safe(details.reason)] : []),
         ].join("\n");
-      }, (line, separator) => questionPaint(theme, line, separator ? "questionSeparator" : "question"), true,
+      }, (line, separator) => questionPaint(theme, line, separator ? "questionSeparator" : "question"), "both",
       () => associated && details?.status !== "error" && openCard(snapshot, renderedSession), width => {
         const live = associated ? liveQuestion(snapshot, renderedSession) : undefined;
         if (details?.status === "error" || live?.status !== "pending" || width <= 0) return;
-        const offset = 1 + wrapTextWithAnsi(labelFor(live).label, width).length + 1;
+        const offset = 1; // Pending results begin with only the filled top buffer.
         const rows: number[] = [];
         // The ID, status, choices and filled outer buffers are not question text.
         let prefix = `Q${live.id}:`;

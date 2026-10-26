@@ -609,10 +609,11 @@ test("full extension wiring combines all UI features and cleans on reload", asyn
     assert.equal(question.details.status, "pending");
     assert.equal(question.terminate, true);
     const pending = view.widgets.get("compact-tools:questions");
-    assert.equal(pending.render(90).length, 4, "new questions start expanded without a trailing spacer");
-    assert.equal(plain(pending.render(90)[0]).trim(), "");
-    assert.match(plain(pending.render(90).at(-1)), /Keep the ordinary input available/);
-    assert.match(pending.render(90).map(plain).join("\n"), /question/i);
+    const pendingRows = pending.render(90);
+    assert.equal(pendingRows.length, 2, "one top spacer then question text, without a header or trailing spacer");
+    assert.equal(pendingRows[0], "");
+    assert.match(plain(pendingRows[1]), /Q1: Keep the ordinary input available/);
+    assert.doesNotMatch(pendingRows.map(plain).join("\n"), /Questions ·|\d+ pending/);
     assert.doesNotMatch(plain(view.editor.render(90)[1]), /pending question|· \/q/);
     assert.equal(view.statuses.has("compact-tools:questions"), false, "only the widget shows pending questions");
     assert.match(plain(view.frame().lines[0]), /full extension input/);
