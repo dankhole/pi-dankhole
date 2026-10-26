@@ -25,6 +25,7 @@ The originals in `../compact-tools` and `../pi-subagents` are not owned by this 
 - Keep questions separate from worker orchestration. The question UI is not an authorization gate.
 - Preserve existing `subagents.json` and `compact-tools.json` settings and command names for this initial migration.
 - Keep upstream notices, licenses and vendored provenance.
-- Validate changed behavior with focused tests, then run the package checks before reporting completion. No live provider calls are required.
+- Default to targeted validation, not `npm run check`, `npm test`, or entire feature suites. Read [testing guidance](docs/testing.md), select the files covering changed behavior and affected consumers, and run only those tests. For code changes, also run lint and typecheck; documentation-only changes need no test run.
+- Broaden testing only for a concrete cross-cutting risk (such as host dependency, runner, shared lifecycle, or package-registration changes), an explicit full-suite request, or release validation. Explain the scope. A lead owns any broad run; workers run focused tests, not duplicate full suites. Reuse passing results for unchanged code, rerun affected checks after fixes, and report exact commands, outcomes, and omitted coverage. No live provider calls are required.
 - Do not change installed extension configuration or symlinks until the user approves switching.
 - Do not commit, stage, switch branches, push, publish, or initialize a Git repository unless requested.

@@ -165,10 +165,13 @@ Lifecycle events describe workers managed by the main agent; the usage ledger re
 ## Development
 
 ```sh
-npm run check
+# Select the worker test files covering your change, not all worker suites.
+npm run test:workers -- tests/workers/completion-outbox.test.ts
+npm run lint
+npm run typecheck
 ```
 
-This runs lint, TypeScript checks and tests. Tests use synthetic model responses; no provider calls are required. See [AGENTS.md](../../AGENTS.md) for repository rules.
+See [testing guidance](../testing.md) for file/name filters, affected-consumer coverage, and full-check criteria. `npm run check` is an explicit full-package check, not the default follow-up to focused tests. Tests use synthetic model responses; no provider calls are required. See [AGENTS.md](../../AGENTS.md) for repository rules.
 
 ## Architecture
 

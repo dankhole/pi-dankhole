@@ -32,12 +32,15 @@ Requires Node.js 22.19+; this package is tested against Pi **1.4.0**. Pi supplie
 
 ```sh
 npm ci --ignore-scripts
-npm run check
-npm run build
-npm run migration:status
+npm run lint
+npm run typecheck
+# Run the test files covering your change; examples and selection map:
+# docs/testing.md
 ```
 
-`check` runs lint, typecheck, the worker/package Vitest suites, and the interface Node test suites. Tests use synthetic model responses or UI fixtures, not live provider calls. Interface tests use the Pi installation on PATH unless `PI_PACKAGE_DIR` points at another Pi package root.
+**Use targeted tests for normal changes.** See [testing guidance](docs/testing.md) for exact commands, affected-consumer coverage, and when to broaden validation. Documentation-only edits need no test run. `npm run build` emits distributable files; it is not an additional routine test gate. `npm run migration:status` is only relevant to source reconciliation.
+
+`npm run check` remains the explicit full check: lint, typecheck, all worker/package Vitest suites, then all interface Node suites. Reserve it for cross-cutting changes, release validation, or an explicit full-suite request; do not automatically run it after focused tests. Tests use synthetic model responses or UI fixtures, not live provider calls. Interface tests use the Pi installation on PATH unless `PI_PACKAGE_DIR` points at another Pi package root.
 
 `migration:status` is read-only: it reports changes in the original projects since capture, including new files in the imported source areas. Use `npm run migration:status -- --check` to exit nonzero when reconciliation is needed. It never overwrites your styling work or the migrated code. It reports source drift, not merge status: changes deliberately applied to both copies will still appear until their baseline is explicitly reconciled.
 

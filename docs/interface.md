@@ -160,9 +160,12 @@ To restore the native view, set the default view to `normal`, remove per-tool ov
 Tests use the installed Pi extension loader and actual `ToolExecutionComponent`, without executing agent tools or making model/network calls:
 
 ```sh
-cd ~/Desktop/Projects/pi-dankhole
-npm run test:interface
-# Or: node --test tests/interface/*.test.mjs
+# From the checkout root; select files for the behavior you changed.
+node --test tests/interface/questions-ui.test.mjs
+# Narrow an iteration further (put Node options before file paths):
+node --test --test-name-pattern='contrast' tests/interface/questions-ui.test.mjs
 ```
+
+See [testing guidance](testing.md) for the selection map and affected-consumer coverage. `npm run test:interface` runs **every** interface suite; it is not the default for a local UI change. Do not follow focused tests with `npm run check` automatically.
 
 The test runner finds a standard npm Pi installation via `pi` on PATH. For another installation layout, set `PI_PACKAGE_DIR` to the **Pi coding-agent package root**, not the Pi Dankhole root (for example, the installed development host at `node_modules/@earendil-works/pi-coding-agent`). Tests exercise `src/styling/index.ts` independently of the aggregate package registration and depend on Pi 1.4's actual loader/component layout. Tests cover click/keyboard-driven expansion, edit/write details, per-tool and conversation backgrounds in dark/light truecolor and 256-color themes, optional status/no-background modes, streaming/timer cleanup, Unicode/narrow terminals, custom renderer fallback/state, settings UI/persistence/conflicts, invalid configuration, consecutive grouping/boundaries/rebuilds, off-screen pinned-input visibility, selected-entry provenance and jump offsets, session-age timing across resume/reload, native-compatible footer accounting/status retention, live compaction countdown cutoffs and rounded cost display, interactive question persistence/delivery/abort/selection and agent resolution evidence/branch isolation, optional keep-awake lifecycle/cleanup/platform/subagent tracking with fake processes and events, finished-thinking streaming/manual-toggle behavior, input padding and native mouse/autocomplete alignment, and literal plain-text panel rendering.
