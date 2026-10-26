@@ -958,7 +958,7 @@ test("blank question separators keep a darker amber tint rather than terminal-gr
     if (mode === "truecolor") assert.ok(brightness(cells[0].bg) < brightness(body.bg), "spacers are darker than text rows");
     if (appearance === "dark" && mode === "truecolor") {
       const ratios = rgbFromAnsi(cells[0].bg).map((channel, index) => channel / rgbFromAnsi(body.bg)[index]);
-      assert.ok(ratios.every(ratio => ratio > .8 && ratio < 1), "separators are only subtly darker");
+      assert.ok(ratios.every(ratio => ratio > .94 && ratio < 1), "separators are only subtly darker");
       assert.ok(Math.max(...ratios) - Math.min(...ratios) < .04, "channels dim proportionally to preserve the same amber hue");
     }
     // The 256-color cube has only one sufficiently dark amber; its two shades may coincide.

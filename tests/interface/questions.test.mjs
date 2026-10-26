@@ -730,7 +730,7 @@ test("every scrolled continuation row keeps its question ID at the smallest list
       const hit = widget.handleMouse({ type: "click", button: "left", x: width - 1, y: 1 });
       if (row.id === undefined) {
         assert.equal(stripTerminalSequences(lines[1]), " ".repeat(width), "internal list separation is full-width amber");
-        assert.ok(lines[1].includes(backgroundAnsi(parseColor(themes.theme.appearance === "light" ? "#e6d58c" : "#4e3c12"), themes.theme.getColorMode())));
+        assert.ok(lines[1].includes(backgroundAnsi(parseColor(themes.theme.appearance === "light" ? "#e6d58c" : "#554214"), themes.theme.getColorMode())));
         assert.equal(hit, undefined, "separator has no question target");
       } else {
         assert.equal(hit?.handled, true, `width ${width}: continuation row opens its own question`);
@@ -874,7 +874,7 @@ test("Questions widget has regular amber outer buffers and a darker inter-questi
     const lines = widget.render(80);
     const background = line => line.match(/\x1b\[48;[^m]+m/)?.[0];
     const bufferBg = backgroundAnsi(parseColor(appearance === "dark" ? "#594515" : "#fff0bf"), mode);
-    const separatorBg = backgroundAnsi(parseColor(appearance === "dark" ? "#4e3c12" : "#e6d58c"), mode);
+    const separatorBg = backgroundAnsi(parseColor(appearance === "dark" ? "#554214" : "#e6d58c"), mode);
     assert.equal(lines.length, 5, "one top and one bottom spacer surround separated entries, without a heading");
     assert.doesNotMatch(lines.map(stripTerminalSequences).join("\n"), /Questions ·|\d+ pending/);
     for (const y of [0, 2, 4]) {
@@ -1388,7 +1388,7 @@ test("question transcript uses amber buffers and darker amber separators without
         assert.equal(stripTerminalSequences(lines[index + 1]).trim(), stripTerminalSequences(truncateToWidth(row, width, "", true)).trim(), "extra spacing leaves all actual-question row offsets unchanged");
       }
       if (mode === "truecolor") assert.equal(lines.filter(line => line === buffer).length, 3);
-      const separatorBg = backgroundAnsi(parseColor(appearance === "dark" ? "#4e3c12" : "#e6d58c"), mode);
+      const separatorBg = backgroundAnsi(parseColor(appearance === "dark" ? "#554214" : "#e6d58c"), mode);
       const separators = lines.filter((line, index) => index > 0 && index < lines.length - 1 && index !== afterQuestion && !stripTerminalSequences(line).trim());
       assert.ok(lines[afterQuestion + 1].includes(separatorBg), "existing dark separator remains immediately after the new normal amber buffer");
       assert.ok(lines.at(-2).includes(separatorBg), "dark amber also follows the final option, before the outer light buffer");
@@ -1494,7 +1494,7 @@ test("native transcript keeps one question/choice copy and live Answered/Dismiss
   assert.equal(visibleWidth(resultRows[0]), 100);
   assert.match(stripTerminalSequences(resultRows[1]), /Q1: Choose a target/, "pending question begins immediately after top fill");
   assert.equal(visibleWidth(resultRows.at(-1)), 100);
-  const separatorBg = backgroundAnsi(parseColor("#4e3c12"), themes.theme.getColorMode());
+  const separatorBg = backgroundAnsi(parseColor("#554214"), themes.theme.getColorMode());
   assert.equal(resultRows[2], resultRows[0], "one normal amber buffer follows actual question text before the choices");
   assert.ok(resultRows.slice(3, -1).filter(line => !stripTerminalSequences(line).trim()).every(line => line.includes(separatorBg)), "internal transcript separators retain a darker amber fill");
   if (process.env.QUESTION_TRANSCRIPT_SAMPLE) {
