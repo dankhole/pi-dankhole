@@ -47,7 +47,8 @@ const nonblank = (component, width) => plain(component, width).filter(line => li
 
 test("adds only question lifecycle tools and never replaces existing tool execution", () => {
   assert.deepEqual([...extension.tools.keys()], ["ask_user", "resolve_question"]);
-  assert.deepEqual([...extension.commands.keys()].sort(), ["compact-tools", "latest-input", "q", "questions"]);
+  assert.deepEqual([...extension.commands.keys()].sort(), ["dankhole", "latest-input", "q", "questions"]);
+  assert.equal(extension.commands.has("compact-tools"), false);
   assert.ok(extension.handlers.has("session_start"));
   assert.ok(extension.handlers.has("session_shutdown"));
 });
@@ -301,7 +302,7 @@ test("settings dialog saves changes and reloads when idle", async () => {
   const path = join(scratch, "compact-tools.json");
   let reloaded = false;
   const notices = [];
-  const command = extension.commands.get("compact-tools");
+  const command = extension.commands.get("dankhole");
   try {
     await command.handler("", {
       mode: "tui", isIdle: () => true, reload: async () => { reloaded = true; },
@@ -310,6 +311,7 @@ test("settings dialog saves changes and reloads when idle", async () => {
         custom: factory => new Promise(resolve => {
           const component = factory({ requestRender() {} }, themeModule.theme, {}, resolve);
           const menu = nonblank(component);
+          assert.match(menu[0], /Pi Dankhole settings/);
           assert.match(menu[2], /Keep awake while working \(macOS\).*off/);
           assert.match(menu.join("\n"), /Default tool view/);
           assert.match(menu.join("\n"), /Per-tool options/);
@@ -331,7 +333,7 @@ test("settings save refuses a concurrent edit without overwriting it", async () 
   const notices = [];
   const concurrent = JSON.stringify({ defaultMode: "normal", tools: { read: "compact" } });
   try {
-    await extension.commands.get("compact-tools").handler("", {
+    await extension.commands.get("dankhole").handler("", {
       mode: "tui", isIdle: () => true,
       reload: async () => { assert.fail("must not reload after a save conflict"); },
       ui: {
@@ -366,7 +368,7 @@ test("per-tool options search all tools, retain edits on reopen, and save only f
       ...Array.from({ length: 30 }, (_, index) => `remote_tool_${index}`),
       "bash", "bash", "__proto__",
     ]);
-    await configured.commands.get("compact-tools").handler("", {
+    await configured.commands.get("dankhole").handler("", {
       mode: "tui", isIdle: () => true, reload: async () => { reloads++; },
       ui: {
         notify: message => assert.fail(message),
@@ -375,7 +377,7 @@ test("per-tool options search all tools, retain edits on reopen, and save only f
           const view = () => nonblank(component, 120).map(line => line.trimEnd()).join("\n");
           const back = () => {
             component.handleInput("\x1b");
-            assert.match(view(), /Compact tools\n/);
+            assert.match(view(), /Pi Dankhole settings\n/);
             assert.match(view(), /Esc to save and close/);
             assert.equal(readFileSync(path, "utf8"), raw);
             assert.equal(reloads, 0);
@@ -385,7 +387,7 @@ test("per-tool options search all tools, retain edits on reopen, and save only f
             component.handleInput("\r"); // reopen the selected submenu
             assert.match(view(), /^Per-tool options\n/);
             assert.match(view(), /Type to search.*Esc to go back/);
-            assert.doesNotMatch(view(), /Esc to save|Esc to cancel|Compact tools/);
+            assert.doesNotMatch(view(), /Esc to save|Esc to cancel|Pi Dankhole settings/);
             component.handleInput(name);
           };
           component.handleInput("\x1b[A"); // first -> last main-menu item
@@ -444,7 +446,7 @@ test("unchanged per-tool submenus never save or reload, including full value cyc
       if (raw !== undefined) writeFileSync(path, raw);
       for (const cycle of [false, true]) {
         let closes = 0;
-        await extension.commands.get("compact-tools").handler("", {
+        await extension.commands.get("dankhole").handler("", {
           mode: "tui", isIdle: () => true,
           reload: async () => assert.fail("unchanged settings must not reload"),
           ui: {
@@ -479,7 +481,7 @@ test("per-tool edits save without reloading if the agent becomes busy", async ()
   const notices = [];
   let idle = true;
   try {
-    await extension.commands.get("compact-tools").handler("", {
+    await extension.commands.get("dankhole").handler("", {
       mode: "tui", isIdle: () => idle,
       reload: async () => assert.fail("must not reload a busy agent"),
       ui: {
@@ -508,7 +510,7 @@ test("consecutive grouping defaults on and the settings dialog persists off", as
   const path = join(scratch, "compact-tools.json");
   let reloaded = false;
   try {
-    await extension.commands.get("compact-tools").handler("", {
+    await extension.commands.get("dankhole").handler("", {
       mode: "tui", isIdle: () => true, reload: async () => { reloaded = true; },
       ui: {
         notify: message => assert.fail(message),
@@ -548,7 +550,7 @@ test("new UI settings default on and persist independently", async () => {
       ["Collapse finished thinking", 10, "collapseThinking"],
     ]) {
       let reloaded = false;
-      await extension.commands.get("compact-tools").handler("", {
+      await extension.commands.get("dankhole").handler("", {
         mode: "tui", isIdle: () => true, reload: async () => { reloaded = true; },
         ui: {
           notify: message => assert.fail(message),
@@ -579,7 +581,7 @@ test("compaction countdown cutoff defaults to 20%, accepts custom bounds, and sa
       let reloads = 0;
       const loaded = await load();
       assert.equal(loaded.tools.size, 2);
-      await loaded.commands.get("compact-tools").handler("", {
+      await loaded.commands.get("dankhole").handler("", {
         mode: "tui", isIdle: () => true, reload: async () => { reloads++; },
         ui: {
           notify: message => assert.fail(message),
@@ -637,7 +639,7 @@ test("keep-awake defaults off, saves independently, and only registers after rel
   const settledHandlers = extension.handlers.get("agent_settled")?.length ?? 0;
   let reloaded = false;
   try {
-    await extension.commands.get("compact-tools").handler("", {
+    await extension.commands.get("dankhole").handler("", {
       mode: "tui", isIdle: () => true, reload: async () => { reloaded = true; },
       ui: {
         notify: message => assert.fail(message),
@@ -681,7 +683,7 @@ test("invalid keep-awake or another invalid field never enables keep-awake or re
 
 test("settings dialog refuses to reload a running agent", async () => {
   const notices = [];
-  await extension.commands.get("compact-tools").handler("", {
+  await extension.commands.get("dankhole").handler("", {
     mode: "tui", isIdle: () => false,
     ui: { notify: (...args) => notices.push(args) },
   });

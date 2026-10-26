@@ -202,7 +202,7 @@ export function registerPinnedPrompt(pi: ExtensionAPI, enabled: boolean, convers
     handler: async (_args, ctx) => {
       reconcile?.();
       if (installed) installed.jump();
-      else ctx.ui.notify("Pinned input requires fullscreen mode and Pin latest user input enabled in /compact-tools.", "info");
+      else ctx.ui.notify("Pinned input requires fullscreen mode and Pin latest user input enabled in /dankhole.", "info");
     },
   });
   if (!enabled) return;

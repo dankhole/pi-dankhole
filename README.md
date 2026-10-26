@@ -16,11 +16,11 @@ Personal Pi customizations in one package, with separate feature modules.
 | `src/settings/interface.ts` | Existing interface settings and settings command |
 | `vendor/` | Attributed third-party helpers and licenses |
 
-Feature modules retain their own state and shutdown cleanup. Questions are not part of worker orchestration. This first migration preserves the existing settings files and commands rather than combining their storage or redesigning behavior.
+Feature modules retain their own state and shutdown cleanup. Questions are not part of worker orchestration. Settings files remain separate; the interface settings command is now `/dankhole`.
 
 - Worker settings: `~/.pi/agent/subagents.json`, with project overrides in `.pi/subagents.json`.
 - Interface settings: `~/.pi/agent/compact-tools.json`.
-- Commands: `/agents`, `/compact-tools`, `/latest-input`, `/q`, and `/questions`.
+- Commands: `/agents`, `/dankhole`, `/latest-input`, `/q`, and `/questions`.
 - Quarterdeck's existing worker events and manager-registry lookup remain unchanged.
 - Worktrees and namespaced memory remain supported; profiles, nesting, scheduling, workflows and grouped completion strategies stay removed.
 

@@ -56,7 +56,7 @@ describe("single package composition", () => {
     const extension = await loadPackage();
     expect(extension.resolvedPath).toBe(join(packageRoot, "src/index.ts"));
     expect([...extension.tools.keys()].sort()).toEqual(["Agent", "ask_user", "get_subagent_result", "resolve_question", "steer_subagent"]);
-    expect([...extension.commands.keys()].sort()).toEqual(["agents", "compact-tools", "latest-input", "q", "questions"]);
+    expect([...extension.commands.keys()].sort()).toEqual(["agents", "dankhole", "latest-input", "q", "questions"]);
     expect(extension.toolRenderers).toHaveLength(1);
     const questionRenderers = extension.tools.get("ask_user")!.definition;
     expect(extension.toolRenderers![0]("ask_user", () => questionRenderers)).toBe(questionRenderers);

@@ -59,7 +59,7 @@ export function saveSettings(path: string, settings: Settings, expected: string 
   const temporary = `${path}.${randomUUID()}.tmp`;
   try {
     const current = existsSync(path) ? readFileSync(path, "utf8") : undefined;
-    if (current !== expected) throw new Error("Settings changed in another session; reopen /compact-tools and retry.");
+    if (current !== expected) throw new Error("Settings changed in another session; reopen /dankhole and retry.");
     writeFileSync(temporary, JSON.stringify(settings, null, 2) + "\n", { mode: 0o600 });
     renameSync(temporary, path);
   } finally {
@@ -69,15 +69,15 @@ export function saveSettings(path: string, settings: Settings, expected: string 
 }
 
 export function registerSettings(pi: ExtensionAPI, path: string) {
-  pi.registerCommand("compact-tools", {
-    description: "Configure compact tools, grouping, pinned input, elapsed time, status line, and questions",
+  pi.registerCommand("dankhole", {
+    description: "Configure Pi Dankhole appearance, questions, and keep-awake settings",
     handler: async (_args, ctx) => {
       if (ctx.mode !== "tui") {
-        ctx.ui.notify(`Edit ${path} to configure compact tool rendering.`, "info");
+        ctx.ui.notify(`Edit ${path} to configure Pi Dankhole interface settings.`, "info");
         return;
       }
       if (!ctx.isIdle()) {
-        ctx.ui.notify("Open /compact-tools when the agent is idle.", "warning");
+        ctx.ui.notify("Open /dankhole when the agent is idle.", "warning");
         return;
       }
       try {
@@ -89,7 +89,7 @@ export function registerSettings(pi: ExtensionAPI, path: string) {
         ])].sort();
         await ctx.ui.custom<void>((tui, theme, _keys, done) => {
           const listTheme = getSettingsListTheme();
-          const mainHeading = theme.fg("accent", "Compact tools")
+          const mainHeading = theme.fg("accent", "Pi Dankhole settings")
             + "\nCompact rows: click to expand · streaming thinking stays visible";
           const heading = new Text(mainHeading, 0, 1);
           const items: SettingItem[] = [
@@ -164,7 +164,7 @@ export function registerSettings(pi: ExtensionAPI, path: string) {
         if (ctx.isIdle()) await ctx.reload();
         else ctx.ui.notify("Settings saved. Run /reload when idle to apply them.", "info");
       } catch (error) {
-        ctx.ui.notify(`Compact tools: ${error instanceof Error ? error.message : String(error)}`, "error");
+        ctx.ui.notify(`Pi Dankhole: ${error instanceof Error ? error.message : String(error)}`, "error");
       }
     },
   });
