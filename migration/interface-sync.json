@@ -1,0 +1,198 @@
+{
+  "verifiedAt": "2026-10-26T00:39:18.478Z",
+  "source": "/Users/d.cole/Desktop/Projects/compact-tools",
+  "files": [
+    {
+      "source": "README.md",
+      "destination": "docs/interface.md",
+      "sourceSha256": "a4dc7ccec5eb62de88d22126293b4691322a44d6df1cba7e487e37be5c02df01",
+      "destinationSha256": "3fc16bee4defa3d115199b95457c1b1b9a47b4a688bfde876c5295139d632519"
+    },
+    {
+      "source": "assistant-panels.ts",
+      "destination": "src/styling/assistant-panels.ts",
+      "sourceSha256": "ab39e902b880fae15eb691137468fb5ec395341f6684dd0e4dc924e5e581ead9",
+      "destinationSha256": "b0d79a66b274444a7b6588da3f3584e9a0bfa120cffa88f834f378e483c8eb68"
+    },
+    {
+      "source": "grouping.ts",
+      "destination": "src/styling/grouping.ts",
+      "sourceSha256": "d2b6e0f793bccfbd27b2ad8eac80ce119fbe13f1fb8161935a8f1dffb7448ea2",
+      "destinationSha256": "931cc355eff1e395df831579de8ff2c434ed9e9cc73f3ab1d8c3fc9241945aca"
+    },
+    {
+      "source": "index.ts",
+      "destination": "src/styling/index.ts",
+      "sourceSha256": "623e11c9a5ee3d07c094e336dc39ee553e0b215439c2bbb67bd3775de4c49268",
+      "destinationSha256": "236a3d8458de6c36bae368bf1501121bf4839c3abdfaf354ba4e5f8ddd20d8d1"
+    },
+    {
+      "source": "input-bar.ts",
+      "destination": "src/styling/input-bar.ts",
+      "sourceSha256": "c2dacfd6dea6d5d4172cc904eb902fb53ac7efe6640e42f14ee81d57e0754614",
+      "destinationSha256": "0e3f4e52931d5453eb38fc2fc44203cffa519629a8b3c645438c54a8eb31feef"
+    },
+    {
+      "source": "keep-awake.ts",
+      "destination": "src/session/keep-awake.ts",
+      "sourceSha256": "8f00477e9a61588f57d86f799096e82cfead2bd1b395424e9f220e40e632dc2e",
+      "destinationSha256": "36fe61681a0f0b16f96bcc9e78e4561f38233a1a2a26d083024e2fe7706cbd66"
+    },
+    {
+      "source": "palette.ts",
+      "destination": "src/styling/palette.ts",
+      "sourceSha256": "d52a53852f3b97df5ac367654d6092bafd2a0837ac20251b2d7a8505417b8cd3",
+      "destinationSha256": "d52a53852f3b97df5ac367654d6092bafd2a0837ac20251b2d7a8505417b8cd3"
+    },
+    {
+      "source": "pinned-prompt.ts",
+      "destination": "src/styling/pinned-prompt.ts",
+      "sourceSha256": "a9d3bebe952d0cfb2cb03386514b31f7c4ace64ee2a9023f5e31a3d4530c0c5a",
+      "destinationSha256": "ad603f14a1e53306fa07ed426bfdd349cfe5e2990355eed8857c03efab753e43"
+    },
+    {
+      "source": "question-palette.ts",
+      "destination": "src/questions/question-palette.ts",
+      "sourceSha256": "6389fac4ed3239260d8888213ffe767e6d2e282470ae6c3f07845c1f6a3690ac",
+      "destinationSha256": "6389fac4ed3239260d8888213ffe767e6d2e282470ae6c3f07845c1f6a3690ac"
+    },
+    {
+      "source": "question-ui.ts",
+      "destination": "src/questions/question-ui.ts",
+      "sourceSha256": "02f84d1f919d77a672cb90908447a3962d8f62d7f37c3d0321f43685add52307",
+      "destinationSha256": "27827e0d1d77abaafc98d23ae5a831ca35b20743a724f777aa9b477c8a21fbb3"
+    },
+    {
+      "source": "questions.ts",
+      "destination": "src/questions/questions.ts",
+      "sourceSha256": "59b0d6e55f1f21b7044865526e53fed5bd18efbce53d3aecad98d442b498f5a9",
+      "destinationSha256": "e7e115d2ea1d1ee38b278cdd1a2af76907d57b57d609688a348f3fb902dc3b6f"
+    },
+    {
+      "source": "settings.ts",
+      "destination": "src/settings/interface.ts",
+      "sourceSha256": "4b03bf9109a3f4a14ec44c7361b24ff3a17050a1bd07559ed476032cdb723824",
+      "destinationSha256": "1b78948e4d3a8c67b5c82f6d90d2f43707b0b62c8c065b22774cf461a0e10190"
+    },
+    {
+      "source": "status-line.ts",
+      "destination": "src/styling/status-line.ts",
+      "sourceSha256": "383870c366239269f7ec4382ab67565517de7c08d48b5deccd6d5b9be1fa7525",
+      "destinationSha256": "994928f189f99a0f41ea045e11b7370d36c5c32af6fba18675e485bf40331c5f"
+    },
+    {
+      "source": "tests/assistant-panels.test.mjs",
+      "destination": "tests/interface/assistant-panels.test.mjs",
+      "sourceSha256": "9a1fe0518b0b21aa7cf151b213401522ace5b10d63aa36928a40db9993c54c65",
+      "destinationSha256": "d39fb58a0db964f7049c9bfbe451d17a04100e7753463c7acf3fe8b1916c85fe"
+    },
+    {
+      "source": "tests/grouping.test.mjs",
+      "destination": "tests/interface/grouping.test.mjs",
+      "sourceSha256": "f37dff9b7e0b86f8eef5db35474851f0c943c1e006b05ebd16eeadfae18379ae",
+      "destinationSha256": "a8c93dddbc3ae58fd05f37b2f6579de656a4e704f0d5bed0e54f271ac8bae24a"
+    },
+    {
+      "source": "tests/input-bar.test.mjs",
+      "destination": "tests/interface/input-bar.test.mjs",
+      "sourceSha256": "8228708353ce6f82eaadcb7983f93d8a112cbfa4bbf42ebafff1c4c9960efb5f",
+      "destinationSha256": "40347f1f7641b41c9e93c35220c1ec2015092881575a126f86e3270bacbaa87f"
+    },
+    {
+      "source": "tests/keep-awake.test.mjs",
+      "destination": "tests/interface/keep-awake.test.mjs",
+      "sourceSha256": "6090e36a632b894296d5eac9f2ed42ca525dbbd588502de2d3f4f862c2a28342",
+      "destinationSha256": "753a5f67e3ad09b90e5367012613cb970131d9231d5be6420af2de90d04bf5a8"
+    },
+    {
+      "source": "tests/palette.test.mjs",
+      "destination": "tests/interface/palette.test.mjs",
+      "sourceSha256": "e1f53842d160ab18112456cde02c1b86bf8553aecaa0af239a528f0ff4ff3f7d",
+      "destinationSha256": "9718c6369ef6d0e2f09fbaa97b9c151d34c438e09be515fc3934f373819dd74a"
+    },
+    {
+      "source": "tests/pinned-prompt.test.mjs",
+      "destination": "tests/interface/pinned-prompt.test.mjs",
+      "sourceSha256": "b2a007840973faa6fdae89812e8d9014c5647371bcad2dfa0f889f5a875550df",
+      "destinationSha256": "b839c4c59fb17de031e1d8d717342e6fffdd1f1641f328c26e7cc1c51cb9a4b2"
+    },
+    {
+      "source": "tests/questions-ui.test.mjs",
+      "destination": "tests/interface/questions-ui.test.mjs",
+      "sourceSha256": "2e3c526a08b302cbdbae4dcb7e7b3b69b27f62e1d13422823c109032bde2dfd2",
+      "destinationSha256": "f4a55fa887edd573a408c711d476a5367efce211bd213504f369b7c09ada7170"
+    },
+    {
+      "source": "tests/questions.test.mjs",
+      "destination": "tests/interface/questions.test.mjs",
+      "sourceSha256": "c190c56580adec2d052625b4e355e2786c9777b66dccb022320359b0f737eb16",
+      "destinationSha256": "e18eaa45063a64a1752de60dac59bbd746a12c37f97980a816ac53352cfbe72a"
+    },
+    {
+      "source": "tests/rendering.test.mjs",
+      "destination": "tests/interface/rendering.test.mjs",
+      "sourceSha256": "ba1ee9d84418a09766284ced7a2001b4ff9e24fa8da74e4663aa294271eba295",
+      "destinationSha256": "7b35b652aa816d18952f990e9e9b35149c7900368572e8511ec97d7b4225e92d"
+    },
+    {
+      "source": "tests/status-line.test.mjs",
+      "destination": "tests/interface/status-line.test.mjs",
+      "sourceSha256": "83f9dc0fb29a6bfe6931237623f3a5d11dda81c3fbd46b7b2e5f87898a809331",
+      "destinationSha256": "49e35575f6d2a61921e1541dd67db48f380ec7d30f78f9a5618ae59ab22dcfd2"
+    },
+    {
+      "source": "tests/text-panels.test.mjs",
+      "destination": "tests/interface/text-panels.test.mjs",
+      "sourceSha256": "65cbef96b999c23a186f8f93a5173e523f44288bc5e0ee6c5e7e744f482110ef",
+      "destinationSha256": "053acf0f59c3062104dba8a9ba2aee14e8d6a7ef58563a1e1806a2630a92fe16"
+    },
+    {
+      "source": "tests/thinking-collapse.test.mjs",
+      "destination": "tests/interface/thinking-collapse.test.mjs",
+      "sourceSha256": "1e910e628c8a6f2925ad7fd4ee640bfc31c12faac00a2327f0052716e6514eda",
+      "destinationSha256": "8280015558825c05149daa49dea97fba587f200e21b22c800068bd6879acc27d"
+    },
+    {
+      "source": "tests/timer.test.mjs",
+      "destination": "tests/interface/timer.test.mjs",
+      "sourceSha256": "4a87f1d8a3c399153f489544135b13cb2ac7b66684815ef659864d031de0a42a",
+      "destinationSha256": "0d6ac9147df26f1598bd421c7fa39582b89d9436124dbc5ad13b127ac5c4592e"
+    },
+    {
+      "source": "text-panels.ts",
+      "destination": "src/styling/text-panels.ts",
+      "sourceSha256": "32c0baefb865156a31c28cee7a5ed7eb484b6f7874419780f256ac452f68d4df",
+      "destinationSha256": "32c0baefb865156a31c28cee7a5ed7eb484b6f7874419780f256ac452f68d4df"
+    },
+    {
+      "source": "thinking-collapse.ts",
+      "destination": "src/styling/thinking-collapse.ts",
+      "sourceSha256": "7c419e6a6bb889d0da3bfd4a9d6c6a5e8b08a1ad3848d61ef6bf32e3f8fb9455",
+      "destinationSha256": "ff07c6ba7464f50d06d69703f9a5da4702710d3683b2e6b30f23e2e1bf4f1727"
+    },
+    {
+      "source": "timer.ts",
+      "destination": "src/styling/timer.ts",
+      "sourceSha256": "5842cb9bb03b2fb200d22ddf83cf4f3a4cb7adbbcc0111d43c564df45d1ecd0c",
+      "destinationSha256": "5842cb9bb03b2fb200d22ddf83cf4f3a4cb7adbbcc0111d43c564df45d1ecd0c"
+    },
+    {
+      "source": "vendor/powerline/LICENSE",
+      "destination": "vendor/powerline/LICENSE",
+      "sourceSha256": "fb52e52ef3beea4ea3e756d0e6a4bae521bcda0d50b542715a0ab7b6fa2d3fc8",
+      "destinationSha256": "fb52e52ef3beea4ea3e756d0e6a4bae521bcda0d50b542715a0ab7b6fa2d3fc8"
+    },
+    {
+      "source": "vendor/powerline/README.md",
+      "destination": "vendor/powerline/README.md",
+      "sourceSha256": "0f787cfeda0daf1ff594c7e60812a64cd869b5020064d40f839643e68c1dcba4",
+      "destinationSha256": "8c41205c9027fa09c96bb78e85a5160f9dac549cc654819f0244076e6738f3c6"
+    },
+    {
+      "source": "vendor/powerline/footer-helpers.ts",
+      "destination": "vendor/powerline/footer-helpers.ts",
+      "sourceSha256": "25a8d7e86fb70d7f7f22a9b0e6552c382e1bb00b9f3a4eb85d09179a8fe0de89",
+      "destinationSha256": "25a8d7e86fb70d7f7f22a9b0e6552c382e1bb00b9f3a4eb85d09179a8fe0de89"
+    }
+  ]
+}
