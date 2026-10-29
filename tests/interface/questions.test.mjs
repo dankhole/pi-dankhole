@@ -227,8 +227,8 @@ test("ask_user returns pending immediately without auto-open; recommendation onl
   assert.equal(result.details.status, "pending");
   assert.equal(result.terminate, true);
   assert.equal(h.updates.length, 0, "no repeated pending tool update");
-  assert.equal(h.widget().split("\n").length, 3, "one top spacer, the question, and one bottom spacer without a header");
-  assert.doesNotMatch(h.widget(), /Questions ·|\d+ pending/);
+  assert.equal(h.widget().split("\n").length, 4, "header and question sit between the top and bottom spacers");
+  assert.match(h.widget(), /▾ Questions · 1 pending/);
   assert.match(h.widget(), /Q1: Which database/);
   assert.match(h.widget(), /Which database/);
   const pending = h.command("Q1");
@@ -254,10 +254,11 @@ test("ask_user returns pending immediately without auto-open; recommendation onl
   assert.equal(h.statuses.get("other"), "keep me");
 });
 
-test("everyday reminder omits its heading and command hints; /q and /questions remain manual entry points", async () => {
+test("everyday reminder shows its heading without command hints; /q and /questions remain manual entry points", async () => {
   const h = await harness();
   await h.ask();
-  assert.doesNotMatch(h.widget().split("\n")[1], /\/q|▾|▸/);
+  assert.match(h.widget().split("\n")[1], /▾ Questions · 1 pending/);
+  assert.doesNotMatch(h.widget(), /\/q/);
   assert.equal(h.statuses.get(statusKey), undefined, "no redundant pending count in the status bar");
   assert.equal((h.widget().match(/Q\d+:/g) ?? []).length, 1);
   const opened = h.extension.commands.get("questions").handler("Q1", h.ctx);
@@ -269,28 +270,29 @@ test("everyday reminder omits its heading and command hints; /q and /questions r
   assert.equal(h.sent.length, 0);
 });
 
-test("headerless question entries are full-width colored click targets in both themes", async () => {
+test("question headers and entries are full-width amber click targets in both themes", async () => {
   for (const appearance of ["light", "dark"]) {
     themes.initTheme(appearance, false);
     const h = await harness();
     await h.ask({ question: "Readable scope?" });
     const widget = h.widgetComponent();
     for (const width of [1, 24, 100]) {
-      const [, entry] = widget.render(width);
+      const [, header, entry] = widget.render(width);
+      assert.equal(visibleWidth(header), width, "header background reaches the row edge");
       assert.equal(visibleWidth(entry), width, "question background reaches the row edge");
       assert.match(entry, /\x1b\[(?:48;[25];[^m]+|4[0-7]|10[0-7])m/, "explicit theme background");
     }
     const lines = widget.render(100);
-    assert.equal(lines.length, 3);
+    assert.equal(lines.length, 4);
     assert.equal(stripTerminalSequences(lines[0]), " ".repeat(100), "one filled amber row separates the reminder from the transcript");
-    assert.match(stripTerminalSequences(lines[1]), /Q1: Readable scope/);
-    assert.doesNotMatch(lines.map(stripTerminalSequences).join("\n"), /Questions ·|\d+ pending/);
+    assert.match(stripTerminalSequences(lines[1]), /▾ Questions · 1 pending/);
+    assert.match(stripTerminalSequences(lines[2]), /Q1: Readable scope/);
     assert.equal(lines.at(-1), lines[0], "matching amber buffers surround the reminder");
-    assert.equal(widget.handleMouse({ type: "click", button: "left", x: 99, y: 2 }), undefined, "bottom spacing has no stale target from narrower wrapping");
+    assert.equal(widget.handleMouse({ type: "click", button: "left", x: 99, y: 3 }), undefined, "bottom spacing has no stale target from narrower wrapping");
     assert.equal(h.dialogs.length, 0);
-    assert.equal(visibleWidth(lines[1]), 100, "entry padding is colored and clickable");
-    assert.match(lines[1], /\x1b\[(?:48;[25];[^m]+|4[0-7]|10[0-7])m/);
-    widget.handleMouse({ type: "click", button: "left", x: 99, y: 1 });
+    assert.equal(visibleWidth(lines[2]), 100, "entry padding is colored and clickable");
+    assert.match(lines[2], /\x1b\[(?:48;[25];[^m]+|4[0-7]|10[0-7])m/);
+    widget.handleMouse({ type: "click", button: "left", x: 99, y: 2 });
     assert.equal(h.dialogs.length, 1, "far-right padding opens the question");
     h.current().component.handleInput("\x1b");
     await h.emit("session_shutdown");
@@ -658,14 +660,14 @@ test("tiny expanded pending list scrolls bounded rows and selects the actual cli
   const h = await harness({ rows: 8 });
   for (let i = 1; i <= 7; i++) await h.ask({ question: `Question ${i}?` });
   const widget = h.widgetComponent();
-  assert.equal(widget.render(48).length, 4, "tiny viewport keeps one body row and a hint between top and bottom spacing");
+  assert.equal(widget.render(48).length, 4, "tiny viewport keeps the header and one body row between top and bottom spacing");
   assert.match(plain(widget, 48), /Q1: Question 1/);
   for (let i = 0; i < 10; i++) {
     widget.handleMouse({ type: "wheel", x: 2, y: 2, wheelDelta: 1 });
     widget.render(48);
   }
   assert.match(plain(widget, 48), /Q6: Question 6/);
-  widget.handleMouse({ type: "click", button: "left", x: 2, y: 1 });
+  widget.handleMouse({ type: "click", button: "left", x: 2, y: 2 });
   assert.match(plain(h.current().component), /Q6/);
   h.current().component.handleInput("\x1b");
   await h.emit("session_shutdown");
@@ -683,13 +685,13 @@ test("expanded list word-wraps complete questions and every continuation opens i
   const painted = widget.render(40);
   if (process.env.QUESTION_LIST_SAMPLE) writeFileSync(process.env.QUESTION_LIST_SAMPLE, painted.join("\n") + "\n");
   const lines = painted.map(stripTerminalSequences);
-  assert.equal(lines.slice(1).map(line => line.trim()).filter(Boolean).join(" "),
+  assert.equal(lines.slice(2).map(line => line.trim()).filter(Boolean).join(" "),
     questions.map((question, i) => `Q${i + 1}: ${question}`).join(" "), "word wrapping preserves all question text");
   const second = lines.findIndex(line => /Q2:/.test(line));
   assert.ok(second > 2);
   assert.equal(lines[second - 1].trim(), "", "one blank row separates the questions");
   assert.notEqual(lines[second - 2].trim(), "", "no extra inter-question gaps");
-  for (let y = 1; y < lines.length; y++) {
+  for (let y = 2; y < lines.length; y++) {
     if (!lines[y].trim()) {
       assert.equal(widget.handleMouse({ type: "click", button: "left", x: 39, y }), undefined);
       continue;
@@ -720,18 +722,18 @@ test("every scrolled continuation row keeps its question ID at the smallest list
     const visited = new Set();
     for (let offset = 0; offset < expected.length; offset++) {
       const lines = widget.render(width);
-      assert.equal(lines.length, 4, "tiny list reserves one scrollable content row and a hint within both spacers");
+      assert.equal(lines.length, 4, "tiny list reserves the header and one scrollable content row within both spacers");
       assert.equal(stripTerminalSequences(lines[0]), " ".repeat(width), "one filled top buffer remains");
       assert.equal(lines[3], lines[0], "matching bottom buffer remains inside the same row budget");
       assert.ok(lines[0].includes(backgroundAnsi(parseColor(themes.theme.appearance === "light" ? "#fff0bf" : "#594515"), themes.theme.getColorMode())), "outer buffers use regular question amber even while scrolling");
       assert.ok(lines.every(line => visibleWidth(line) <= width));
       const row = expected[offset];
       visited.add(offset);
-      assert.equal(stripTerminalSequences(lines[1]).trim(), row.text.trim());
-      const hit = widget.handleMouse({ type: "click", button: "left", x: width - 1, y: 1 });
+      assert.equal(stripTerminalSequences(lines[2]).trim(), row.text.trim());
+      const hit = widget.handleMouse({ type: "click", button: "left", x: width - 1, y: 2 });
       if (row.id === undefined) {
-        assert.equal(stripTerminalSequences(lines[1]), " ".repeat(width), "internal list separation is full-width amber");
-        assert.ok(lines[1].includes(backgroundAnsi(parseColor(themes.theme.appearance === "light" ? "#e6d58c" : "#524013"), themes.theme.getColorMode())));
+        assert.equal(stripTerminalSequences(lines[2]), " ".repeat(width), "internal list separation is full-width amber");
+        assert.ok(lines[2].includes(backgroundAnsi(parseColor(themes.theme.appearance === "light" ? "#e6d58c" : "#524013"), themes.theme.getColorMode())));
         assert.equal(hit, undefined, "separator has no question target");
       } else {
         assert.equal(hit?.handled, true, `width ${width}: continuation row opens its own question`);
@@ -739,10 +741,9 @@ test("every scrolled continuation row keeps its question ID at the smallest list
         h.current().done({ kind: "defer" });
         await new Promise(resolve => setImmediate(resolve));
       }
-      assert.equal(widget.handleMouse({ type: "click", button: "left", x: width - 1, y: 2 }), undefined, "scroll hint is not an answer target");
       assert.equal(widget.handleMouse({ type: "click", button: "left", x: width - 1, y: 3 }), undefined, "bottom spacing is not an answer target");
       assert.equal(widget.handleMouse({ type: "click", button: "left", x: width - 1, y: 4 }), undefined, "rows beyond the bottom spacing are out of bounds");
-      widget.handleMouse({ type: "wheel", x: 0, y: 1, wheelDelta: 1 });
+      widget.handleMouse({ type: "wheel", x: 0, y: 2, wheelDelta: 1 });
     }
     assert.equal(visited.size, expected.length, "every wrapped row remains reachable and keeps its own target");
     assert.equal(h.sent.length, 0);
@@ -831,38 +832,91 @@ test("explicit retry refuses known queued/busy work and reconciles a persisted a
   assert.equal(h.widget(), "");
 });
 
-test("list is always expanded and headerless across refresh; only entries open overlays", async () => {
+test("header collapses to exactly one row and expands without opening an overlay or retaining stale targets", async () => {
   const h = await harness();
   const question = "Approve this exact scope?\nDevelopment only\r\nDo not touch production";
   await h.ask({ question });
   const widget = h.widgetComponent();
-  assert.doesNotMatch(plain(widget), /Questions ·|\d+ pending/);
+  assert.match(plain(widget), /▾ Questions · 1 pending/);
   assert.match(plain(widget), /exact scope\? Development only Do not touch production/);
   assert.equal(h.latest().question, question.replace(/\r\n/g, "\n"));
   assert.equal(widget.handleMouse({ type: "click", button: "left", x: 3, y: 0 }), undefined, "top separation is inert");
+  assert.equal(widget.handleMouse({ type: "click", button: "left", x: 99, y: 1 })?.handled, true, "header padding toggles collapse");
+  assert.equal(widget.handleMouse({ type: "click", button: "left", x: 3, y: 2 }), undefined, "old question targets retire before rendering");
   for (const width of [1, 15, 100]) {
     const lines = widget.render(width);
-    assert.ok(lines.length >= 3);
-    assert.equal(stripTerminalSequences(lines[0]), " ".repeat(width));
-    assert.equal(lines.at(-1), lines[0]);
-    for (const line of lines) assert.ok(visibleWidth(line) <= width);
+    assert.equal(lines.length, 1, "collapsed reminder has no outer buffers or body rows");
+    assert.ok(visibleWidth(lines[0]) <= width);
+    assert.ok(lines[0].includes(backgroundAnsi(parseColor("#594515"), themes.theme.getColorMode())));
+    for (const y of [1, 2, 3]) assert.equal(widget.handleMouse({ type: "click", button: "left", x: 0, y }), undefined);
+    assert.equal(widget.handleMouse({ type: "wheel", x: 0, y: 0, wheelDelta: 1 }), undefined, "collapsed header does not scroll hidden questions");
   }
-  await h.emit("agent_settled");
-  await h.ask({ question: "Another?" });
-  await h.message(assistant("Q3: One prose question?"));
-  await h.emit("session_tree");
-  for (const id of [1, 2, 3]) assert.match(h.widget(), new RegExp(`Q${id}:`));
-  assert.match(h.widget(), /One prose question/);
-  assert.doesNotMatch(h.widget(), /▾|▸|\/q/);
+  assert.equal(plain(widget), "▸ Questions · 1 pending" + " ".repeat(77));
   assert.equal(h.dialogs.length, 0);
-  const refreshed = h.widgetComponent(); refreshed.render(100);
-  assert.equal(refreshed.handleMouse({ type: "click", button: "left", x: 3, y: 1 }).handled, true);
+  assert.equal(widget.handleMouse({ type: "click", button: "right", x: 3, y: 0 }), undefined);
+  assert.equal(widget.handleMouse({ type: "click", button: "left", x: 99, y: 0 })?.handled, true);
+  const expanded = widget.render(100);
+  assert.equal(expanded.length, 4);
+  assert.equal(expanded.at(-1), expanded[0], "expanded reminder restores both amber buffers");
+  assert.match(stripTerminalSequences(expanded[1]), /▾ Questions · 1 pending/);
+  assert.equal(widget.handleMouse({ type: "click", button: "left", x: 99, y: 2 })?.handled, true);
   assert.equal(h.current().customOptions.overlay, true);
   h.current().component.handleInput("\x1b");
   await new Promise(resolve => setImmediate(resolve));
+  assert.equal(h.dialogs.length, 1, "only a question row opens the overlay");
+  assert.equal(h.sent.length, 0);
+});
+
+test("collapsed preference survives question refreshes and empty pending lists; retired widgets cannot toggle or answer", async () => {
+  const h = await harness();
+  await h.ask();
+  const stale = h.widgetComponent(); stale.render(100);
+  stale.handleMouse({ type: "click", button: "left", x: 3, y: 1 });
+  assert.match(plain(stale), /▸ Questions · 1 pending/);
+  await h.emit("agent_settled");
+  assert.equal(h.widget().split("\n").length, 1);
+  await h.ask({ question: "Another?" });
+  await h.message(assistant("Q3: One prose question?"));
+  assert.equal(h.widget().trim(), "▸ Questions · 3 pending");
+  assert.equal(stale.handleMouse({ type: "click", button: "left", x: 3, y: 0 }), undefined, "retired collapsed header cannot change live preference");
+  assert.deepEqual(stale.render(100), []);
+  const collapsed = h.widgetComponent(); collapsed.render(100);
+  await h.input("Q2: Not now");
+  assert.equal(h.widget().trim(), "▸ Questions · 2 pending");
+  assert.equal(collapsed.handleMouse({ type: "click", button: "left", x: 3, y: 0 }), undefined);
+  await h.input("Q1: No\nQ3: No");
+  assert.equal(h.widget(), "");
   await h.ask({ question: "Fourth question?" });
-  for (const id of [1, 2, 3, 4]) assert.match(h.widget(), new RegExp(`Q${id}:`));
-  assert.equal(h.dialogs.length, 1, "new questions never open automatically");
+  assert.equal(h.widget().trim(), "▸ Questions · 1 pending", "refresh to an empty list does not clear session preference");
+  const fresh = h.widgetComponent(); fresh.render(100);
+  fresh.handleMouse({ type: "click", button: "left", x: 3, y: 0 });
+  assert.match(plain(fresh), /Q4: Fourth question/);
+  await h.ask({ question: "Fifth question?" });
+  assert.match(h.widget(), /▾ Questions · 2 pending/);
+  assert.match(h.widget(), /Q4: Fourth question/);
+  assert.match(h.widget(), /Q5: Fifth question/);
+  assert.equal(h.dialogs.length, 0);
+  assert.equal(h.sent.length, 0);
+});
+
+test("lifecycle clears reset the collapsed preference and retire both header and question targets", async () => {
+  for (const event of ["session_start", "session_tree", "session_shutdown"]) {
+    const h = await harness();
+    await h.ask();
+    const expanded = h.widgetComponent(); expanded.render(80);
+    const collapsed = h.widgetComponent(); collapsed.render(80);
+    collapsed.handleMouse({ type: "click", button: "left", x: 3, y: 1 });
+    collapsed.render(80);
+    await h.emit(event);
+    for (const [widget, y] of [[expanded, 1], [expanded, 2], [collapsed, 0]]) {
+      assert.equal(widget.handleMouse({ type: "click", button: "left", x: 3, y }), undefined);
+      assert.deepEqual(widget.render(80), []);
+    }
+    if (event === "session_shutdown") { assert.equal(h.widget(), ""); await h.emit("session_start"); }
+    assert.match(h.widget(), /▾ Questions · 1 pending/);
+    assert.match(h.widget(), /Q1: Proceed/);
+    assert.equal(h.dialogs.length, 0);
+  }
 });
 
 test("Questions widget has regular amber outer buffers and a darker inter-question gap, without residual empty padding", async () => {
@@ -876,26 +930,34 @@ test("Questions widget has regular amber outer buffers and a darker inter-questi
     const background = line => line.match(/\x1b\[48;[^m]+m/)?.[0];
     const bufferBg = backgroundAnsi(parseColor(appearance === "dark" ? "#594515" : "#fff0bf"), mode);
     const separatorBg = backgroundAnsi(parseColor(appearance === "dark" ? "#524013" : "#e6d58c"), mode);
-    assert.equal(lines.length, 5, "one top and one bottom spacer surround separated entries, without a heading");
-    assert.doesNotMatch(lines.map(stripTerminalSequences).join("\n"), /Questions ·|\d+ pending/);
-    for (const y of [0, 2, 4]) {
+    assert.equal(lines.length, 6, "header and separated entries retain one top and one bottom spacer");
+    assert.match(stripTerminalSequences(lines[1]), /▾ Questions · 2 pending/);
+    assert.equal(background(lines[1]), bufferBg, "header shares the question amber surface");
+    for (const y of [0, 3, 5]) {
       assert.equal(stripTerminalSequences(lines[y]), " ".repeat(80), "outer buffers and inter-question gap have full-width amber fill");
-      assert.equal(background(lines[y]), y === 2 ? separatorBg : bufferBg, `${appearance}/${mode}: only the inter-question separator is darker`);
+      assert.equal(background(lines[y]), y === 3 ? separatorBg : bufferBg, `${appearance}/${mode}: only the inter-question separator is darker`);
       assert.equal(widget.handleMouse({ type: "click", button: "left", x: 3, y }), undefined, "padding and separator are not click targets");
     }
-    assert.match(stripTerminalSequences(lines[1]), /Q1: First/);
-    assert.match(stripTerminalSequences(lines[3]), /Q2: Second/);
-    assert.equal(background(lines[1]), bufferBg, "outer buffers match the ordinary question-row fill");
-    assert.equal(background(lines[3]), bufferBg, "question rows share the same amber fill");
+    assert.match(stripTerminalSequences(lines[2]), /Q1: First/);
+    assert.match(stripTerminalSequences(lines[4]), /Q2: Second/);
+    assert.equal(background(lines[2]), bufferBg, "outer buffers match the ordinary question-row fill");
+    assert.equal(background(lines[4]), bufferBg, "question rows share the same amber fill");
+    widget.handleMouse({ type: "click", button: "left", x: 79, y: 1 });
+    const collapsed = widget.render(80);
+    assert.equal(collapsed.length, 1);
+    assert.equal(background(collapsed[0]), bufferBg, "collapsed header retains the question amber surface");
+    assert.match(stripTerminalSequences(collapsed[0]), /▸ Questions · 2 pending/);
+    widget.handleMouse({ type: "click", button: "left", x: 79, y: 0 });
+    widget.render(80);
     assert.equal(lines.at(-1), lines[0]);
     widget.dispose();
   }
   const widget = h.widgetComponent();
   widget.render(80);
-  for (const [x, y] of [[3, 5], [80, 3], [-1, 3], [3, -1]]) {
+  for (const [x, y] of [[3, 6], [80, 4], [-1, 4], [3, -1]]) {
     assert.equal(widget.handleMouse({ type: "click", button: "left", x, y }), undefined, "out-of-bounds positions are inert");
   }
-  widget.handleMouse({ type: "click", button: "left", x: 79, y: 3 });
+  widget.handleMouse({ type: "click", button: "left", x: 79, y: 4 });
   assert.match(plain(h.current().component), /Q2/);
   h.current().done({ kind: "dismiss" });
   await Promise.resolve(); await Promise.resolve();
@@ -931,7 +993,7 @@ test("installed viewport keeps Questions outer spacing and ordinary input intact
       return result;
     };
     assert.match(plain(widget, 48), /Q1: Proceed/);
-    assert.doesNotMatch(plain(widget, 48), /Questions ·|\d+ pending/);
+    assert.match(plain(widget, 48), /▾ Questions · 20 pending/);
     assert.match(frame().lines.map(stripTerminalSequences).join("\n"), /Unsent ordinary draft/);
     assert.equal(h.dialogs.length, 0);
     const beforePaddingClick = widget.render(48);
@@ -972,6 +1034,8 @@ test("stale list callbacks after branch change cannot open a question in the rep
   const stale = h.widgetComponent(); stale.render(80);
   stale.handleMouse({ type: "click", button: "left", x: 2, y: 0 }); stale.render(80);
   h.ctx.sessionManager = SessionManager.inMemory(scratch);
+  assert.equal(stale.handleMouse({ type: "click", button: "left", x: 2, y: 1 }), undefined, "replaced session rejects header clicks before lifecycle restoration");
+  assert.equal(stale.handleMouse({ type: "click", button: "left", x: 2, y: 2 }), undefined, "replaced session rejects question clicks before lifecycle restoration");
   await h.emit("session_start");
   stale.handleMouse({ type: "click", button: "left", x: 2, y: 1 });
   assert.equal(h.dialogs.length, 0);
@@ -1057,7 +1121,7 @@ test("restart restores deferred questions and resumes sequence without automatic
   const next = await resumed.ask({ question: "Next?" });
   assert.equal(next.details.question.id, 2);
   assert.equal(resumed.dialogs.length, 0);
-  assert.equal(resumed.widget().split("\n").length, 5, "restored questions start expanded between both spacers without a header or opening a dialog");
+  assert.equal(resumed.widget().split("\n").length, 6, "restored questions start expanded below the header between both spacers without opening a dialog");
 });
 
 test("tree restoration keeps only branch pending questions but high-water includes abandoned Q5/prose", async () => {
@@ -1250,7 +1314,7 @@ test("fallback captures labeled assistant prose, skips fences/quotes/examples/th
   await h.message({ role: "toolResult", toolName: "bash", content: [{ type: "text", text: "Q101: Tool output?" }], timestamp: Date.now() });
   assert.deepEqual(h.records().map(record => record.id), [3, 4]);
   assert.equal((h.widget().match(/Q\d+:/g) ?? []).length, 2);
-  assert.equal(h.widget().split("\n").length, 5);
+  assert.equal(h.widget().split("\n").length, 6);
   assert.deepEqual(h.latest().options, []);
   assert.equal(h.latest().recommended, undefined);
   const result = await h.ask({ question: "Next?" });
@@ -1445,10 +1509,17 @@ test("question transcript plain modes retain buffer geometry without painting in
         assert.notEqual(call[1].trim(), "", "plain title starts directly after its top buffer");
         assert.notEqual(call.at(-1).trim(), "", "plain title has no bottom buffer");
         assert.doesNotMatch(call.join("\n"), /\x1b\[[0-9;]*m/);
-        const widget = h.widgetComponent().render(width);
+        const component = h.widgetComponent();
+        const widget = component.render(width);
         assert.equal(widget[0], "");
         assert.doesNotMatch(widget.join("\n"), /\x1b\[[0-9;]*m/);
         assert.equal(widget.at(-1), "", "one unpainted bottom reminder spacer remains in plain mode");
+        component.handleMouse({ type: "click", button: "left", x: 0, y: 1 });
+        const collapsed = component.render(width);
+        assert.equal(collapsed.length, 1, "plain collapsed reminder has no spacer rows");
+        assert.doesNotMatch(collapsed[0], /\x1b\[[0-9;]*m/);
+        assert.ok(visibleWidth(collapsed[0]) <= width);
+        component.handleMouse({ type: "click", button: "left", x: 0, y: 0 });
       }
     }
   } finally {
@@ -2214,7 +2285,7 @@ test("native fullscreen hides the entire list when any actual question row is vi
       view.frame();
       assert.equal(view.list().render(42).length === 0, hidden, label);
       assert.equal(view.reminderVisible(), !hidden, `${label}: no residual reminder rows/gap`);
-      assert.doesNotMatch(view.text(), /Questions ·/);
+      assert.equal(/Questions ·/.test(view.text()), !hidden, "header follows automatic reminder visibility");
     }
   };
   assert.ok(first > 0, "pending question follows the call title and its filled buffers");
@@ -2247,6 +2318,40 @@ test("native grouped tool projection preserves question visibility and click ide
   await h.emit("session_shutdown");
 });
 
+test("collapsed reminder still auto-hides with visible questions and reappears as one row without losing preference", async () => {
+  const h = await harness();
+  const view = nativeQuestionView(h, { rows: 18, width: 64 });
+  view.add(await h.ask({ question: "A question whose reminder can collapse?" }));
+  const tail = new Text("tail\n".repeat(40), 0, 0); view.chat.addChild(tail);
+  assert.equal(view.reminderVisible(), true);
+  const widget = view.list();
+  widget.handleMouse({ type: "click", button: "left", x: 63, y: 1 });
+  for (let i = 0; i < 5; i++) {
+    assert.equal(view.reminderVisible(), true);
+    assert.equal(widget.render(64).length, 1);
+    assert.match(view.text(), /▸ Questions · 1 pending/);
+  }
+  view.chat.removeChild(tail);
+  assert.equal(view.reminderVisible(), false, "visible question removes even the collapsed header");
+  assert.deepEqual(widget.render(64), []);
+  for (const y of [0, 1, 2, 3]) assert.equal(widget.handleMouse({ type: "click", button: "left", x: 3, y }), undefined);
+  view.chat.addChild(tail);
+  for (const [width, height] of [[30, 12], [80, 24], [64, 18]]) {
+    view.frame(width, height);
+    assert.equal(view.list().render(width).length, 1);
+    assert.match(view.text(), /▸ Questions · 1 pending/);
+  }
+  widget.handleMouse({ type: "click", button: "left", x: 3, y: 0 });
+  assert.equal(view.reminderVisible(), true);
+  assert.match(plain(widget, 64), /▾ Questions · 1 pending/);
+  assert.match(plain(widget, 64), /Q1: A question/);
+  assert.equal(view.editor.getValue(), "Unsent ordinary draft");
+  assert.equal(view.editor.focused, true);
+  assert.equal(h.dialogs.length, 0);
+  assert.equal(h.sent.length, 0);
+  await h.emit("session_shutdown");
+});
+
 test("native fullscreen resize and follow-end decisions do not feed the reminder height back into visibility", async () => {
   const h = await harness();
   const view = nativeQuestionView(h, { rows: 24, width: 64 });
@@ -2258,21 +2363,21 @@ test("native fullscreen resize and follow-end decisions do not feed the reminder
   const filler = new Text("tail\n".repeat(22), 0, 0); view.chat.addChild(filler);
   for (const [width, height] of [[64, 24], [28, 12], [90, 50], [64, 24]]) {
     const first = view.frame(width, height);
-    assert.doesNotMatch(first.lines.map(stripTerminalSequences).join("\n"), /Questions ·/);
     const expected = view.reminderVisible();
+    assert.equal(/Questions ·/.test(first.lines.map(stripTerminalSequences).join("\n")), expected);
     for (let i = 0; i < 8; i++) assert.equal(view.reminderVisible(), expected);
     assert.equal(view.transcript.isFollowingEnd, true);
     assert.match(view.text(), /Unsent ordinary draft/);
   }
   const visibleList = view.list();
   const visibleRows = visibleList.render(64);
-  assert.equal(visibleRows.length, 3, "offscreen single question reserves exactly its text and both outer spacers");
+  assert.equal(visibleRows.length, 4, "offscreen single question reserves its header, text and both outer spacers");
   assert.equal(visibleRows.at(-1), visibleRows[0]);
-  assert.equal(visibleList.handleMouse({ type: "click", button: "left", x: 3, y: 2 }), undefined, "visible reminder bottom spacer is inert");
+  assert.equal(visibleList.handleMouse({ type: "click", button: "left", x: 3, y: 3 }), undefined, "visible reminder bottom spacer is inert");
   view.chat.removeChild(filler);
   assert.equal(view.reminderVisible(), false, "newly visible question restores full transcript space immediately");
   assert.deepEqual(visibleList.render(64), [], "hiding a previously visible reminder removes both outer spacers");
-  for (const y of [0, 1, 2]) assert.equal(visibleList.handleMouse({ type: "click", button: "left", x: 3, y }), undefined, "hidden reminder clears every old target including its bottom spacer");
+  for (const y of [0, 1, 2, 3]) assert.equal(visibleList.handleMouse({ type: "click", button: "left", x: 3, y }), undefined, "hidden reminder clears every old target including its bottom spacer");
   assert.equal(getScrollViewBox(view.frame(), view.transcript).rect.height, 24 - view.root.entries.at(-1).component.render(64).length);
 });
 

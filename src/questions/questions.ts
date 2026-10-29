@@ -311,6 +311,7 @@ export function registerQuestions(pi: ExtensionAPI, enabled: boolean): void {
   let sessionId: string | undefined;
   let active: { id: number; close: (result: QuestionUIResult) => void } | undefined;
   let retryConfirmation: { id: number } | undefined;
+  let listExpanded = true;
   let listOffset = 0;
   // Native tool components cache their layout. Invalidate their public renderer
   // contexts when status changes; never mutate old results or append UI messages.
@@ -393,10 +394,12 @@ export function registerQuestions(pi: ExtensionAPI, enabled: boolean): void {
             entry.type === "message" && entry.message === message)) return false;
         return openCard(record, sessionId);
       }, () => ctx.ui.theme);
-      const dispose = () => { shouldShow.dispose(); viewportDisposers.delete(dispose); };
+      let disposed = false;
+      const dispose = () => { disposed = true; shouldShow.dispose(); viewportDisposers.delete(dispose); };
       viewportDisposers.add(dispose);
       let lastWidth = 0;
       let lastHeight = 0;
+      let headerRow = -1;
       let targets: (QuestionRecord | undefined)[] = [];
       let maxOffset = 0;
       let wrappedWidth = 0;
@@ -408,10 +411,18 @@ export function registerQuestions(pi: ExtensionAPI, enabled: boolean): void {
           lastWidth = width;
           targets = [];
           lastHeight = 0;
-          if (width <= 0 || !shouldShow(width)) return [];
+          headerRow = -1;
+          if (disposed || !sameGeneration(stamp) || publishedPending !== pending || width <= 0 || !shouldShow(width)) return [];
+          const header = questionStyle(theme, truncateToWidth(`${listExpanded ? "▾" : "▸"} Questions · ${pending.length} pending`, width, "", true), "questionText", "question", { bold: true });
+          if (!listExpanded) {
+            headerRow = 0;
+            lastHeight = 1;
+            return [questionPlain() ? stripTerminalSequences(header) : header];
+          }
           const buffer = questionPlain() ? "" : questionPaint(theme, " ".repeat(width), "question");
           const separator = questionPlain() ? "" : questionPaint(theme, " ".repeat(width), "questionSeparator");
-          const lines = [buffer];
+          const lines = [buffer, header];
+          headerRow = 1;
           if (wrappedWidth !== width) {
             wrappedWidth = width;
             body = [];
@@ -443,18 +454,25 @@ export function registerQuestions(pi: ExtensionAPI, enabled: boolean): void {
           return questionPlain() ? lines.map(stripTerminalSequences) : lines;
         },
         handleMouse(event) {
-          if (!sameGeneration(stamp) || event.x < 0 || event.x >= lastWidth || event.y < 0 || event.y >= lastHeight) return;
-          if (event.type === "wheel" && event.wheelDelta) {
+          if (disposed || !sameGeneration(stamp) || publishedPending !== pending || ctx.sessionManager.getSessionId() !== sessionId
+            || event.x < 0 || event.x >= lastWidth || event.y < 0 || event.y >= lastHeight) return;
+          if (listExpanded && event.type === "wheel" && event.wheelDelta) {
             listOffset = Math.max(0, Math.min(maxOffset, listOffset + Math.sign(event.wheelDelta)));
             tui.requestRender();
             return { handled: true, render: true };
           }
           if (event.type !== "click" || event.button !== "left") return;
-          const record = targets[event.y];
-          if (!record) return;
-          // No editor replacement or draft mutation: only an explicit click opens an overlay.
-          void answerQuestion(`Q${record.id}`, ctx).catch(() => ctx.ui.notify(`Q${record.id}: unable to open. Use /q.`, "warning"));
-          return { handled: true, render: true };
+          if (event.y === headerRow) {
+            listExpanded = !listExpanded;
+            // Retire the old geometry immediately, before the requested render runs.
+            targets = [];
+            lastHeight = 0;
+            tui.requestRender();
+            return { handled: true, render: true };
+          }
+          const record = listExpanded ? targets[event.y] : undefined;
+          // No editor replacement or draft mutation: only a live question opens an overlay.
+          if (record && records.get(record.id) === record && openCard(record, sessionId)) return { handled: true, render: true };
         },
       };
     } : undefined, { placement: "aboveEditor" });
@@ -467,6 +485,7 @@ export function registerQuestions(pi: ExtensionAPI, enabled: boolean): void {
     changedQuestions.clear();
     publishedPending = undefined;
     publishedDelivery = undefined;
+    listExpanded = true;
     listOffset = 0;
     active?.close({ kind: "defer" });
     active = undefined;
