@@ -464,6 +464,8 @@ export class AgentManager {
       lifetimeUsage: { ...savedRecord.lifetimeUsage },
       compactionCount: savedRecord.compactionCount,
       outputFile: savedRecord.outputFile,
+      // Consumption belongs to the prior run, not the retained conversation.
+      resultConsumed: false,
       result: undefined,
       error: undefined,
       completedAt: undefined,

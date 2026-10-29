@@ -14,6 +14,7 @@ import { join } from "node:path";
 import type { AgentSession } from "@earendil-works/pi-coding-agent";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AgentManager, type SpawnOptions } from "../../src/workers/agent-manager.js";
+import type { AgentRecord } from "../../src/workers/types.js";
 
 vi.mock("../../src/workers/agent-runner.js", () => ({
   runAgent: vi.fn(),
@@ -263,7 +264,8 @@ describe("AgentManager — ID-based resume after eviction", () => {
   });
 
   it("reopens a persisted session with its stable ID and launch configuration", async () => {
-    manager = new AgentManager();
+    const completed = vi.fn((record: AgentRecord) => record.resultConsumed);
+    manager = new AgentManager(completed);
     const { id, record } = await evictable("audit");
     record.lifetimeUsage = { input: 10, output: 5, cacheWrite: 0, cost: 0.01 };
     record.compactionCount = 2;
@@ -278,8 +280,11 @@ describe("AgentManager — ID-based resume after eviction", () => {
       return { responseText: "continued", session, aborted: false, steered: false };
     });
 
+    completed.mockClear();
     const resumed = await manager.resume(id, "continue");
 
+    // Foreground reopen still suppresses duplicate completion notification.
+    expect(completed).toHaveReturnedWith(true);
     expect(resumed).toBe(archived);
     expect(resumed).toMatchObject({
       id, description: "audit", status: "completed", config: record.config,
@@ -292,6 +297,73 @@ describe("AgentManager — ID-based resume after eviction", () => {
       resumeSessionFile: record.sessionFile,
       config: record.config,
     }));
+  });
+
+  it.each([true, undefined])("starts each archived background run unread after prior consumption %s", async (priorConsumed) => {
+    const completed = vi.fn((record: AgentRecord) => record.resultConsumed);
+    manager = new AgentManager(completed);
+    const { id, record } = await evictable("continued worker");
+    const sessionFile = record.sessionFile!;
+
+    for (let cycle = 0; cycle < 2; cycle++) {
+      const previous = manager.getRecord(id)!;
+      previous.resultConsumed = priorConsumed;
+      previous.completedAt = Date.now() - (TEN_MINUTES + 30_000);
+      await vi.advanceTimersByTimeAsync(TICK);
+      expect(manager.getRecord(id)).toBeUndefined();
+      const archived = manager.getResumableRecord(id)!;
+      expect(archived.resultConsumed).toBe(priorConsumed);
+      completed.mockClear();
+      let finish!: () => void;
+      vi.mocked(runAgent).mockImplementationOnce(async (_ctx, _prompt, options) => {
+        const session = {
+          dispose: vi.fn(), sessionManager: { getSessionFile: () => sessionFile },
+        } as unknown as AgentSession;
+        options.onSessionCreated?.(session);
+        await new Promise<void>(resolve => { finish = resolve; });
+        return { responseText: `continued ${cycle}`, session, aborted: false, steered: false };
+      });
+
+      const reopened = await manager.resume(id, "continue", undefined, { isBackground: true });
+
+      expect(reopened).toBe(archived);
+      expect(reopened).toMatchObject({ id, status: "running", resultConsumed: false });
+      finish();
+      await reopened!.promise;
+      expect(reopened).toMatchObject({ status: "completed", result: `continued ${cycle}`, resultConsumed: false });
+      expect(completed).toHaveBeenCalledOnce();
+      expect(completed).toHaveReturnedWith(false);
+    }
+  });
+
+  it("keeps a consumed archived reopen unread while queued and after the pool drains", async () => {
+    const completed = vi.fn((record: AgentRecord) => record.resultConsumed);
+    manager = new AgentManager(completed, 1);
+    const { id, record } = await evictable("queued continuation");
+    record.resultConsumed = true;
+    await vi.advanceTimersByTimeAsync(TICK);
+    let finishHolder!: () => void;
+    vi.mocked(runAgent).mockImplementationOnce(async () => {
+      await new Promise<void>(resolve => { finishHolder = resolve; });
+      return { responseText: "holder done", session: { dispose: vi.fn() } as unknown as AgentSession, aborted: false, steered: false };
+    });
+    const holderId = manager.spawn(mockPi, mockCtx, "holder", { description: "holder", isBackground: true });
+    const holder = manager.getRecord(holderId)!;
+    vi.mocked(runAgent).mockClear();
+    completed.mockClear();
+
+    const reopened = await manager.resume(id, "continue", undefined, { isBackground: true });
+
+    expect(reopened).toMatchObject({ id, status: "queued", resultConsumed: false });
+    expect(runAgent).not.toHaveBeenCalled();
+    expect(await manager.resume(id, "duplicate", undefined, { isBackground: true })).toBeUndefined();
+    finishHolder();
+    await holder.promise;
+    await reopened!.promise;
+    expect(runAgent).toHaveBeenCalledOnce();
+    expect(reopened).toMatchObject({ status: "completed", result: "done", resultConsumed: false });
+    expect(completed.mock.calls.map(([record]) => record.id)).toEqual([holderId, id]);
+    expect(completed.mock.results.map(({ value }) => value)).toEqual([undefined, false]);
   });
 
   const launchModel = {
@@ -366,11 +438,14 @@ describe("AgentManager — ID-based resume after eviction", () => {
 
   for (const isBackground of [false, true]) {
     it(`reports a failed archived reopen under the original ID (background: ${isBackground})`, async () => {
-      manager = new AgentManager();
+      const completed = vi.fn((record: AgentRecord) => record.resultConsumed);
+      manager = new AgentManager(completed);
       const { id, record } = await evictable("failed reopen");
+      record.resultConsumed = true;
       record.lifetimeUsage = { input: 10, output: 5, cacheWrite: 0, cost: 0.01 };
       await vi.advanceTimersByTimeAsync(TICK);
       vi.mocked(runAgent).mockRejectedValueOnce(new Error("corrupt persisted session"));
+      completed.mockClear();
 
       const reopened = await manager.resume(id, "continue", undefined, { isBackground });
       await reopened?.promise;
@@ -380,6 +455,9 @@ describe("AgentManager — ID-based resume after eviction", () => {
         id, status: "error", error: "corrupt persisted session", config: record.config,
         lifetimeUsage: { input: 10, output: 5, cacheWrite: 0, cost: 0.01 },
       });
+      expect(completed).toHaveBeenCalledOnce();
+      expect(completed).toHaveReturnedWith(!isBackground);
+      expect(reopened?.resultConsumed).toBe(!isBackground);
       expect(reopened?.result).toBeUndefined();
       expect(reopened?.completedAt).toBeGreaterThan(0);
       expect(manager.listAgents().map(record => record.id)).toEqual([id]);

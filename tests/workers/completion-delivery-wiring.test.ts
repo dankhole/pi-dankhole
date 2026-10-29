@@ -3,9 +3,12 @@
  * held while the parent runs and sent at its turn's end, as in Claude Code, and
  * without sibling joins or delayed idle batching.
  */
+import { writeFileSync } from "node:fs";
+import { join } from "node:path";
 import { fauxAssistantMessage } from "@earendil-works/pi-ai";
-import { createAgentSession, DefaultResourceLoader, type ExtensionContext, getAgentDir, SessionManager, SettingsManager } from "@earendil-works/pi-coding-agent";
+import { type AgentSession, createAgentSession, DefaultResourceLoader, type ExtensionContext, getAgentDir, SessionManager, SettingsManager } from "@earendil-works/pi-coding-agent";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import type { AgentManager } from "../../src/workers/agent-manager.js";
 import type * as AgentRunnerModule from "../../src/workers/agent-runner.js";
 
 vi.mock("../../src/workers/agent-runner.js", async () => {
@@ -49,15 +52,22 @@ async function boot(settings: Record<string, unknown> = {}) {
 }
 
 /** Runs that settle only when `settle(description)` is called. */
-function controllableRuns() {
+function controllableRuns(sessionFile?: string) {
   const finishers = new Map<string, () => void>();
-  vi.mocked(runAgent).mockImplementation((_c: any, prompt: any) =>
-    new Promise<any>(resolve => {
+  vi.mocked(runAgent).mockImplementation((_c, prompt, options) => {
+    const session = {
+      dispose: vi.fn(), messages: [],
+      sessionManager: { getSessionFile: () => sessionFile },
+    } as unknown as AgentSession;
+    // Archived reopen uses runAgent again, with a new session instance, rather
+    // than resumeAgent's live-session path. Capture persistence the same way.
+    if (sessionFile) options.onSessionCreated?.(session);
+    return new Promise(resolve => {
       finishers.set(prompt, () => resolve({
-        responseText: `${prompt} done`, session: { dispose: vi.fn(), messages: [] }, aborted: false, steered: false,
+        responseText: `${prompt} done`, session, aborted: false, steered: false,
       }));
-    }) as any,
-  );
+    });
+  });
   vi.mocked(resumeAgent).mockImplementation((_s: any, prompt: string) =>
     new Promise(resolve => { finishers.set(prompt, () => resolve({ text: `${prompt} done` })); }),
   );
@@ -373,6 +383,127 @@ describe("a completion pending while its agent is resumed", () => {
     turnEnd(b);
     b.parent.running = false;
     b.lifecycle.get("agent_settled")?.({ aborted: false });
+    expect(b.pi.sendMessage).not.toHaveBeenCalled();
+  });
+});
+
+describe("completion delivery after a consumed worker is archived and reopened", () => {
+  async function archivedWorker() {
+    const b = await boot();
+    const sessionFile = join(hermetic!.dir, "worker.jsonl");
+    writeFileSync(sessionFile, "");
+    const runs = controllableRuns(sessionFile);
+    const id = agentIdOf(await spawn(b, b.parentCtx, "alpha"));
+    const manager = (globalThis as unknown as Record<symbol, Pick<AgentManager, "getRecord">>)[MANAGER_KEY];
+    const original = manager.getRecord(id)!;
+    const originalSession = original.session!;
+    runs.settle("alpha");
+    await original.promise;
+    const consumed = await b.tools.get("get_subagent_result").execute(
+      "read-original", { agent_id: id }, undefined, undefined, b.parentCtx,
+    );
+    expect(consumed.content[0].text).toContain("alpha done");
+    expect(original.resultConsumed).toBe(true);
+
+    // Drive the actual minute cleanup interval past the ten-minute cutoff;
+    // neither eviction nor consumption is simulated by changing record fields.
+    await vi.advanceTimersByTimeAsync(11 * 60_000);
+    expect(manager.getRecord(id)).toBeUndefined();
+    expect(originalSession.dispose).toHaveBeenCalledOnce();
+    expect(b.pi.sendMessage).not.toHaveBeenCalled();
+    return { b, runs, id, manager, sessionFile, originalSession };
+  }
+
+  const reopen = (b: BootedPi, parentCtx: ExtensionContext, id: string, background = true) =>
+    b.tools.get("Agent").execute(
+      "call-reopened",
+      { resume: id, prompt: "again", run_in_background: background },
+      undefined, undefined, parentCtx,
+    );
+
+  it.each(["running", "idle"])("delivers the reopened run exactly once when the parent is %s", async parentState => {
+    vi.useFakeTimers();
+    const { b, runs, id, manager, sessionFile, originalSession } = await archivedWorker();
+    b.parent.running = parentState === "running";
+    const resumed = await reopen(b, b.parentCtx, id);
+    expect(agentIdOf(resumed)).toBe(id);
+    expect(manager.getRecord(id)).toMatchObject({ id, toolCallId: "call-reopened", status: "running" });
+    expect(manager.getRecord(id)?.session).toBeDefined();
+    expect(manager.getRecord(id)?.session).not.toBe(originalSession);
+    expect(runAgent).toHaveBeenLastCalledWith(b.parentCtx, "again", expect.objectContaining({
+      resumeSessionFile: sessionFile, agentId: id,
+    }));
+    expect(resumeAgent).not.toHaveBeenCalled();
+
+    runs.settle("again");
+    await manager.getRecord(id)!.promise; // Idle delivery needs no clock advance.
+    if (parentState === "running") {
+      expect(b.pi.sendMessage).not.toHaveBeenCalled();
+      turnEnd(b);
+    }
+    expect(b.pi.sendMessage).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({
+        content: expect.stringContaining("again done"),
+        details: expect.objectContaining({ id, resultPreview: "again done" }),
+      }),
+      { deliverAs: "steer", triggerTurn: true },
+    );
+    expect(sentContents(b)[0]).toContain("<tool-use-id>call-reopened</tool-use-id>");
+    expect(sentContents(b)[0]).not.toContain("<tool-use-id>call-alpha</tool-use-id>");
+    expect(sentContents(b)[0]).not.toContain("alpha done");
+
+    turnEnd(b);
+    b.parent.running = false;
+    b.lifecycle.get("agent_settled")?.({ aborted: false });
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(b.pi.sendMessage).toHaveBeenCalledOnce();
+  });
+
+  it.each(["tool", "RPC"])("suppresses a reopened result consumed through %s before the boundary", async consumer => {
+    vi.useFakeTimers();
+    const { b, runs, id, manager } = await archivedWorker();
+    expect(agentIdOf(await reopen(b, b.parentCtx, id))).toBe(id);
+    runs.settle("again");
+    await manager.getRecord(id)!.promise;
+    expect(manager.getRecord(id)).toMatchObject({ result: "again done", resultConsumed: false });
+    expect(b.pi.sendMessage).not.toHaveBeenCalled();
+
+    if (consumer === "tool") {
+      const result = await b.tools.get("get_subagent_result").execute(
+        "read-reopened", { agent_id: id }, undefined, undefined, b.parentCtx,
+      );
+      expect(result.content[0].text).toContain("again done");
+    } else {
+      const [, consume] = b.pi.events.on.mock.calls.find(([channel]: string[]) => channel === "subagents:rpc:consume");
+      await consume({ requestId: "consume-reopened", agentId: id });
+      expect(b.pi.events.emit).toHaveBeenCalledWith(
+        "subagents:rpc:consume:reply:consume-reopened", expect.objectContaining({ success: true }),
+      );
+    }
+    turnEnd(b);
+    b.parent.running = false;
+    b.lifecycle.get("agent_settled")?.({ aborted: false });
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(b.pi.sendMessage).not.toHaveBeenCalled();
+  });
+
+  it("returns a foreground archived reopen inline without a completion notification", async () => {
+    vi.useFakeTimers();
+    const { b, runs, id, manager, sessionFile } = await archivedWorker();
+    const inline = reopen(b, b.parentCtx, id, false);
+    await vi.advanceTimersByTimeAsync(0);
+    runs.settle("again");
+    const result = await inline;
+    expect(result.content[0].text).toBe("again done");
+    expect(manager.getRecord(id)).toMatchObject({ id, status: "completed", isBackground: false });
+    expect(runAgent).toHaveBeenLastCalledWith(b.parentCtx, "again", expect.objectContaining({
+      resumeSessionFile: sessionFile, agentId: id,
+    }));
+    expect(resumeAgent).not.toHaveBeenCalled();
+    turnEnd(b);
+    b.parent.running = false;
+    b.lifecycle.get("agent_settled")?.({ aborted: false });
+    await vi.advanceTimersByTimeAsync(60_000);
     expect(b.pi.sendMessage).not.toHaveBeenCalled();
   });
 });
