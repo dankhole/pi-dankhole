@@ -279,14 +279,14 @@ test("factory is resource-free; idle startup subscribes without acquiring an ass
   assert.equal(h.listeners(), 0);
 });
 
-test("main work uses only idle-sleep assertion with parent PID, no shell, and no ref", async () => {
+test("main work prevents display and idle system sleep with parent PID, no shell, and no ref", async () => {
   const h = harness();
   await h.start();
   h.idle(false);
   await h.emit("before_agent_start");
   await h.emit("agent_start");
   h.tick();
-  assert.deepEqual(h.calls, [["/usr/bin/caffeinate", ["-i", "-w", "1234"], { stdio: "ignore" }]]);
+  assert.deepEqual(h.calls, [["/usr/bin/caffeinate", ["-di", "-w", "1234"], { stdio: "ignore" }]]);
   assert.equal(h.children[0].unrefs, 1);
   await h.emit("agent_end"); // queued follow-up/retry/compaction can still continue
   await h.emit("agent_before_settle"); // a continuation can be requested here

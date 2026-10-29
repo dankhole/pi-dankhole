@@ -88,9 +88,9 @@ export function registerKeepAwake(pi: ExtensionAPI, enabled: boolean, backend = 
     }
     if (child) return;
     try {
-      // -i only: allow display sleep. -w releases even if Pi is killed without
+      // -di prevents display and idle system sleep. -w releases if Pi is killed without
       // session_shutdown/exit. No shell, detached daemon, or user command.
-      const started = backend.spawn("/usr/bin/caffeinate", ["-i", "-w", String(backend.pid)], { stdio: "ignore" });
+      const started = backend.spawn("/usr/bin/caffeinate", ["-di", "-w", String(backend.pid)], { stdio: "ignore" });
       child = started;
       started.once("error", () => { if (child === started) warn(); });
       started.once("exit", () => { if (child === started) warn(); });
