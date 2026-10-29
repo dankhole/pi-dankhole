@@ -147,6 +147,21 @@ test("actual idle frame has outer whitespace and three native input rows with to
   }
 });
 
+test("model breadcrumb omits the LiteLLM suffix without changing model configuration", async t => {
+  environment(t, { TERM: "xterm-256color", NO_COLOR: undefined, PI_NERD_FONTS: "0" });
+  const f = await fixture(t);
+  for (const suffix of ["LiteLLM", "liteLLM"]) {
+    const name = `Claude Opus 5.5 (${suffix})`;
+    f.ctx.model.name = name;
+    const row = stripVTControlCharacters(f.editor.render(150)[1]);
+    assert.match(row, /^─ Claude Opus 5\.5 high › pi-playground /);
+    assert.doesNotMatch(row, /litellm/i);
+    assert.equal(f.ctx.model.name, name);
+  }
+  f.ctx.model.name = "Other Model (preview)";
+  assert.match(stripVTControlCharacters(f.editor.render(150)[1]), /Other Model \(preview\) high/);
+});
+
 test("typed input has exactly one native left-padding column without adding a blank row", async t => {
   const f = await fixture(t);
   const editor = f.editor;

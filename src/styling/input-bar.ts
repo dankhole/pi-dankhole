@@ -80,7 +80,7 @@ class InputBar extends CustomEditor {
     // native rules and working/overflow indicators retain their mode cues.
     const decorate = (value: string) => paint(theme, "rule", value);
     if (width < 16) return super.renderTopBorder(width, hiddenLineCount);
-    const model = clean(ctx.model?.name || ctx.model?.id || "no-model");
+    const model = clean(ctx.model?.name || ctx.model?.id || "no-model").replace(/\s*\(litellm\)$/i, "");
     const folder = clean(basename(ctx.sessionManager.getCwd()) || ctx.sessionManager.getCwd());
     // Keep native working/overflow rendering in the middle. At narrow widths
     // Pi chooses its spinner/overflow fallback; decorative fields yield first.
