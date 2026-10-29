@@ -1,7 +1,7 @@
 import { Type } from "typebox";
 import { isUnsafeName } from "./memory.js";
 import { BUILTIN_TOOL_NAMES } from "./tool-names.js";
-import type { AgentConfig, IsolationMode, ThinkingLevel } from "./types.js";
+import type { AgentConfig, IsolationMode, McpStartupPolicy, ThinkingLevel } from "./types.js";
 
 const isolationParamShape = {
   isolation: Type.Optional(Type.Union([Type.Literal("off"), Type.Literal("worktree")], {
@@ -22,6 +22,9 @@ export function launchConfigParams() {
     disallowed_tools: Type.Optional(Type.Array(Type.String())),
     extensions: Type.Optional(selection()),
     exclude_extensions: Type.Optional(Type.Array(Type.String())),
+    mcp_startup: Type.Optional(Type.Union([Type.Literal("inherit"), Type.Literal("skip-unreachable")], {
+      description: 'Default "inherit". "skip-unreachable" skips builtin:mcp connections, resources and commands only when an explicit ext: tool allowlist excludes that owner; other extensions are unchanged.',
+    })),
     skills: Type.Optional(selection()),
     instructions: Type.Optional(Type.String({ description: "Additional instructions appended after inherited parent system rules." })),
     persist_session: Type.Optional(Type.Boolean()),
@@ -46,6 +49,7 @@ export interface AgentInvocationParams {
   disallowed_tools?: string[];
   extensions?: boolean | string[];
   exclude_extensions?: string[];
+  mcp_startup?: McpStartupPolicy;
   skills?: boolean | string[];
   instructions?: string;
   persist_session?: boolean;
@@ -79,6 +83,9 @@ export function resolveAgentInvocationConfig(params: AgentInvocationParams, opts
   for (const key of ["model", "instructions", "session_dir"] as const) {
     if (params[key] !== undefined && typeof params[key] !== "string") throw new Error(`${key} must be a string`);
   }
+  if (params.mcp_startup !== undefined && params.mcp_startup !== "inherit" && params.mcp_startup !== "skip-unreachable") {
+    throw new Error('mcp_startup must be "inherit" or "skip-unreachable"');
+  }
   if (params.isolation !== undefined && params.isolation !== "off" && params.isolation !== "worktree") throw new Error('isolation must be "off" or "worktree"');
   if (params.thinking !== undefined && !["off", "minimal", "low", "medium", "high", "xhigh", "max"].includes(params.thinking)) {
     throw new Error(`Invalid thinking level: "${params.thinking}"`);
@@ -111,6 +118,7 @@ export function resolveAgentInvocationConfig(params: AgentInvocationParams, opts
     disallowedTools: params.disallowed_tools?.slice(),
     extensions: isolated ? false : Array.isArray(params.extensions) ? params.extensions.slice() : params.extensions ?? true,
     excludeExtensions: isolated ? undefined : params.exclude_extensions?.slice(),
+    mcpStartup: params.mcp_startup ?? "inherit",
     skills: isolated ? false : Array.isArray(params.skills) ? params.skills.slice() : params.skills ?? true,
     instructions: params.instructions,
     persistSession: params.persist_session,
@@ -158,6 +166,7 @@ export function validateAgentConfig(config: AgentConfig): void {
     isolation: config.isolation,
     extensions: config.extensions,
     exclude_extensions: config.excludeExtensions,
+    mcp_startup: config.mcpStartup,
     skills: config.skills,
     disallowed_tools: config.disallowedTools,
     instructions: config.instructions,

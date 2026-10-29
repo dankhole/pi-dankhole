@@ -32,11 +32,23 @@ describe("resolveAgentInvocationConfig", () => {
     expect(result.config.builtinToolNames).toEqual(BUILTIN_TOOL_NAMES);
     expect(result.config.extensions).toBe(true);
     expect(result.config.skills).toBe(true);
+    expect(result.config.mcpStartup).toBe("inherit");
     expect(result.inheritContext).toBe(false);
     expect(result.isolated).toBe(false);
     expect(result.runInBackground).toBe(false);
     expect(resolveAgentInvocationConfig({}, { defaultRunInBackground: true }).runInBackground).toBe(true);
     expect(resolveAgentInvocationConfig({ run_in_background: false }, { defaultRunInBackground: true }).runInBackground).toBe(false);
+  });
+
+  it("retains the explicit MCP startup policy and validates direct and launch values", () => {
+    for (const policy of ["inherit", "skip-unreachable"] as const) {
+      expect(resolveAgentInvocationConfig({ mcp_startup: policy }).config.mcpStartup).toBe(policy);
+      expect(() => validateAgentConfig({ extensions: true, skills: false, mcpStartup: policy })).not.toThrow();
+    }
+    for (const invalid of [true, [], null, "off"]) {
+      expect(() => resolveAgentInvocationConfig({ mcp_startup: invalid as never })).toThrow("mcp_startup");
+      expect(() => validateAgentConfig({ extensions: true, skills: false, mcpStartup: invalid as never })).toThrow("mcp_startup");
+    }
   });
 
   it("keeps an explicit empty built-in scope", () => {
@@ -98,7 +110,7 @@ describe("direct configuration validation", () => {
 describe("resume configuration", () => {
   it("accepts run controls but rejects unsupported launch overrides", () => {
     expect(() => assertSupportedResumeParams({ resume: "id", prompt: "continue", description: "Updated goal", max_turns: 2, run_in_background: false })).not.toThrow();
-    for (const field of ["tools", "model", "instructions", "skills", "extensions", "memory", "isolation"]) {
+    for (const field of ["tools", "model", "instructions", "skills", "extensions", "memory", "isolation", "mcp_startup"]) {
       expect(() => assertSupportedResumeParams({ resume: "id", [field]: true })).toThrow(`Resume cannot override launch configuration: ${field}`);
     }
   });

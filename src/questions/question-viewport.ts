@@ -1,6 +1,6 @@
 import type { Theme } from "@earendil-works/pi-coding-agent";
 import { backgroundAnsi, type Component, foregroundAnsi, getOsc8LinkAtColumn, stripTerminalSequences, type TUI, visibleWidth } from "@earendil-works/pi-tui";
-import { isTranscriptRendererSupported, registerTranscriptRenderer, withTranscriptMeasurement } from "../styling/transcript-measurement.ts";
+import { invalidateTranscriptRows, isTranscriptRendererSupported, registerTranscriptRenderer, retainTranscriptFrames, withTranscriptMeasurement } from "../styling/transcript-measurement.ts";
 import { questionPalette, questionPlain } from "./question-palette.ts";
 
 /** Only question renderers owned by this registration can supply these identities. */
@@ -113,6 +113,7 @@ export function questionListVisibility(tui: TUI, pending: readonly PendingIdenti
   theme?: () => Theme) {
   let measuring = false;
   let disposed = false;
+  const releaseFrames = retainTranscriptFrames(tui);
   const bindings = new Map<Component, ProseBinding>();
   const contested = new WeakSet<Component>();
   const removeBinding = (component: Component) => {
@@ -129,6 +130,7 @@ export function questionListVisibility(tui: TUI, pending: readonly PendingIdenti
     }
     binding.unregister();
     bindings.delete(component);
+    invalidateTranscriptRows(tui);
   };
   const clearBindings = () => { for (const component of bindings.keys()) removeBinding(component); };
   const fallback = () => { clearBindings(); return true; };
@@ -180,6 +182,9 @@ export function questionListVisibility(tui: TUI, pending: readonly PendingIdenti
         Object.defineProperty(component, "handleMouse", { configurable: true, writable: true, value: handler });
         Object.defineProperty(component, "render", { configurable: true, writable: true, value: render });
         binding.unregister = registerTranscriptRenderer(component, render);
+        // This preserving decorator was installed after measuring native rows.
+        // The next predicate must see first-frame amber, not captured old paint.
+        invalidateTranscriptRows(tui);
       } catch { removeBinding(component); return false; }
     }
     Object.assign(binding, { message: source.message, lines, width, targets });
@@ -277,5 +282,10 @@ export function questionListVisibility(tui: TUI, pending: readonly PendingIdenti
       measuring = false;
     }
   };
-  return Object.assign(show, { dispose() { disposed = true; clearBindings(); } });
+  return Object.assign(show, { dispose() {
+    if (disposed) return;
+    disposed = true;
+    clearBindings();
+    releaseFrames();
+  } });
 }

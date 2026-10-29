@@ -23,6 +23,8 @@ export type MemoryScope = "user" | "project" | "local";
  */
 export type IsolationMode = "worktree" | "off";
 
+export type McpStartupPolicy = "inherit" | "skip-unreachable";
+
 /** Launch-time worker configuration, retained on its record for resume. */
 export interface AgentConfig {
   builtinToolNames?: string[];
@@ -36,6 +38,8 @@ export interface AgentConfig {
   /** Extension-name denylist applied after the `extensions:` include set. Exclude wins.
    * Plain canonical names only (case-insensitive); no paths, no wildcard. */
   excludeExtensions?: string[];
+  /** Default inherit. Opt-in skips builtin:mcp only when an ext: allowlist excludes its owner. */
+  mcpStartup?: McpStartupPolicy;
   /** true = inherit all, string[] = only listed, false = none */
   skills: true | string[] | false;
   model?: string;

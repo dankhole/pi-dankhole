@@ -46,6 +46,7 @@ Descriptions need not be unique. There are no types, profile names, aliases, `(t
 | `disallowed_tools` | Tool-name denylist |
 | `extensions` | `true` to inherit, `false` for none, or a list of extension names/paths |
 | `exclude_extensions` | Extension-name denylist; exclusion wins |
+| `mcp_startup` | `"inherit"` (default), or `"skip-unreachable"` to omit built-in MCP startup when an explicit `ext:` tool allowlist excludes its owner |
 | `skills` | `true` to inherit, `false` for none, or named skills to preload |
 | `isolated` | Disable extensions and skills; not a filesystem sandbox |
 | `inherit_context` | Include the parent conversation; default false |
@@ -74,14 +75,17 @@ Stopped, failed and turn-limited work is distinguished from normal completion; a
 
 ## UI
 
-- **Completion cards:** each finished run gets a subtly shaded, padded card headed **Subagent completed — task goal** (or its failed/stopped/turn-limit outcome), with **cost · duration · model · thinking** in one right-aligned group (cost remains optional). Narrow terminals wrap that group below the title, still right-aligned. Up to two wrapped lines from the final reply follow. Model/thinking are shown independently of the widget's `showModel` setting; missing metadata is labeled **not recorded**, including on older saved notifications. Transcript paths and tool-use counts are not displayed. Expand for a longer preview or use the conversation viewer/result tool for the full result. New workers are asked to open their final reply with 1–2 short outcome/verification sentences, including unresolved limitations, then supporting details. Task-specific output formats take precedence. The card still displays a bounded excerpt rather than generating a second summary: no extra model call is made, and notification content and transcript recording are unchanged.
+- **Completion cards:** each finished run gets a subtly shaded, padded card headed **Subagent completed — task goal** (or its failed/stopped/turn-limit outcome), with **cost · duration · model · thinking** in one right-aligned group (cost remains optional). Narrow terminals wrap that group below the title, still right-aligned. Up to two wrapped lines from the final reply follow. Model/thinking are shown independently of the widget's `showModel` setting; missing metadata is labeled **not recorded**, including on older saved notifications. Transcript paths and tool-use counts are not displayed. Existing cards follow the live `showCost` setting on their next render; the captured notification text sent to the model is unchanged. Expand for a longer preview or use the conversation viewer/result tool for the full result. New workers are asked to open their final reply with 1–2 short outcome/verification sentences, including unresolved limitations, then supporting details. Task-specific output formats take precedence. The card still displays a bounded excerpt rather than generating a second summary: no extra model call is made, and notification content and transcript recording are unchanged.
 - **Above-editor widget:** live worker goals, activity, model/effort when enabled, turns, token/context usage, optional cost and elapsed time. No tool-use counters. Each worker keeps its live activity line with compact indentation.
 - **FleetView:** navigable `main` and worker list below the editor. At an empty prompt use `↓` or `←` to enter, arrows to select, and Enter to inspect.
 - **Conversation viewer:** live transcript with scrolling, Markdown controls, steering and stopping. Enter opens the steering composer; `x` twice stops the worker. Escape returns to the parent without stopping it. Detailed metrics remain available here.
 - **`/agents`:** worker conversations and settings. No profile creation, type management, scheduler or workflow menus.
+- **`/agents recover`:** inspect captured terminal results and deliberately recover pending or uncertain notifications; see [completion recovery](#completion-recovery).
 - **`/agents diagnostics`:** read-only completion-wait and animation observations. Pending count/age, public parent idle/queued/signal state and the last observed lifecycle help distinguish extension activity from a host spinner. The host's internal busy cause remains unknown. An event-driven pending status appears immediately, with a compaction-specific Escape hint in the TUI. A completion waiting 30 seconds produces a bounded warning, not forced delivery, cancellation or a model call; consumption, delivery and shutdown clear pending state.
 
-After compaction or successful tree navigation, pending completions get an immediate public-idle check, then checks every 500 ms for at most 30 seconds. Empty queues stop timers but retain the original deadline for late arrivals; input, preparation, run starts, shutdown or replacement invalidate it. Every delivery still requires public idle and rejects an active run/signal. Hooks exceeding this finite observation window can leave results pending until another safe boundary. Expiry retains results and diagnostics and never forces the parent idle.
+After compaction, successful tree navigation, or an observed summary-operation abort signal, pending completions get an immediate public-idle check, then checks every 500 ms for at most 30 seconds. Empty queues stop timers but retain the original deadline for late arrivals; input, preparation, run starts, shutdown or replacement invalidate it. Every delivery still requires public idle and rejects an active run/signal. Hooks exceeding this finite observation window can leave results pending until another safe boundary. Expiry retains results and diagnostics and never forces the parent idle.
+
+Summary cancellation is not settlement. Missing tree error/finalizer events and hooks that ignore cancellation remain host limits. `/agents recover check` requests an immediate guarded check without forcing delivery. An aborted parent settlement holds automatic delivery rather than starting another turn; later normal boundaries or deliberate recovery can release queued work.
 
 Worker usage displays round elapsed time to the nearest whole minute (`0m` below 30 seconds, `1m` at 30 seconds, `2m` at 90 seconds), counting up while running. Estimated costs round to the nearest whole dollar with the `~$` marker (`~$0` for positive costs below $0.50, `~$1` at $0.50). Exact zero/unpriced costs remain hidden. These display rules apply across the widget, FleetView, conversation viewer, completion cards and tool summaries; raw usage, costs and timestamps retain their precision.
 
@@ -101,11 +105,36 @@ Only the main agent launches and controls workers. Workers do not receive delega
 
 Extensions can be a substantial part of worker startup: inherited extensions may start their own MCP clients. Select only the extensions a task needs when that matters. This fork makes no measured latency or memory-savings claim.
 
+`mcp_startup: "skip-unreachable"` is an explicit optimization: if a worker's `ext:` tool allowlist excludes `builtin:mcp`, the runner omits that built-in before its factory runs. This also omits its resources and `/mcp` command. `tools: ["read"]` alone does **not** restrict extension tools and therefore does not skip MCP; admitting `ext:builtin:mcp` or one of its tools retains startup. Other extensions, including independent MCP clients, remain unchanged. The default `"inherit"` preserves current startup, and resume retains the original policy. Existing `exclude_extensions: ["builtin:mcp"]` explicitly disables that extension regardless of this policy. Servers are not shared between children or selectively loaded within an admitted MCP extension; see [host boundaries](../pi-host-boundaries.md).
+
 ### Persistence and memory
 
 Persisted child sessions appear beneath their spawning session in Pi's `/resume`. Temporary `.output` transcripts are separate JSON-lines files under the OS temp directory and may disappear after reboot. Neither mechanism is a guarantee that an arbitrary worker ID can be reopened across process restarts.
 
 Memory uses an explicit namespace, not the goal label. Existing memory files are not renamed or deleted. Workers without write capability receive read-only memory instructions; memory access respects tool denylists.
+
+### Completion recovery
+
+New terminal worker results are captured as versioned, parent-session-owned custom entries before completion observers run. Each captured run has a distinct delivery ID, including resumes of the same worker. Send attempts and consumption/dismissal are recorded separately. A successful void `sendMessage()` return is **not** delivery confirmation: matching canonical notification entries supply transcript evidence, including coalesced results.
+
+A throwing idle observation keeps the result pending. A throwing or otherwise unconfirmed send retains an uncertain result instead of dropping or automatically resending it. Synchronous append failures warn and keep in-memory results available; they do not prevent ordinary delivery. Diagnostics tolerate stale public getters and report unknown state rather than throw from a watchdog.
+
+On reload/restart, the execution ledger is read across that parent session, including abandoned branches. Forks/clones do not adopt entries owned by another session. Delivered or consumed runs do not reappear merely because conversation history is rewound. Restoration shows a notice/status only: **no recovered result automatically starts a model turn**, even if it was never attempted.
+
+Commands:
+
+```text
+/agents recover                         # list unresolved delivery IDs and states
+/agents recover inspect <delivery-id>   # inspect one captured terminal result
+/agents recover retry <delivery-id>     # deliberately requeue; safe boundaries still apply
+/agents recover consume <worker-id>     # mark captured runs consumed, without stopping work
+/agents recover dismiss <worker-id>     # dismiss all captured unresolved runs of this worker
+/agents recover check                   # check already-queued work at public idle
+```
+
+An uncertain retry requires a duplicate-risk confirmation; a prior send may still arrive. Session/state are rechecked after confirmation. Dismissal affects captured runs, not future runs or live execution. `get_subagent_result` can retrieve the latest captured terminal result when the live manager no longer has that worker; RPC consumption can acknowledge it too. Full captured results remain retrievable after consumption, but this **does not restore execution, transcripts missing from disk, arbitrary cross-restart resume, or usage accounting**.
+
+Durability is bounded by Pi's session persistence: ephemeral sessions, pre-conversation deferred writes, failed writes, a crash before capture and filesystem/power-loss failures cannot be guaranteed recoverable. Public session-tree evidence is not an independent disk-commit or fsync acknowledgement; it is re-derived after reopen. Legacy `subagents:record` entries lack delivery identity and are reported as unknown rather than automatically replayed. There is no crash-atomic exactly-once delivery promise. If session ownership is unavailable or a terminal snapshot cannot be validated/captured, the extension warns and leaves the live result retrievable; it does not send an untracked notification into an unknown session or claim restart recovery. See [host boundaries](../pi-host-boundaries.md).
 
 ### Worktrees
 

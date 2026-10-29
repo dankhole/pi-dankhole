@@ -179,7 +179,8 @@ describe("completion-card final-row cache", () => {
     const d = details({ others: [details({ id: "second", description: "Check rollback" })] });
     const original = structuredClone(d);
     const theme = darkTheme();
-    const component = new CompletionCards(d, true, theme, true);
+    let showCost = true;
+    const component = new CompletionCards(d, true, theme, () => showCost);
     const rows = component.render(100);
     Object.assign(d, { description: "Changed goal", status: "error", error: "Changed error", resultPreview: "Changed preview", totalCost: 50, durationMs: 600000 });
     Object.assign(d.invocation!, { modelName: "Changed model", thinking: "off" });
@@ -189,11 +190,70 @@ describe("completion-card final-row cache", () => {
     component.invalidate();
     expect(component.render(100)).toEqual(rows);
     expect(component.render(32)).toEqual(new CompletionCards(original, true, theme, true).render(32));
+    showCost = false;
+    expect(component.render(100)).toEqual(new CompletionCards(original, true, theme, false).render(100));
+    showCost = true;
+    expect(component.render(100)).toEqual(rows); // Setting changes never refresh captured data.
     expect(new CompletionCards(d, true, theme, true).render(100)).not.toEqual(rows);
   });
 
-  it("does not expose its cached row array to callers", () => {
-    const component = new CompletionCards(details(), false, darkTheme(), false);
+  it("observes the live cost setting once per render and keeps Markdown intact on cost-only changes", () => {
+    let showCost = false;
+    const getShowCost = vi.fn(() => showCost);
+    const data = details({ totalCost: 0.75, others: [details({ totalCost: 0.75 }), details({ totalCost: 0.75 })] });
+    const original = structuredClone(data);
+    const component = new CompletionCards(data, true, darkTheme(), getShowCost);
+    const invalidate = vi.spyOn(component, "invalidate");
+    const markdownInvalidate = vi.spyOn(Markdown.prototype, "invalidate");
+    expect(getShowCost).not.toHaveBeenCalled();
+    const hidden = component.render(160);
+    expect(getShowCost).toHaveBeenCalledTimes(1);
+    expect(plain(hidden)).not.toContain("~$");
+    const constructed = operations.markdownNew;
+
+    showCost = true;
+    // A getter with side effects would disagree between grouped headers if sampled again.
+    getShowCost.mockImplementationOnce(() => { showCost = false; return true; });
+    const shown = component.render(160);
+    expect(getShowCost).toHaveBeenCalledTimes(2);
+    expect(plain(shown).match(/~\$1/g)).toHaveLength(3);
+    expect(operations.markdownNew).toBe(constructed);
+    expect(invalidate).not.toHaveBeenCalled();
+    expect(markdownInvalidate).not.toHaveBeenCalled();
+
+    expect(component.render(160)).toEqual(hidden);
+    expect(getShowCost).toHaveBeenCalledTimes(3);
+    const warm = { ...operations };
+    expect(component.render(160)).toEqual(hidden);
+    expect(getShowCost).toHaveBeenCalledTimes(4); // Cache hits still observe the setting.
+    expect(operations).toEqual(warm);
+    expect(component.render(0)).toEqual([]);
+    expect(component.render(-1)).toEqual([]);
+    expect(getShowCost).toHaveBeenCalledTimes(4); // Hidden-width probes need no setting.
+    expect(data).toEqual(original);
+  });
+
+  it.each([
+    { cost: undefined, label: undefined }, { cost: 0, label: undefined },
+    { cost: 0.49, label: "~$0" }, { cost: 0.5, label: "~$1" }, { cost: 1.5, label: "~$2" },
+  ])("applies live cost visibility without changing raw cost $cost", ({ cost, label }) => {
+    let showCost = false;
+    const data = details({ totalCost: cost });
+    const original = structuredClone(data);
+    const component = new CompletionCards(data, false, darkTheme(), () => showCost);
+    const hidden = component.render(160);
+    showCost = true;
+    const shown = plain(component.render(160));
+    if (label) expect(shown).toContain(label);
+    else expect(shown).not.toContain("~$");
+    showCost = false;
+    expect(component.render(160)).toEqual(hidden);
+    expect(data).toEqual(original);
+  });
+
+  it("does not expose its cached row array to callers, including after a cost-setting change", () => {
+    let showCost = false;
+    const component = new CompletionCards(details(), false, darkTheme(), () => showCost);
     const cold = component.render(100);
     const expected = [...cold];
     cold[0] = "corrupt cold array";
@@ -202,6 +262,14 @@ describe("completion-card final-row cache", () => {
     const warm = component.render(100);
     expect(warm).toEqual(expected);
     warm.splice(0, warm.length);
+    expect(component.render(100)).toEqual(expected);
+    showCost = true;
+    const shown = component.render(100);
+    const shownExpected = [...shown];
+    expect(plain(shown)).toContain("~$0");
+    shown.fill("corrupt cost-visible rows");
+    expect(component.render(100)).toEqual(shownExpected);
+    showCost = false;
     expect(component.render(100)).toEqual(expected);
   });
 
@@ -225,7 +293,7 @@ describe("completion-card final-row cache", () => {
 });
 
 // Reconciled master coverage: frozen native Markdown arrays, the full theme/width/
-// expansion/cost matrix, and native root invalidation with captured settings.
+// expansion/cost matrix, and native root invalidation with live display settings.
 const matrixDetails = (overrides: Partial<NotificationDetails> = {}): NotificationDetails => ({
   id: "worker-1", description: "Inspect 認証 👩‍💻 e\u0301\x1b[2J", status: "completed", toolUses: 3,
   turnCount: 2, maxTurns: 30, totalTokens: 12345, totalCost: 0.75, durationMs: 65000,
@@ -299,9 +367,11 @@ describe("completion-card render cache", () => {
       observeMarkdown();
       const original = structuredClone(data);
       const theme = getThemeByName(themeName) as Theme;
-      const cards = new CompletionCards(data, expanded, theme, showCost);
-      for (const width of widths) {
-        const expected = new CompletionCards(data, expanded, theme, showCost).render(width);
+      let costVisible = showCost;
+      const cards = new CompletionCards(data, expanded, theme, () => costVisible);
+      for (const width of widths) for (const value of [showCost, !showCost, showCost]) {
+        costVisible = value;
+        const expected = new CompletionCards(data, expanded, theme, value).render(width);
         const cold = cards.render(width);
         expect(cold).toEqual(expected);
         expect(cards.render(width)).toEqual(expected);
@@ -316,14 +386,14 @@ describe("completion-card render cache", () => {
 });
 
 describe("Pi 1.4 custom-message cache lifecycle", () => {
-  it("retains components across renders/resizes and recreates them for expansion, theme and captured settings", () => {
+  it("retains components across renders, resizes and live settings; recreates them for expansion and theme", () => {
     const dark = getThemeByName("dark") as Theme;
     setThemeInstance(dark);
     let showCost = false;
     const created: CompletionCards[] = [];
     const data = matrixDetails();
     const renderer: MessageRenderer = (_message, { expanded }, theme) => {
-      const cards = new CompletionCards(data, expanded, theme, showCost);
+      const cards = new CompletionCards(data, expanded, theme, () => showCost);
       created.push(cards);
       return cards;
     };
@@ -355,10 +425,17 @@ describe("Pi 1.4 custom-message cache lifecycle", () => {
       expect(light).not.toEqual(expanded);
       expect(plain(light)).toEqual(plain(expanded));
 
-      // The existing setter updates widgets/fleet, not historical cards. A
-      // later native rebuild captures the new setting; cache adds no staleness.
+      // A setting change updates retained historical cards on their next render,
+      // with no native invalidation or renderer/component reconstruction.
       showCost = true;
+      const shown = root.render(80);
+      expect(shown).not.toEqual(light);
+      expect(plain(shown)).toContain("~$1");
+      expect(created).toHaveLength(3);
+      showCost = false;
       expect(root.render(80)).toEqual(light);
+      expect(created).toHaveLength(3);
+      showCost = true;
       root.invalidate();
       expect(created).toHaveLength(4);
       expect(plain(root.render(80))).toContain("~$1");

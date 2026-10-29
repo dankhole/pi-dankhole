@@ -9,6 +9,7 @@
  * `get_subagent_result` header with `|` — which is why the cost travels as a
  * number and is formatted at the end, not baked into the token string.
  */
+import { type ExtensionAPI, type ExtensionContext, SessionManager } from "@earendil-works/pi-coding-agent";
 import { stripTerminalSequences } from "@earendil-works/pi-tui";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { getThemeByName } from "../../node_modules/@earendil-works/pi-coding-agent/dist/modes/interactive/theme/theme.js";
@@ -24,6 +25,7 @@ import subagentsExtension from "../../src/workers/index.js";
 import { ctx, flush, type Hermetic, hermeticDir, makePi, textOf } from "./helpers/boot-extension.js";
 
 const COST = 0.0123;
+let parentContext: ExtensionContext | undefined;
 
 /** One foreground run that spends `cost` on a single assistant message. */
 function runSpending(cost: number) {
@@ -37,16 +39,26 @@ const spawn = (tools: Map<string, any>) =>
   tools.get("Agent").execute(
     "tc-1",
     { prompt: "go", description: "spend", run_in_background: false },
-    undefined, undefined, ctx(),
+    undefined, undefined, parentContext,
   );
 
 describe("cost display", () => {
   let hermetic: Hermetic;
+  let activeLifecycle: Map<string, any> | undefined;
 
-  function boot(settings: Record<string, unknown>) {
+  async function boot(settings: Record<string, unknown>) {
     hermetic = hermeticDir({ settings });
     const { pi, tools, lifecycle } = makePi();
+    activeLifecycle = lifecycle;
+    const sessionManager = SessionManager.inMemory(hermetic.dir);
+    pi.appendEntry.mockImplementation((type: string, data: unknown) => { sessionManager.appendCustomEntry(type, data); });
+    pi.sendMessage.mockImplementation((message: Parameters<ExtensionAPI["sendMessage"]>[0]) => {
+      sessionManager.appendCustomMessageEntry(message.customType, message.content, message.display, message.details);
+      queueMicrotask(() => { lifecycle.get("turn_start")?.(); });
+    });
     subagentsExtension(pi);
+    parentContext = ctx({ sessionManager, hasPendingMessages: () => false });
+    await lifecycle.get("session_start")({}, parentContext);
     return { pi, tools, lifecycle };
   }
 
@@ -54,15 +66,17 @@ describe("cost display", () => {
     vi.mocked(runAgent).mockReset();
   });
 
-  afterEach(() => {
+  afterEach(async () => {
+    await activeLifecycle?.get("session_shutdown")?.();
+    activeLifecycle = undefined;
+    parentContext = undefined;
     delete (globalThis as any)[Symbol.for("pi-subagents:manager")];
-
     hermetic?.restore();
   });
 
   describe("the foreground result the orchestrator reads", () => {
     it("names the cost in the stats it already reports", async () => {
-      const { tools } = boot({ showCost: true });
+      const { tools } = await boot({ showCost: true });
       runSpending(COST);
 
       const result = await spawn(tools);
@@ -76,14 +90,14 @@ describe("cost display", () => {
     });
 
     it("says nothing when the setting is off", async () => {
-      const { tools } = boot({ showCost: false });
+      const { tools } = await boot({ showCost: false });
       runSpending(COST);
 
       expect(textOf(await spawn(tools))).not.toContain("$");
     });
 
     it("says nothing for a model with no pricing data", async () => {
-      const { tools } = boot({ showCost: true });
+      const { tools } = await boot({ showCost: true });
       runSpending(0);
 
       const text = textOf(await spawn(tools));
@@ -94,7 +108,7 @@ describe("cost display", () => {
 
   describe("get_subagent_result", () => {
     it("reports the cost as its own labelled field", async () => {
-      const { tools } = boot({ showCost: true });
+      const { tools } = await boot({ showCost: true });
       runSpending(COST);
       const spawned = await spawn(tools);
       await flush();
@@ -109,7 +123,7 @@ describe("cost display", () => {
     });
 
     it("omits the field entirely when unpriced", async () => {
-      const { tools } = boot({ showCost: true });
+      const { tools } = await boot({ showCost: true });
       runSpending(0);
       const spawned = await spawn(tools);
       await flush();
@@ -124,26 +138,23 @@ describe("cost display", () => {
 
   describe("the background completion notification the model reads", () => {
     /**
-     * The <task-notification> text sent into the parent conversation. Held
-     * behind a 200ms nudge debounce (plus batch finalization), so this polls
-     * rather than waiting a fixed beat.
+     * The <task-notification> text sent into the idle parent conversation.
+     * Allow the worker completion's promise chain to finish before inspecting it.
      */
     async function notificationText(pi: any): Promise<string> {
-      for (let i = 0; i < 60 && pi.sendMessage.mock.calls.length === 0; i++) {
-        await new Promise((r) => setTimeout(r, 25));
-      }
-      return pi.sendMessage.mock.calls.at(-1)?.[0]?.content ?? "";
+      await vi.waitFor(() => expect(pi.sendMessage).toHaveBeenCalledOnce());
+      return pi.sendMessage.mock.calls[0][0].content;
     }
 
     const spawnBackground = (tools: Map<string, any>) =>
       tools.get("Agent").execute(
         "tc-1",
         { prompt: "go", description: "spend", run_in_background: true },
-        undefined, undefined, ctx(),
+        undefined, undefined, parentContext,
       );
 
     it("includes the cost in the usage block when enabled", async () => {
-      const { pi, tools } = boot({ showCost: true });
+      const { pi, tools } = await boot({ showCost: true });
       runSpending(COST);
 
       await spawnBackground(tools);
@@ -155,7 +166,7 @@ describe("cost display", () => {
       // A figure the orchestrator was not asked to track is one it may start
       // reporting unprompted, so the setting gates the context too, not just
       // what a human sees.
-      const { pi, tools } = boot({ showCost: false });
+      const { pi, tools } = await boot({ showCost: false });
       runSpending(COST);
 
       await spawnBackground(tools);
@@ -166,7 +177,7 @@ describe("cost display", () => {
     });
 
     it("omits it for a model with no pricing data", async () => {
-      const { pi, tools } = boot({ showCost: true });
+      const { pi, tools } = await boot({ showCost: true });
       runSpending(0);
 
       await spawnBackground(tools);
@@ -176,8 +187,8 @@ describe("cost display", () => {
   });
 
   describe("the Agent tool renderer", () => {
-    it.each([false, true])("rounds display without changing raw details (partial: %s)", (isPartial) => {
-      const { tools } = boot({ showCost: true });
+    it.each([false, true])("rounds display without changing raw details (partial: %s)", async (isPartial) => {
+      const { tools } = await boot({ showCost: true });
       const details = {
         description: "spend", status: isPartial ? "running" : "completed",
         tokens: "1.2k token", toolUses: 1, cost: 0.8534, durationMs: 811_100,
@@ -207,8 +218,8 @@ describe("cost display", () => {
       totalTokens, totalCost, durationMs: 1000, resultPreview: "done",
     });
 
-    it("keeps each card's cost in its own header without a dense batch total", () => {
-      const { pi } = boot({ showCost: true });
+    it("keeps each card's cost in its own header without a dense batch total", async () => {
+      const { pi } = await boot({ showCost: true });
       const out = render(pi, { ...agent("first", 1000, 0.8534), others: [agent("second", 3000, 1.5)] });
 
       expect(out).toContain("~$1");
@@ -216,23 +227,23 @@ describe("cost display", () => {
       expect(out).not.toContain("agents ·");
     });
 
-    it("does not total a single agent — the line above already says it", () => {
-      const { pi } = boot({ showCost: true });
+    it("does not total a single agent — the line above already says it", async () => {
+      const { pi } = await boot({ showCost: true });
       const out = render(pi, agent("only", 1000, 0.8534));
 
       expect(out).toContain("~$1");
       expect(out).not.toContain("1 agents");
     });
 
-    it("shows no total, and no per-agent cost, when unpriced", () => {
-      const { pi } = boot({ showCost: true });
+    it("shows no total, and no per-agent cost, when unpriced", async () => {
+      const { pi } = await boot({ showCost: true });
       const out = render(pi, { ...agent("first", 1000, 0), others: [agent("second", 3000, 0)] });
 
       expect(out).not.toContain("$");
     });
 
-    it("shows nothing when the setting is off", () => {
-      const { pi } = boot({ showCost: false });
+    it("shows nothing when the setting is off", async () => {
+      const { pi } = await boot({ showCost: false });
       const out = render(pi, { ...agent("first", 1000, 0.01), others: [agent("second", 3000, 0.02)] });
 
       expect(out).not.toContain("$");

@@ -14,10 +14,14 @@ import { CompletionCards } from "../../src/workers/ui/completion-card.js";
 
 // Count only the card's work. Pinning legitimately decorates its own row on each
 // frame; native layout also performs unrelated terminal-width operations.
-const counts = vi.hoisted(() => ({ depth: 0, construct: 0, render: 0, markdown: 0, truncate: 0, wrap: 0, decorate: 0 }));
+const counts = vi.hoisted(() => ({ depth: 0, construct: 0, render: 0, markdownNew: 0, markdown: 0, truncate: 0, wrap: 0, decorate: 0 }));
 vi.mock("@earendil-works/pi-tui", async importOriginal => {
   const actual = await importOriginal<typeof import("@earendil-works/pi-tui")>();
   class CountingMarkdown extends actual.Markdown {
+    constructor(...args: ConstructorParameters<typeof actual.Markdown>) {
+      super(...args);
+      counts.markdownNew++;
+    }
     render(width: number): string[] {
       if (counts.depth) counts.markdown++;
       return super.render(width);
@@ -109,7 +113,7 @@ function fixture() {
     text: prompt, displayed: true, id: "user-1", rows: [{ id: "user-1", kind: "UserMessageComponent" }],
   }), notify, settings.assistantPanels);
   let showCost = false;
-  const renderer: MessageRenderer = (message, { expanded }, theme) => new CountingCards(message.details as NotificationDetails, expanded, theme, showCost);
+  const renderer: MessageRenderer = (message, { expanded }, theme) => new CountingCards(message.details as NotificationDetails, expanded, theme, () => showCost);
   const wrappers = Array.from({ length: 17 }, (_, index) => new CustomMessageComponent({
     role: "custom", customType: "subagent-notification", content: "model-readable completion", display: true,
     details: details(index), timestamp: 0,
@@ -161,10 +165,22 @@ describe("completion cards in the real Pi fullscreen layout", () => {
       const initial = wrapper.children.at(-1)!;
       const width = view.transcript.getContentWidth(100);
       expect(plain(initial.render(width))).not.toMatch(/Partial findings|\$/);
+      const markdownNew = counts.markdownNew;
       view.setShowCost(true);
       view.frame();
       expect(wrapper.children.at(-1)).toBe(initial);
-      expect(plain(initial.render(width))).not.toContain("~$0"); // Setting alone does not rebuild.
+      expect(counts.construct).toBe(17);
+      expect(counts.markdownNew).toBe(markdownNew); // Cost-only changes retain Markdown instances.
+      expect(plain(initial.render(width))).toContain("~$0");
+      const costUpdated = expensive();
+      view.frame();
+      expect(expensive()).toEqual(costUpdated);
+      view.setShowCost(false);
+      view.frame();
+      expect(plain(initial.render(width))).not.toContain("~$0");
+      expect(counts.construct).toBe(17);
+      expect(counts.markdownNew).toBe(markdownNew);
+      view.setShowCost(true);
 
       wrapper.setExpanded(true);
       expect(counts.construct).toBe(18);

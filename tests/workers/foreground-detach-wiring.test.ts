@@ -15,6 +15,7 @@
  * through overlay keystrokes; the key-to-action path is pinned in
  * `conversation-viewer.test.ts`.
  */
+import { type ExtensionAPI, type ExtensionContext, SessionManager } from "@earendil-works/pi-coding-agent";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("../../src/workers/agent-runner.js", async () => {
@@ -57,6 +58,7 @@ import { ctx, flush, type Hermetic, hermeticDir, makePi, textOf } from "./helper
 
 let hermetic: Hermetic | undefined;
 let booted: Map<string, any> | undefined;
+let parentContext: ExtensionContext | undefined;
 
 const MANAGER_KEY = Symbol.for("pi-subagents:manager");
 /** The narrow cross-extension façade — `getRecord` is all this file needs. */
@@ -73,17 +75,25 @@ afterEach(async () => {
   await booted?.get("session_shutdown")?.();
   delete (globalThis as any)[MANAGER_KEY];
   booted = undefined;
+  parentContext = undefined;
   hermetic?.restore();
   hermetic = undefined;
 });
 
-function boot(settings: Record<string, unknown> = {}) {
-  hermetic = hermeticDir({
-    settings: { outputTranscript: false, ...settings },
-  });
+async function boot(settings: Record<string, unknown> = {}) {
+  hermetic = hermeticDir({ settings: { outputTranscript: false, ...settings } });
   const b = makePi();
+  const sessionManager = SessionManager.inMemory(hermetic.dir);
+  b.pi.appendEntry.mockImplementation((type: string, data: unknown) => { sessionManager.appendCustomEntry(type, data); });
+  b.pi.sendMessage.mockImplementation((message: Parameters<ExtensionAPI["sendMessage"]>[0]) => {
+    sessionManager.appendCustomMessageEntry(message.customType, message.content, message.display, message.details);
+    // Model the host's next-turn receipt observation, not acknowledgement of a void send.
+    queueMicrotask(() => { b.lifecycle.get("turn_start")?.(); });
+  });
   subagentsExtension(b.pi);
   booted = b.lifecycle;
+  parentContext = ctx({ sessionManager, hasPendingMessages: () => false });
+  await b.lifecycle.get("session_start")({}, parentContext);
   return b;
 }
 
@@ -127,7 +137,7 @@ const runAgentTool = (tools: Map<string, any>, prompt: string, opts: { signal?: 
     },
     opts.signal,
     opts.onUpdate,
-    ctx(),
+    parentContext,
   );
 
 /** Enough of pi's Theme for a real ConversationViewer. */
@@ -156,7 +166,7 @@ describe("Agent tool — foreground run sent to the background", () => {
   it("cleans the 80ms presentation interval and abort listener when the initial UI update throws", async () => {
     vi.useFakeTimers();
     try {
-      const { tools } = boot();
+      const { tools } = await boot();
       const baselineTimers = vi.getTimerCount(); // Manager maintenance survives until shutdown.
       const controller = new AbortController();
       const remove = vi.spyOn(controller.signal, "removeEventListener");
@@ -177,7 +187,7 @@ describe("Agent tool — foreground run sent to the background", () => {
     vi.useFakeTimers();
     try {
       const runs = controllableRuns();
-      const { tools, commands } = boot();
+      const { tools, commands } = await boot();
       const baselineTimers = vi.getTimerCount();
       const onUpdate = vi.fn();
       const diagnosticCtx = ctx();
@@ -211,7 +221,7 @@ describe("Agent tool — foreground run sent to the background", () => {
     vi.useFakeTimers();
     const reject = vi.spyOn(AgentManager.prototype, "spawnAndWait").mockRejectedValueOnce(new Error("startup rejected"));
     try {
-      const { tools, commands } = boot();
+      const { tools, commands } = await boot();
       const baselineTimers = vi.getTimerCount();
       const controller = new AbortController();
       const remove = vi.spyOn(controller.signal, "removeEventListener");
@@ -230,7 +240,7 @@ describe("Agent tool — foreground run sent to the background", () => {
   it("never leaves a presentation timer or listener when cancellation preceded spawn", async () => {
     vi.useFakeTimers();
     try {
-      const { tools, commands } = boot();
+      const { tools, commands } = await boot();
       const baselineTimers = vi.getTimerCount();
       const controller = new AbortController();
       controller.abort();
@@ -254,7 +264,7 @@ describe("Agent tool — foreground run sent to the background", () => {
 
   it("ctrl+b returns every pending call as a background spawn, and each notifies once", async () => {
     const runs = controllableRuns();
-    const { pi, tools, lifecycle } = boot();
+    const { pi, tools, lifecycle } = await boot();
     const { ui, press } = terminalUi();
     await lifecycle.get("tool_execution_start")({}, ctx({ ui }));
 
@@ -299,7 +309,7 @@ describe("Agent tool — foreground run sent to the background", () => {
 
   it("ctrl+b passes through when no foreground call is pending", async () => {
     const runs = controllableRuns();
-    const { tools, lifecycle } = boot();
+    const { tools, lifecycle } = await boot();
     const { ui, press } = terminalUi();
     await lifecycle.get("tool_execution_start")({}, ctx({ ui }));
 
@@ -324,7 +334,7 @@ describe("Agent tool — foreground run sent to the background", () => {
 
   it("the viewer's `b` hands off just that run", async () => {
     const runs = controllableRuns();
-    const { tools } = boot();
+    const { tools } = await boot();
 
     const kept = runAgentTool(tools, "kept job");
     const handed = runAgentTool(tools, "handed job");
@@ -351,7 +361,7 @@ describe("Agent tool — foreground run sent to the background", () => {
 
   it("shows the ctrl+b hint on a running row only once it can be handed off", async () => {
     const runs = controllableRuns();
-    const { tools } = boot();
+    const { tools } = await boot();
     const onUpdate = vi.fn();
 
     const execution = runAgentTool(tools, "long job", { onUpdate });
@@ -367,7 +377,7 @@ describe("Agent tool — foreground run sent to the background", () => {
 
   it("offers no handoff for a background spawn", async () => {
     const runs = controllableRuns();
-    const { tools } = boot();
+    const { tools } = await boot();
     await runAgentTool(tools, "bg job", { background: true });
     await flush();
 
@@ -378,7 +388,7 @@ describe("Agent tool — foreground run sent to the background", () => {
 
   it("keeps the tool call's Esc from reaching the agent afterwards", async () => {
     const runs = controllableRuns();
-    const { tools } = boot();
+    const { tools } = await boot();
     const parent = new AbortController();
 
     const execution = runAgentTool(tools, "long job", { signal: parent.signal });
@@ -395,7 +405,7 @@ describe("Agent tool — foreground run sent to the background", () => {
 
   it("leaves the run blocking and reporting inline when nothing hands it off", async () => {
     const runs = controllableRuns();
-    const { pi, tools } = boot();
+    const { pi, tools } = await boot();
 
     const execution = runAgentTool(tools, "long job");
     await flush();
@@ -417,7 +427,7 @@ describe("Agent tool — foreground run sent to the background", () => {
   });
   it("shows one hint per batch, moving it on when that call is handed off", async () => {
     const runs = controllableRuns();
-    const { tools } = boot();
+    const { tools } = await boot();
     const firstUpdates = vi.fn();
     const secondUpdates = vi.fn();
 
@@ -439,7 +449,7 @@ describe("Agent tool — foreground run sent to the background", () => {
 
   it("stops building tool updates once the call has returned", async () => {
     const runs = controllableRuns();
-    const { tools } = boot();
+    const { tools } = await boot();
     const onUpdate = vi.fn();
 
     const execution = runAgentTool(tools, "long job", { onUpdate });
@@ -458,7 +468,7 @@ describe("Agent tool — foreground run sent to the background", () => {
 
   it("announces a handed-off run as a background agent", async () => {
     const runs = controllableRuns();
-    const { pi, tools, lifecycle } = boot();
+    const { pi, tools, lifecycle } = await boot();
     const { ui, press } = terminalUi();
     await lifecycle.get("tool_execution_start")({}, ctx({ ui }));
 
@@ -477,7 +487,7 @@ describe("Agent tool — foreground run sent to the background", () => {
 
   it("leaves ctrl+b to whatever has focus when it is not the prompt editor", async () => {
     const runs = controllableRuns();
-    const { tools, lifecycle } = boot();
+    const { tools, lifecycle } = await boot();
     const { ui, press } = terminalUi();
     await lifecycle.get("tool_execution_start")({}, ctx({ ui }));
 
@@ -496,7 +506,7 @@ describe("Agent tool — foreground run sent to the background", () => {
 
   it("acts on the ctrl+b press, not its key release", async () => {
     const runs = controllableRuns();
-    const { tools, lifecycle } = boot();
+    const { tools, lifecycle } = await boot();
     const { ui, press } = terminalUi();
     await lifecycle.get("tool_execution_start")({}, ctx({ ui }));
 
@@ -511,9 +521,9 @@ describe("Agent tool — foreground run sent to the background", () => {
 
   it("claims ctrl+b from session start, before any tool has run", async () => {
     const runs = controllableRuns();
-    const { tools, lifecycle } = boot();
+    const { tools, lifecycle } = await boot();
     const { ui, press } = terminalUi();
-    await lifecycle.get("session_start")({}, ctx({ hasUI: true, ui }));
+    await lifecycle.get("session_start")({}, ctx({ hasUI: true, ui, sessionManager: parentContext!.sessionManager }));
 
     const execution = runAgentTool(tools, "long job");
     await flush();
@@ -524,7 +534,7 @@ describe("Agent tool — foreground run sent to the background", () => {
 
   it("wires `b` in the /agents viewer to the same handoff", async () => {
     const runs = controllableRuns();
-    const { tools, commands } = boot();
+    const { tools, commands } = await boot();
 
     const execution = runAgentTool(tools, "long job");
     await flush();

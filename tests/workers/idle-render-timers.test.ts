@@ -1,3 +1,4 @@
+import { type ExtensionAPI, SessionManager } from "@earendil-works/pi-coding-agent";
 import type { Component } from "@earendil-works/pi-tui";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -17,6 +18,7 @@ import { ctx, type Hermetic, hermeticDir, makePi } from "./helpers/boot-extensio
 const drain = async () => { for (let i = 0; i < 30; i++) await Promise.resolve(); };
 let hermetic: Hermetic;
 let boot: ReturnType<typeof makePi>;
+let sessionManager: SessionManager;
 let finish: (() => void) | undefined;
 let overlay: Component | undefined;
 
@@ -28,6 +30,11 @@ beforeEach(() => {
 function setup(widgetMode: WidgetMode = "all") {
   hermetic = hermeticDir({ settings: { outputTranscript: false, rememberAgents: false, widgetMode, fleetView: true } });
   boot = makePi();
+  sessionManager = SessionManager.inMemory(hermetic.dir);
+  boot.pi.appendEntry.mockImplementation((type: string, data: unknown) => { sessionManager.appendCustomEntry(type, data); });
+  boot.pi.sendMessage.mockImplementation((message: Parameters<ExtensionAPI["sendMessage"]>[0]) => {
+    sessionManager.appendCustomMessageEntry(message.customType, message.content, message.display, message.details);
+  });
   vi.mocked(runAgent).mockReset();
   workers(boot.pi);
 }
@@ -62,7 +69,7 @@ describe("idle worker presentation timers (real extension, widget and fleet)", (
         overlay = factory(tui, theme, undefined, resolve);
       });
       let idle = false;
-      const parent = ctx({ hasUI: true, isIdle: () => idle, ui: {
+      const parent = ctx({ sessionManager, hasUI: true, isIdle: () => idle, ui: {
         setWidget, setStatus, custom, notify: vi.fn(), getEditorText: () => "",
         onTerminalInput: (handler: (data: string) => { consume?: boolean } | undefined) => {
           inputs.add(handler);
@@ -140,7 +147,7 @@ it("discovers a delayed background session beside a viewed result with the above
   const custom: FleetUICtx["custom"] = factory => new Promise(resolve => {
     overlay = factory(tui, theme, undefined, resolve);
   });
-  const parent = ctx({ hasUI: true, ui: {
+  const parent = ctx({ sessionManager, hasUI: true, ui: {
     setWidget, custom, setStatus: vi.fn(), notify: vi.fn(), getEditorText: () => "",
     onTerminalInput: (handler: (data: string) => { consume?: boolean } | undefined) => {
       inputs.add(handler); return () => { inputs.delete(handler); };

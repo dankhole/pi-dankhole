@@ -10,10 +10,11 @@ const root = process.env.PI_PACKAGE_DIR ?? resolve(dirname(realpathSync(execFile
 const requirePi = createRequire(join(root, "package.json"));
 const fromPi = path => import(pathToFileURL(join(root, path)).href);
 const tuiPath = dirname(requirePi.resolve("@earendil-works/pi-tui"));
-const { Container, MouseRegion, Text } = await import(pathToFileURL(join(tuiPath, "index.js")).href);
+const { backgroundAnsi, Container, MouseRegion, Text, TuiAltScreen } = await import(pathToFileURL(join(tuiPath, "index.js")).href);
 const { renderLayoutFrame } = await import(pathToFileURL(join(tuiPath, "layout.js")).href);
 const { createChatViewport } = await fromPi("dist/modes/interactive/chat-viewport.js");
 const { UserMessageComponent } = await fromPi("dist/modes/interactive/components/user-message.js");
+const { AssistantMessageComponent } = await fromPi("dist/modes/interactive/components/assistant-message.js");
 const { ToolExecutionComponent } = await fromPi("dist/modes/interactive/components/tool-execution.js");
 const themes = await fromPi("dist/modes/interactive/theme/theme.js");
 themes.initTheme("dark", false);
@@ -23,13 +24,15 @@ const jiti = createJiti(import.meta.url, { alias: {
   "@earendil-works/pi-tui": requirePi.resolve("@earendil-works/pi-tui"),
 } });
 const source = path => jiti.import(resolve(dirname(fileURLToPath(import.meta.url)), "../../src", path));
-const { freshTranscriptChildren, isTranscriptRendererSupported, registerTranscriptRenderer, TranscriptMeasurement, withTranscriptMeasurement } = await source("styling/transcript-measurement.ts");
+const { freshTranscriptChildren, isTranscriptRendererSupported, registerTranscriptRenderer,
+  TranscriptMeasurement, withTranscriptMeasurement } = await source("styling/transcript-measurement.ts");
 const { installPinnedPrompt } = await source("styling/pinned-prompt.ts");
 const { installGrouping } = await source("styling/grouping.ts");
 const { installAssistantPanels } = await source("styling/assistant-panels.ts");
 const { QUESTION_CONTENT, questionListVisibility } = await source("questions/question-viewport.ts");
+const { questionPalette } = await source("questions/question-palette.ts");
 
-function fixture({ pin = true, grouping = true, count = 60, reminder = true, panels = false } = {}) {
+function fixture({ pin = true, grouping = true, count = 60, reminder = true, panels = false, native = false, scrollbar = "hidden" } = {}) {
   const chat = new Container();
   const header = new Container(); header.addChild(new Text("Header", 0, 0));
   const document = new Container();
@@ -59,8 +62,20 @@ function fixture({ pin = true, grouping = true, count = 60, reminder = true, pan
   }
   const widgetsAbove = new Container();
   const viewport = createChatViewport({ document, pendingMessages: new Container(), status: new Container(), widgetsAbove,
-    editor: new Text("Editor", 0, 0), footer: new Text("Footer", 0, 0), scrollbar: "hidden" });
-  const tui = { mode: "fullscreen", children: [document], layoutRoot: viewport.root, terminal: { columns: 90, rows: 20 }, requestRender() {} };
+    editor: new Text("Editor", 0, 0), footer: new Text("Footer", 0, 0), scrollbar });
+  const terminal = { columns: 90, rows: 20, write() {}, hideCursor() {}, showCursor() {} };
+  const tui = native ? new TuiAltScreen(terminal, false)
+    : { mode: "fullscreen", children: [document], terminal, requestRender() {} };
+  tui.requestRender = () => {};
+  if (native) tui.setLayoutRoot(viewport.root);
+  else tui.layoutRoot = viewport.root;
+  if (native) {
+    // Exercise the real synchronous host renderer, without starting a terminal,
+    // timers, OS listeners, provider, or worker runtime.
+    tui.addChild(document);
+    tui.stopped = false;
+    tui.altScreenActive = true;
+  }
   const disposeGrouping = installGrouping(tui, { groupConsecutive: grouping, defaultMode: "compact", tools: {}, backgrounds: "tool" },
     { theme: () => themes.theme, requestRender() {}, warn(message) { assert.fail(message); } });
   const disposePanels = panels ? installAssistantPanels(tui, { theme: () => themes.theme, requestRender() {}, warn: assert.fail }) : () => {};
@@ -68,8 +83,12 @@ function fixture({ pin = true, grouping = true, count = 60, reminder = true, pan
     () => ({ id: "prompt", text: "Selected prompt", displayed: true, rows: [{ id: "prompt", kind: "UserMessageComponent" }] }), assert.fail) : undefined;
   const show = questionListVisibility(tui, [pending]);
   if (reminder) widgetsAbove.addChild({ invalidate() {}, render(width) { return show(width) ? ["Questions reminder"] : []; } });
-  return { tui, chat, cards, pending, document, viewport, show, user, widgetsAbove,
-    frame() { return renderLayoutFrame(viewport.root, tui.terminal.columns, tui.terminal.rows, () => {}); },
+  return { tui, chat, cards, pending, document, viewport, show, user, widgetsAbove, pinned,
+    frame() {
+      if (!native) return renderLayoutFrame(viewport.root, tui.terminal.columns, tui.terminal.rows, () => {});
+      tui.doRender();
+      return tui.currentLayout;
+    },
     reset() { nativeRenders = 0; cardRenders = 0; metadataReads = 0; },
     counts() { return { nativeRenders, cardRenders, metadataReads }; },
     dispose() { show.dispose(); pinned?.dispose(); disposePanels(); disposeGrouping(); for (const dispose of rendererDisposers) dispose(); },
@@ -89,9 +108,145 @@ test("one visibility calculation shares a fresh transcript pass with nested pinn
       const counts = f.counts();
       assert.equal(counts.cardRenders, counts.nativeRenders, "metadata traversal never rerenders a card body");
       assert.ok(counts.nativeRenders <= 4 * 60, "bounded native layout/visibility passes, independent of history size");
-      t.diagnostic(`pin=${pin}, grouping=${grouping}: ${counts.nativeRenders / 60} native/card render passes per fullscreen frame`);
+      t.diagnostic(`unscoped direct layout, pin=${pin}, grouping=${grouping}: ${counts.nativeRenders / 60} native/card passes`);
     } finally { f.dispose(); }
   }
+});
+
+test("real fullscreen pin/question frames use one measured pass plus an uncached native paint", t => {
+  for (const pin of [false, true]) for (const grouping of [false, true]) for (const panels of [false, true]) {
+    const f = fixture({ pin, grouping, panels, native: true });
+    try {
+      const nativeDocumentRender = f.document.render;
+      f.frame();
+      for (const scrolled of [false, true]) {
+        if (scrolled) f.viewport.transcript.scrollToStart();
+        f.reset();
+        f.frame();
+        assert.equal(f.counts().nativeRenders, 2 * 60,
+          "all visibility predicates share one fresh pass, but native paint always renders history independently");
+        assert.equal(f.counts().cardRenders, 2 * 60);
+        assert.equal(f.document.render, nativeDocumentRender, "native paint is never intercepted to serve cached rows");
+      }
+      t.diagnostic(`pin=${pin}, grouping=${grouping}, panels=${panels}: 2 native/card passes per frame`);
+    } finally { f.dispose(); }
+  }
+});
+
+test("real grouped frames retain live expansion and produce the same native output without sharing", () => {
+  const f = fixture({ count: 12, panels: true, native: true });
+  try {
+    f.chat.children = [f.user, ...f.cards.flatMap((card, index) => {
+      const tools = [0, 1].map(part => {
+        const tool = new ToolExecutionComponent("bash", `frame-group-${index}-${part}`, {}, { showImages: false }, undefined, f.tui, process.cwd());
+        tool.updateResult({ content: [{ type: "text", text: "group output\n".repeat(8) }], details: undefined, isError: false });
+        return tool;
+      });
+      return [...tools, card];
+    })];
+    f.frame();
+    const groups = freshTranscriptChildren(f.chat).filter(child => child.constructor.name === "ToolGroup");
+    assert.equal(groups.length, 12);
+    let groupRenders = 0;
+    for (const group of groups) {
+      const render = group.render;
+      group.render = function(width) { groupRenders++; return render.call(this, width); };
+    }
+    f.reset();
+    const optimized = f.frame();
+    assert.equal(groupRenders, 24);
+    assert.equal(f.counts().nativeRenders, 24);
+    const ownedRender = f.tui.doRender;
+    f.tui.doRender = () => TuiAltScreen.prototype.doRender.call(f.tui);
+    try {
+      f.reset();
+      assert.deepEqual(f.frame().lines, optimized.lines, "sharing predicates never changes final native frame output");
+      assert.equal(f.counts().nativeRenders, 48, "the same fixture really takes four passes without the adapter");
+    } finally { f.tui.doRender = ownedRender; }
+    const rows = f.chat.render(90);
+    const footer = rows.findLastIndex(line => /2 tools/.test(line));
+    assert.equal(f.chat.handleMouse({ type: "click", button: "left", x: 3, y: footer, width: 90, height: rows.length })?.handled, true);
+    const lastGroup = groups.at(-1);
+    assert.equal(lastGroup.members.every(member => !member.expanded), true, "opening the group does not expand native details");
+    f.frame();
+    assert.match(f.chat.render(90).join("\n"), /▴.*2 tools/);
+    lastGroup.members[0].setExpanded(true);
+    f.frame();
+    assert.match(f.chat.render(90).join("\n"), /group output/);
+    lastGroup.members[0].updateResult({ content: [{ type: "image", data: "not rendered", mimeType: "image/png" }], details: undefined, isError: false });
+    f.frame();
+    assert.equal(freshTranscriptChildren(f.chat).includes(lastGroup), false, "a late image breaks the live group on the next frame");
+  } finally { f.dispose(); }
+});
+
+test("real pin-only frames retain suffix measurement rather than treating a frame as a nested predicate", () => {
+  for (const grouping of [false, true]) for (const panels of [false, true]) for (const count of [60, 600]) {
+    const f = fixture({ grouping, panels, count, native: true, reminder: false });
+    try {
+      f.frame(); f.reset(); f.frame();
+      assert.equal(f.counts().nativeRenders, count + 6, "native paint plus exactly one viewport-filling suffix");
+      f.reset();
+      for (let index = 0; index < 10; index++) assert.equal(f.viewport.root.entries[0].visible({ width: 90, height: 20 }), true);
+      assert.equal(f.counts().nativeRenders, 60, "standalone suffix calculations are independently fresh");
+    } finally { f.dispose(); }
+  }
+});
+
+test("real frame snapshots refresh streaming, replacements, live bounds and native mouse geometry", () => {
+  for (const scrollbar of ["hidden", "auto", "always"]) {
+    const f = fixture({ count: 3, panels: true, native: true, scrollbar });
+    try {
+      const tail = new Text("tail\n".repeat(40), 0, 0);
+      f.chat.addChild(tail);
+      f.frame();
+      assert.equal(f.show(90), true);
+      tail.setText("short tail");
+      f.frame();
+      assert.equal(f.show(90), false, "same-object mutation refreshes the following frame");
+      f.chat.children[f.chat.children.length - 1] = new Text("replacement\n".repeat(40), 0, 0);
+      f.frame();
+      assert.equal(f.show(90), true);
+      f.widgetsAbove.addChild({ invalidate() {}, render() { f.show(17); return []; } });
+      for (const [columns, rows] of [[90, 20], [24, 12], [50, 40]]) {
+        Object.assign(f.tui.terminal, { columns, rows });
+        f.frame();
+        const contentWidth = f.viewport.transcript.getContentWidth(columns);
+        assert.equal(f.document.mouseLayout.width, contentWidth,
+          "a repeated different-width predicate cannot replace the final native paint's mouse layout");
+        assert.equal(f.user.mouseLayout.width, contentWidth);
+        f.viewport.transcript.scrollToStart();
+        f.frame();
+        assert.equal(f.document.mouseLayout.width, contentWidth);
+        assert.equal(f.viewport.transcript.isFollowingEnd, false);
+      }
+    } finally { f.dispose(); }
+  }
+});
+
+test("first-frame prose binding invalidates measured paint and preserves amber plus native click routing", () => {
+  const f = fixture({ count: 0, panels: true, native: true });
+  f.show.dispose(); f.widgetsAbove.clear();
+  const pending = {};
+  const message = { role: "assistant", content: [{ type: "text", text: "Q1: Is this the current question?" }], stopReason: "stop" };
+  const prose = new AssistantMessageComponent(message);
+  f.chat.addChild(prose);
+  let opened = 0;
+  const show = questionListVisibility(f.tui, [pending], () => [{ message, questions: [{ identity: pending, id: 1,
+    question: "Is this the current question?" }] }], () => { opened++; return true; }, () => themes.theme);
+  f.widgetsAbove.addChild({ invalidate() {}, render(width) { return show(width) ? ["Questions reminder"] : []; } });
+  try {
+    const frame = f.frame();
+    const painted = frame.lines.find(line => line.includes("Q1:"));
+    const amber = backgroundAnsi(questionPalette(themes.theme).question, themes.theme.getColorMode());
+    assert.ok(painted?.includes(amber), "the first actual native frame is amber, not the underlying blue conversation panel");
+    assert.equal(show(90), false);
+    const rows = prose.render(90);
+    const y = rows.findIndex(line => line.includes("Q1:"));
+    assert.equal(prose.handleMouse({ type: "click", button: "left", x: 3, y, width: 90, height: rows.length })?.handled, true);
+    assert.equal(opened, 1);
+    f.frame();
+    assert.ok(f.tui.getScreenLines().find(line => line.includes("Q1:"))?.includes(amber));
+  } finally { show.dispose(); f.dispose(); }
 });
 
 test("pin-only follow-end measures a bounded fresh suffix with owned grouping and panel projections too", () => {

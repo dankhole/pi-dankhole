@@ -1,10 +1,10 @@
 import type { MessageRenderer, Theme } from "@earendil-works/pi-coding-agent";
-import { stripTerminalSequences, visibleWidth } from "@earendil-works/pi-tui";
-import { afterEach, describe, expect, it } from "vitest";
-import { getThemeByName } from "../../node_modules/@earendil-works/pi-coding-agent/dist/modes/interactive/theme/theme.js";
+import { type Component, SettingsList, stripTerminalSequences, visibleWidth } from "@earendil-works/pi-tui";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { getThemeByName, setThemeInstance } from "../../node_modules/@earendil-works/pi-coding-agent/dist/modes/interactive/theme/theme.js";
 import subagentsExtension from "../../src/workers/index.js";
 import type { NotificationDetails } from "../../src/workers/types.js";
-import { type Hermetic, hermeticDir, makePi } from "./helpers/boot-extension.js";
+import { ctx, type Hermetic, hermeticDir, makePi } from "./helpers/boot-extension.js";
 
 const details = (overrides: Partial<NotificationDetails> = {}): NotificationDetails => ({
   id: "worker-1", description: "Audit authentication", status: "completed", toolUses: 347,
@@ -16,15 +16,20 @@ const details = (overrides: Partial<NotificationDetails> = {}): NotificationDeta
 const plain = (lines: string[]) => lines.map(stripTerminalSequences);
 
 describe("registered completion cards", () => {
-  let hermetic: Hermetic | undefined;
-  let shutdown: (() => Promise<void>) | undefined;
+  const registrations: { hermetic: Hermetic; host: ReturnType<typeof makePi> }[] = [];
+  const themeKeys = [Symbol.for("@earendil-works/pi-coding-agent:theme"), Symbol.for("@mariozechner/pi-coding-agent:theme")];
+  let previousThemes: (PropertyDescriptor | undefined)[];
+  beforeEach(() => {
+    previousThemes = themeKeys.map(key => Object.getOwnPropertyDescriptor(globalThis, key));
+    setThemeInstance(getThemeByName("dark") as Theme); // In-memory synthetic host only.
+  });
 
   function boot(showCost = false): MessageRenderer<NotificationDetails> {
-    hermetic = hermeticDir({ settings: { showCost } });
-    const { pi, lifecycle } = makePi();
-    subagentsExtension(pi);
-    shutdown = lifecycle.get("session_shutdown");
-    return pi.registerMessageRenderer.mock.calls.find(([name]: [string]) => name === "subagent-notification")[1];
+    const hermetic = hermeticDir({ settings: { showCost } });
+    const host = makePi();
+    registrations.push({ hermetic, host });
+    subagentsExtension(host.pi);
+    return host.pi.registerMessageRenderer.mock.calls.find(([name]: [string]) => name === "subagent-notification")[1];
   }
 
   function render(renderer: MessageRenderer<NotificationDetails>, d: NotificationDetails, expanded = false, theme = getThemeByName("dark") as Theme) {
@@ -34,10 +39,74 @@ describe("registered completion cards", () => {
   }
 
   afterEach(async () => {
-    await shutdown?.();
-    shutdown = undefined;
-    hermetic?.restore();
-    hermetic = undefined;
+    vi.restoreAllMocks();
+    themeKeys.forEach((key, index) => {
+      const descriptor = previousThemes[index];
+      if (descriptor) Object.defineProperty(globalThis, key, descriptor);
+      else Reflect.deleteProperty(globalThis, key);
+    });
+    while (registrations.length) {
+      const registration = registrations.pop()!;
+      try { await registration.host.lifecycle.get("session_shutdown")?.(); }
+      finally { registration.hermetic.restore(); }
+    }
+  });
+
+  it("updates retained cards only from their owning registrar's live cost setting", async () => {
+    const firstRenderer = boot();
+    const firstHost = registrations.at(-1)!.host;
+    const data = details({ totalCost: 0.75, others: [details({ totalCost: 1.5 })] });
+    const original = structuredClone(data);
+    const first = render(firstRenderer, data);
+    const hidden = first.render(160);
+    expect(plain(hidden).join("\n")).not.toContain("~$");
+
+    const secondRenderer = boot(true);
+    const secondHost = registrations.at(-1)!.host;
+    const second = render(secondRenderer, data, true);
+    expect(plain(second.render(160)).join("\n")).toContain("~$1");
+
+    // Drive the real SettingsList through its public selection/input API, not
+    // a renderer-specific setter. Both registrars stay alive in this test.
+    const handleInput = SettingsList.prototype.handleInput;
+    vi.spyOn(SettingsList.prototype, "handleInput").mockImplementation(function (data) {
+      this.selectItem("showCost");
+      handleInput.call(this, data);
+    });
+    const toggleCost = async (host: ReturnType<typeof makePi>) => {
+      const context = ctx({
+        hasUI: true,
+        ui: {
+          select: vi.fn().mockResolvedValueOnce("Settings").mockResolvedValue(undefined),
+          notify: vi.fn(),
+          custom: vi.fn(async (factory: (tui: object, theme: Theme, keys: object, done: () => void) => Component) => {
+            const component = factory({}, getThemeByName("dark") as Theme, {}, () => {});
+            component.handleInput?.(" ");
+            component.handleInput?.("\x1b");
+          }),
+        },
+      });
+      await host.commands.get("agents").handler("", context);
+      expect(context.ui.custom).toHaveBeenCalledTimes(1);
+    };
+
+    await toggleCost(firstHost);
+    const shown = plain(first.render(160)).join("\n");
+    expect(shown).toContain("~$1");
+    expect(shown).toContain("~$2");
+    expect(plain(second.render(160)).join("\n")).toContain("~$1");
+    await toggleCost(secondHost);
+    expect(plain(second.render(160)).join("\n")).not.toContain("~$");
+    expect(plain(first.render(160)).join("\n")).toBe(shown);
+    await toggleCost(firstHost);
+    expect(first.render(160)).toEqual(hidden);
+    expect(data).toEqual(original);
+    for (const host of [firstHost, secondHost]) {
+      expect(host.pi.registerMessageRenderer).toHaveBeenCalledTimes(1);
+      expect(host.pi.sendMessage).not.toHaveBeenCalled();
+      expect(host.pi.appendEntry).not.toHaveBeenCalled();
+      expect(host.pi.exec).not.toHaveBeenCalled();
+    }
   });
 
   it("uses a shaded padded card, readable Markdown and quiet right-aligned header stats", () => {

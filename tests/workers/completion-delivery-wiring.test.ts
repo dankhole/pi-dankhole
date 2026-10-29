@@ -7,7 +7,7 @@ import { EventEmitter } from "node:events";
 import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { fauxAssistantMessage } from "@earendil-works/pi-ai";
-import { type AgentSession, createAgentSession, DefaultResourceLoader, type ExtensionContext, getAgentDir, SessionManager, SettingsManager } from "@earendil-works/pi-coding-agent";
+import { type AgentSession, createAgentSession, DefaultResourceLoader, type ExtensionAPI, type ExtensionContext, getAgentDir, SessionManager, SettingsManager } from "@earendil-works/pi-coding-agent";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { type KeepAwakeBackend, registerKeepAwake } from "../../src/session/keep-awake.js";
 import type { AgentManager } from "../../src/workers/agent-manager.js";
@@ -19,6 +19,7 @@ vi.mock("../../src/workers/agent-runner.js", async () => {
 });
 
 import { resumeAgent, runAgent } from "../../src/workers/agent-runner.js";
+import { CompletionJournal } from "../../src/workers/completion-journal.js";
 import subagentsExtension from "../../src/workers/index.js";
 import { type BootedPi, ctx, type Hermetic, hermeticDir, makePi } from "./helpers/boot-extension.js";
 import { fauxModelBackend } from "./helpers/faux-model-backend.js";
@@ -44,10 +45,16 @@ afterEach(async () => {
 async function boot(settings: Record<string, unknown> = {}, lowLevelRun = true) {
   hermetic = hermeticDir({ settings: { outputTranscript: false, ...settings } });
   booted = makePi();
+  const sessionManager = SessionManager.inMemory(hermetic.dir);
+  booted.pi.appendEntry.mockImplementation((type: string, data: unknown) => { sessionManager.appendCustomEntry(type, data); });
+  // This fixture models a synchronous canonical transcript write, not a void-send acknowledgement.
+  booted.pi.sendMessage.mockImplementation((message: Parameters<ExtensionAPI["sendMessage"]>[0]) => {
+    sessionManager.appendCustomMessageEntry(message.customType, message.content, message.display, message.details);
+  });
   subagentsExtension(booted.pi);
   const parent = { running: true, lowLevelRun };
   const signal = new AbortController().signal;
-  const parentCtx = ctx({ isIdle: () => !parent.running, hasPendingMessages: () => false });
+  const parentCtx = ctx({ sessionManager, isIdle: () => !parent.running, hasPendingMessages: () => false });
   Object.defineProperty(parentCtx, "signal", { get: () => (parent.running && parent.lowLevelRun ? signal : undefined) });
   await booted.lifecycle.get("session_start")({ type: "session_start" }, parentCtx);
   return { ...booted, parent, parentCtx };
@@ -432,8 +439,9 @@ describe("completion delivery to a running parent", () => {
     await vi.advanceTimersByTimeAsync(30_000);
     expect(b.pi.sendMessage).not.toHaveBeenCalled();
     expect(b.parentCtx.ui.notify).toHaveBeenCalledWith(expect.stringContaining("Last observed lifecycle: agent_end"), "warning");
-    expect(b.parentCtx.ui.notify.mock.calls[0][0]).toContain("Public parent idle=false");
-    expect(b.parentCtx.ui.notify.mock.calls[0][0]).not.toContain("private");
+    const waitWarning = b.parentCtx.ui.notify.mock.calls.find(([text]: [string]) => text.startsWith("Completions pending:"))![0];
+    expect(waitWarning).toContain("Public parent idle=false");
+    expect(waitWarning).not.toContain("private");
     expect(b.parentCtx.ui.setStatus).toHaveBeenCalledWith("subagents:pending-completions", expect.stringContaining("1 worker result waiting"));
 
     await b.commands.get("agents").handler("diagnostics", b.parentCtx);
@@ -458,6 +466,7 @@ describe("completion delivery to a running parent", () => {
     await vi.advanceTimersByTimeAsync(0);
     await old.lifecycle.get("session_shutdown")();
     expect(vi.getTimerCount()).toBe(0);
+    old.parentCtx.ui.notify.mockClear(); // Ignore the earlier, legitimate unverified-durability notice.
 
     const replacement = makePi();
     subagentsExtension(replacement.pi);
@@ -512,7 +521,7 @@ describe("completion delivery to a running parent", () => {
       b.lifecycle.get("agent_settled")?.({ aborted: true });
       keepLifecycle.get("agent_settled")?.({ aborted: true });
       expect(kill).toHaveBeenCalledExactlyOnceWith("SIGKILL");
-      expect(b.pi.sendMessage).toHaveBeenCalledOnce();
+      expect(b.pi.sendMessage).not.toHaveBeenCalled(); // Aborted settlement must not restart the parent.
 
       // The same root manager emits lifecycle ownership for foreground workers,
       // too: parent coverage is not limited to background notifications.
@@ -600,7 +609,7 @@ describe("completion delivery to a running parent", () => {
     expect(b.pi.sendMessage).not.toHaveBeenCalled();
   });
 
-  it("delivers an aborted turn's completion once the run ends, starting a turn, as Claude Code does after Esc", async () => {
+  it("retains an aborted turn's completion until deliberate recovery instead of restarting after Escape", async () => {
     vi.useFakeTimers();
     const runs = controllableRuns();
     const b = await boot();
@@ -614,6 +623,8 @@ describe("completion delivery to a running parent", () => {
 
     b.parent.running = false;
     b.lifecycle.get("agent_settled")?.({ type: "agent_settled", aborted: true });
+    expect(b.pi.sendMessage).not.toHaveBeenCalled();
+    await b.commands.get("agents").handler("recover check", b.parentCtx);
     expect(b.pi.sendMessage).toHaveBeenCalledExactlyOnceWith(
       expect.objectContaining({ content: expect.stringContaining("alpha done") }),
       { deliverAs: "steer", triggerTurn: true },
@@ -679,9 +690,11 @@ describe("completion delivery to a running parent", () => {
       await session.abort();
       await prompt;
       await session.waitForIdle();
-      // Pi 1.4 defers a triggerTurn send from agent_settled and re-enters
-      // sendCustomMessage to start the deferred run. Count delivered messages,
-      // not internal method entries: the notification must still arrive once.
+      expect(send).not.toHaveBeenCalled(); // Escape is not authorization for another model turn.
+      expect(faux.state.callCount).toBe(1);
+      await session.prompt("/agents recover check");
+      await session.waitForIdle();
+      // Deliberate recovery uses the same public-idle check, not a forced boundary.
       expect(send).toHaveBeenCalledWith(
         expect.objectContaining({ content: expect.stringContaining("alpha done") }),
         { deliverAs: "steer", triggerTurn: true },
@@ -731,13 +744,14 @@ describe("completion delivery to a running parent", () => {
     runs.settle("prepared input arrival");
     await vi.advanceTimersByTimeAsync(0);
     const shutDown = event === "session_shutdown";
-    expect(vi.getTimerCount()).toBe(shutDown ? 0 : baselineTimers + 1); // Diagnostic watchdog only, unless disposed.
+    const replaced = event === "session_start";
+    expect(vi.getTimerCount()).toBe(shutDown ? 0 : baselineTimers + (replaced ? 0 : 1)); // No old-session completion enters the replacement.
     b.parent.running = false;
     await vi.advanceTimersByTimeAsync(1_500);
     expect(isIdle.mock.calls.length).toBeLessThanOrEqual(1); // Enqueue only: canceled windows never probe.
     expect(b.pi.sendMessage).not.toHaveBeenCalled();
     turnEnd(b);
-    expect(sentContents(b)).toEqual(shutDown ? [] : [expect.stringContaining("prepared input arrival done")]);
+    expect(sentContents(b)).toEqual(shutDown || replaced ? [] : [expect.stringContaining("prepared input arrival done")]);
     expect(vi.getTimerCount()).toBe(shutDown ? 0 : baselineTimers);
   });
 
@@ -1050,6 +1064,41 @@ describe("a completion pending while its agent is resumed", () => {
     const sent = sentContents(b);
     expect(sent).toEqual([expect.stringContaining("alpha done")]);
     expect(sent[0]).not.toContain("again done");
+  });
+
+  it("restores an earlier pending background run after an archived foreground resume consumes only its own snapshot", async () => {
+    vi.useFakeTimers();
+    const b = await boot();
+    const sessionFile = join(hermetic!.dir, "pending-worker.jsonl");
+    writeFileSync(sessionFile, "");
+    const runs = controllableRuns(sessionFile);
+    const id = agentIdOf(await spawn(b, b.parentCtx, "alpha"));
+    runs.settle("alpha");
+    await vi.advanceTimersByTimeAsync(0);
+    // A live foreground resume has no completion callback; reopening an evicted
+    // worker does, and must not consume earlier snapshots for the same worker ID.
+    await vi.advanceTimersByTimeAsync(11 * 60_000);
+    const manager = Reflect.get(globalThis, MANAGER_KEY) as Pick<AgentManager, "getRecord">;
+    expect(manager.getRecord(id)).toBeUndefined();
+    const inline = resume(b, b.parentCtx, id, "inline resume", false);
+    await vi.advanceTimersByTimeAsync(0);
+    runs.settle("inline resume");
+    const result = await inline;
+    expect(result.content[0].text).toContain("inline resume done");
+    expect(b.pi.sendMessage).not.toHaveBeenCalled();
+
+    // Reopening must not mistake the inline run's consumption for delivery of
+    // the earlier background notification that is still in the live outbox.
+    const sessionManager = b.parentCtx.sessionManager;
+    const restored = new CompletionJournal(sessionManager.getSessionId(), vi.fn());
+    expect(restored.restore(sessionManager.getEntries())).toMatchObject({ pending: 1, consumed: 1, delivered: 0 });
+    const runsAfterRestore = restored.list();
+    expect(runsAfterRestore.map(item => [item.snapshot.record.result, item.state])).toEqual([
+      ["alpha done", "pending"], ["inline resume done", "consumed"],
+    ]);
+    expect(new Set(runsAfterRestore.map(item => item.snapshot.deliveryId)).size).toBe(2);
+    turnEnd(b);
+    expect(sentContents(b)).toEqual([expect.stringContaining("alpha done")]);
   });
 
   it("does not report a run whose result was read before a background resume", async () => {

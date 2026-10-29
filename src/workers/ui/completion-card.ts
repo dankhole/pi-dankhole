@@ -36,11 +36,11 @@ type CardDetails = Pick<NotificationDetails, "status" | "description" | "totalCo
 export class CompletionCards implements Component {
   private readonly cards: { details: CardDetails; markdown: Markdown; createMarkdown: () => Markdown }[];
   // One final layout per instance, never a history of widths or notification identities.
-  private cached?: { width: number; theme: string; lines: string[] };
+  private cached?: { width: number; theme: string; showCost: boolean; lines: string[] };
 
-  // Expansion or host invalidation creates a new instance. showCost is captured here;
-  // changing the setting alone does not rebuild an existing card (preexisting behavior).
-  constructor(details: NotificationDetails, private readonly expanded: boolean, private readonly theme: Theme, private readonly showCost: boolean) {
+  // Notification data stays captured; only presentation reads the owning registrar's
+  // live setting. A boolean also supports callers with a fixed display preference.
+  constructor(details: NotificationDetails, private readonly expanded: boolean, private readonly theme: Theme, private readonly showCost: boolean | (() => boolean)) {
     // Use the renderer's supplied theme, not the process-global Markdown theme.
     const markdownTheme: MarkdownTheme = {
       heading: text => theme.fg("mdHeading", /^#{3,6} $/.test(stripTerminalSequences(text)) ? "" : text),
@@ -87,9 +87,11 @@ export class CompletionCards implements Component {
 
   render(width: number): string[] {
     if (width <= 0) return [];
+    // Observe once, including cache hits, so grouped cards share one setting per render.
+    const showCost = typeof this.showCost === "function" ? this.showCost() : this.showCost;
     const backgroundAnsi = this.theme.getBgAnsi("customMessageBg");
     const theme = JSON.stringify([backgroundAnsi, ...foregrounds.map(color => this.theme.getFgAnsi(color))]);
-    if (this.cached?.theme === theme && this.cached.width === width) return this.cached.lines.slice();
+    if (this.cached?.theme === theme && this.cached.width === width && this.cached.showCost === showCost) return this.cached.lines.slice();
     // Markdown caches themed rows too; changing only the outer cache would retain stale colors.
     if (this.cached && this.cached.theme !== theme) this.invalidate();
     const padding = width >= 40 ? 2 : width >= 12 ? 1 : 0;
@@ -108,7 +110,7 @@ export class CompletionCards implements Component {
       const status = this.theme.bold(this.theme.fg(color, label));
       const goal = this.theme.bold(this.theme.fg("text", safeText(d.description).replace(/\s+/g, " ").trim()));
       const content: string[] = [];
-      const metrics = [this.showCost ? formatCost(d.totalCost ?? 0) : "", d.durationMs > 0 ? formatMs(d.durationMs) : ""].filter(Boolean).join(" · ");
+      const metrics = [showCost ? formatCost(d.totalCost ?? 0) : "", d.durationMs > 0 ? formatMs(d.durationMs) : ""].filter(Boolean).join(" · ");
       const model = d.model;
       const thinking = d.thinking;
       const stats = [
@@ -144,7 +146,7 @@ export class CompletionCards implements Component {
       for (const line of content) lines.push(background(margin + truncateToWidth(line, contentWidth, "…") + margin));
       if (width >= 24) lines.push(background(""));
     }
-    this.cached = { width, theme, lines };
+    this.cached = { width, theme, showCost, lines };
     // The host receives an owned array: a consumer decorating rows cannot poison our cache.
     return lines.slice();
   }

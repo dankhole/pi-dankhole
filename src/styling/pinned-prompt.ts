@@ -2,7 +2,7 @@ import { stripVTControlCharacters } from "node:util";
 import { type ExtensionAPI, parseSkillBlock, type Theme } from "@earendil-works/pi-coding-agent";
 import { type Component, type TUI, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { userBackground } from "./palette.ts";
-import { freshTranscriptChildren, isTranscriptRendererSupported, withTranscriptMeasurement } from "./transcript-measurement.ts";
+import { freshTranscriptChildren, isTranscriptRendererSupported, retainTranscriptFrames, withTranscriptMeasurement } from "./transcript-measurement.ts";
 
 interface Tree extends Component { children: Component[] }
 interface Stack extends Tree {
@@ -222,6 +222,7 @@ export function installPinnedPrompt(tui: TUI, getTheme: () => Theme, fromHistory
   root.addChild(bar, { basis: "auto", grow: 0, shrink: 0, minSize: 0, maxSize: 1, visible: show });
   root.children.unshift(root.children.pop()!);
   root.entries.unshift(root.entries.pop()!);
+  const releaseFrames = retainTranscriptFrames(tui);
   root.invalidate();
   tui.requestRender();
   return {
@@ -229,6 +230,7 @@ export function installPinnedPrompt(tui: TUI, getTheme: () => Theme, fromHistory
     dispose() {
       if (disposed) return;
       disposed = true;
+      releaseFrames();
       root.removeChild(bar);
       root.invalidate();
       tui.requestRender();

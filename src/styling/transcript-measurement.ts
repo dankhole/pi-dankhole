@@ -1,5 +1,5 @@
 import { AssistantMessageComponent, SkillInvocationMessageComponent, ToolExecutionComponent, UserMessageComponent } from "@earendil-works/pi-coding-agent";
-import { type Component, Container, MouseRegion } from "@earendil-works/pi-tui";
+import { type Component, Container, MouseRegion, type TUI, TuiAltScreen, VStack } from "@earendil-works/pi-tui";
 
 type LayoutChild = { component: Component; height: number };
 type MeasuredComponent = Component & {
@@ -71,10 +71,33 @@ export function freshTranscriptChildren(component: Component): readonly Componen
 export class TranscriptMeasurement {
   private readonly measured = new Map<Component, Map<number, Rows>>();
   private readonly values = new Map<object, unknown>();
+  private readonly renderers = new Map<Component, { render: Component["render"]; projection: Projection | undefined }>();
+  private revision = 0;
+
+  /** Keep committed non-layout memos, but reject any pre-invalidation work still
+   * on the stack: a suspended native render can resume after reentrant cleanup. */
+  invalidateRows(): void { this.revision++; this.measured.clear(); this.renderers.clear(); }
+
+  /** Reentrant native renders must not leave either rows or provenance memos live. */
+  invalidate(): void { this.invalidateRows(); this.values.clear(); }
+
+  /** A later predicate cannot inherit coordinates after a renderer changes owner,
+   * even when native paint ran between predicates and the height stayed equal. */
+  validateRenderers(): void {
+    for (const [component, captured] of this.renderers) {
+      if (component.render !== captured.render || projections.get(component) !== captured.projection) {
+        this.invalidateRows();
+        return;
+      }
+    }
+  }
 
   memo<T>(key: object, calculate: () => T): T {
-    if (!this.values.has(key)) this.values.set(key, calculate());
-    return this.values.get(key) as T;
+    if (this.values.has(key)) return this.values.get(key) as T;
+    const revision = this.revision;
+    const value = calculate();
+    if (revision === this.revision) this.values.set(key, value);
+    return value;
   }
 
   private view(component: Component): MeasuredComponent {
@@ -91,6 +114,7 @@ export class TranscriptMeasurement {
     if (existing) return existing;
     if (!widths) { widths = new Map(); this.measured.set(component, widths); }
     widths.set(width, rows);
+    this.renderers.set(component, { render: component.render, projection: projections.get(component) });
     const view = this.view(component);
     if (!isTranscriptRendererSupported(component)) return rows;
     let children: LayoutChild[] | undefined;
@@ -132,7 +156,11 @@ export class TranscriptMeasurement {
   render(component: Component, width: number): string[] {
     let rows = this.measured.get(component)?.get(width);
     if (!rows) {
+      const revision = this.revision;
       const lines = component.render(width);
+      // Clearing an interrupted measurement cannot cancel native concatenation.
+      // Its returned rows may predate reentry even when the renderer is unchanged.
+      if (revision !== this.revision) return lines;
       rows = this.capture(component, width, { lines, start: 0, height: lines.length });
     }
     return this.lines(rows);
@@ -153,16 +181,128 @@ export class TranscriptMeasurement {
 }
 
 const active = new WeakMap<object, TranscriptMeasurement>();
+// Pi 1.4 exports the classes, but not this layout-node symbol or a frame hook.
+// Its installed declarations define this exact synchronous instance protocol.
+const layoutNode = Symbol.for("@earendil-works/pi-tui/layout-node");
+type LayoutRoot = Component & { [layoutNode](): unknown };
+type FrameHost = { mode?: string; layoutRoot?: Component; doRender(): void };
+interface Frame {
+  root: LayoutRoot;
+  node: LayoutRoot[typeof layoutNode];
+  measurement: TranscriptMeasurement;
+  entered: boolean;
+}
+const frames = new WeakMap<object, Frame>();
+const rootHooks = new WeakMap<Component, LayoutRoot[typeof layoutNode]>();
+const frameOwners = new WeakMap<object, { render: FrameHost["doRender"]; release: () => void; references: number }>();
+const nativeNode = (VStack.prototype as unknown as LayoutRoot)[layoutNode];
+const nativeRender = (TuiAltScreen.prototype as unknown as FrameHost).doRender;
 
-/** Nested pin/reminder predicates share transcript rows, but not dock renders: the
- * reminder is deliberately suppressed while measuring its canonical viewport.
- * A nested predicate must not start a partial render that its caller's full native
- * pass would repeat. The shared flag lets pinning retain that one-pass contract.
+function currentFrame(owner: object): Frame | undefined {
+  const frame = frames.get(owner);
+  const host = owner as FrameHost;
+  return frame?.entered && host.mode === "fullscreen" && host.layoutRoot === frame.root
+    && frame.root[layoutNode] === frame.node ? frame : undefined;
+}
+
+/** One synchronous native paint transaction, with a NEW predicate snapshot for
+ * each layout traversal (search can lay out twice). Native painting is NEVER
+ * intercepted or served these rows: it must refresh native mouse geometry.
+ * This exported boundary also lets fixtures exercise the actual layout engine.
+ */
+export function withTranscriptFrame<T>(owner: object, render: () => T): T {
+  const host = owner as FrameHost;
+  const root = host.layoutRoot as LayoutRoot | undefined;
+  if (host.mode !== "fullscreen" || !(root instanceof VStack)) return render();
+  const original = root[layoutNode];
+  if (typeof original !== "function" || original !== nativeNode && original !== rootHooks.get(root)) return render();
+  const descriptor = Object.getOwnPropertyDescriptor(root, layoutNode);
+  const previous = frames.get(owner);
+  const previousActive = active.get(owner);
+  const previousHook = rootHooks.get(root);
+  const frame: Frame = { root, node, measurement: new TranscriptMeasurement(), entered: false };
+  function node() {
+    // The root protocol is called before any visibility predicates, once per
+    // renderLayoutFrame. Never infer a frame from a timer, width or leaf ID.
+    frame.measurement.invalidate();
+    frame.entered = true;
+    return original.call(root);
+  }
+  try { Object.defineProperty(root, layoutNode, { configurable: true, writable: true, value: node }); }
+  catch { return render(); }
+  previous?.measurement.invalidate();
+  previousActive?.invalidate();
+  active.delete(owner);
+  frames.set(owner, frame);
+  rootHooks.set(root, node);
+  try { return render(); }
+  finally {
+    frame.measurement.invalidate();
+    active.delete(owner);
+    if (previous) { previous.measurement.invalidate(); frames.set(owner, previous); }
+    else frames.delete(owner);
+    if (previousActive) { previousActive.invalidate(); active.set(owner, previousActive); }
+    if (root[layoutNode] === node) {
+      if (descriptor) Object.defineProperty(root, layoutNode, descriptor);
+      else Reflect.deleteProperty(root, layoutNode);
+    }
+    if (rootHooks.get(root) === node) {
+      if (previousHook) rootHooks.set(root, previousHook);
+      else rootHooks.delete(root);
+    }
+  }
+}
+
+/** Ref-counted, guarded Pi 1.4 instance adapter; no prototype/host-file patch.
+ * A foreign doRender or layout-node owner retains the unoptimized native path.
+ */
+export function retainTranscriptFrames(tui: TUI): () => void {
+  const host = tui as unknown as FrameHost;
+  let owner = frameOwners.get(tui);
+  if (owner && host.doRender !== owner.render) return () => {};
+  if (!owner) {
+    const original = host.doRender;
+    if (original !== nativeRender) return () => {};
+    const descriptor = Object.getOwnPropertyDescriptor(host, "doRender");
+    const render = () => host.doRender === render ? withTranscriptFrame(tui, () => original.call(host)) : original.call(host);
+    const release = () => {
+      if (host.doRender === render) {
+        if (descriptor) Object.defineProperty(host, "doRender", descriptor);
+        else Reflect.deleteProperty(host, "doRender");
+      }
+    };
+    try { Object.defineProperty(host, "doRender", { configurable: true, writable: true, value: render }); }
+    catch { return () => {}; }
+    owner = { render, release, references: 0 };
+    frameOwners.set(tui, owner);
+  }
+  const retained = owner;
+  retained.references++;
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    if (--retained.references) return;
+    retained.release();
+    if (frameOwners.get(tui) === retained) frameOwners.delete(tui);
+  };
+}
+
+/** A newly bound/retired prose decorator must not leave old paint in predicates. */
+export function invalidateTranscriptRows(owner: object): void {
+  active.get(owner)?.invalidateRows();
+  currentFrame(owner)?.measurement.invalidateRows();
+}
+
+/** Nested predicates share rows, but NOT dock renders or visibility decisions:
+ * canonical measurements suppress different rows. `shared` means a nested
+ * predicate, not merely a frame: independent follow-end pins keep fresh suffixes.
  */
 export function withTranscriptMeasurement<T>(owner: object, calculate: (measurement: TranscriptMeasurement, shared: boolean) => T): T {
   const existing = active.get(owner);
   if (existing) return calculate(existing, true);
-  const measurement = new TranscriptMeasurement();
+  const measurement = currentFrame(owner)?.measurement ?? new TranscriptMeasurement();
+  measurement.validateRenderers();
   active.set(owner, measurement);
   try { return calculate(measurement, false); }
   finally { active.delete(owner); }

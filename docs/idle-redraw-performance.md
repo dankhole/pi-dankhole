@@ -1,5 +1,12 @@
 # Idle redraw performance follow-up
 
+This records the earlier `e40cf31`/`4378157` work. The subsequent
+[Pi follow-up plan](pi-follow-up-plan.md), [final measurements](pi-live-measurement.md)
+and [completion recovery guide](workers/README.md#completion-recovery) supersede
+its remaining-work statements about repeated visibility passes, live card cost
+settings and the memory-only completion outbox. Historical measurements below
+remain unchanged; live incident CPU is still unmeasured.
+
 ## Evidence and limits
 
 The motivating investigation reported an idle Pi task redrawing every 80 ms,

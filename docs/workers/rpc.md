@@ -45,6 +45,8 @@ There is no `type`, `subagent_type`, `name`, or nested `options` payload. `promp
 
 The reply is `{id}` after startup succeeds. RPC calls themselves return asynchronously through the bus; use `run_in_background: true` to charge launches to the background pool. `cwd`, if supplied, must identify an existing absolute directory. It changes tool execution location, not project trust or the parent's configuration root.
 
+RPC also accepts `mcp_startup: "inherit" | "skip-unreachable"` through the same launch resolver. The opt-in policy skips only unreachable `builtin:mcp` startup under an explicit extension-tool allowlist, including that built-in's resources and command; it does not share server connections or change trust/tool permissions. Defaults and resume retention match the Agent tool.
+
 Public RPC payloads cannot supply root-session identity, a file to replay as a conversation, internal queue flags or execution callbacks. These are controlled by the dispatcher, not callers. Use the normal tool's `resume` path for continuations.
 
 An RPC spawn is not guaranteed to emit `subagents:created`: use the returned ID and `subagents:started` to track it. Completion arrives through `subagents:completed` or `subagents:failed`.
@@ -66,7 +68,7 @@ pi.events.emit("subagents:rpc:consume", {
 
 These operations use stable IDs, never goal labels or handles. All workers are managed by the main agent; worker sessions cannot launch or control other workers. Steering requires a non-empty message; accepted startup-time messages wait until the session exists. Stopping a settled worker reports that it is no longer running. Consuming requires a settled result.
 
-Consume means the caller has already handled the result and does not need an additional parent completion notification. To prevent scheduling that notification, consume synchronously inside the completion handler. If it is already queued in the completion outbox, consumption can cancel it before delivery. Once sent, it cannot be recalled.
+Consume means the caller has already handled the result and does not need an additional parent completion notification. To prevent scheduling that notification, consume synchronously inside the completion handler. If it is already queued in the completion outbox, consumption can cancel it before delivery. Once handed to Pi, it cannot be recalled; send acceptance is not proof of transcript delivery. New completions retain captured run identities and unconfirmed delivery state. After restart, RPC consumption can acknowledge captured terminal results even when no live manager record exists. This suppresses additional notification attempts but does not restore execution or promise that an earlier accepted send cannot arrive. See [completion recovery](README.md#completion-recovery).
 
 ## Lifecycle and accounting
 

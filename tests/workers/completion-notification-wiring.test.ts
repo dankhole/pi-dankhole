@@ -1,3 +1,4 @@
+import { type ExtensionAPI, SessionManager } from "@earendil-works/pi-coding-agent";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type * as AgentRunnerModule from "../../src/workers/agent-runner.js";
 
@@ -29,8 +30,13 @@ async function boot(running: boolean) {
   environment = hermeticDir({ settings: { outputTranscript: false } });
   Reflect.deleteProperty(globalThis, MANAGER_KEY);
   booted = makePi();
+  const sessionManager = SessionManager.inMemory(environment.dir);
+  booted.pi.appendEntry.mockImplementation((type: string, data: unknown) => { sessionManager.appendCustomEntry(type, data); });
+  booted.pi.sendMessage.mockImplementation((message: Parameters<ExtensionAPI["sendMessage"]>[0]) => {
+    sessionManager.appendCustomMessageEntry(message.customType, message.content, message.display, message.details);
+  });
   subagentsExtension(booted.pi);
-  const context = ctx({ isIdle: () => !running, signal: running ? new AbortController().signal : undefined });
+  const context = ctx({ sessionManager, hasPendingMessages: () => false, isIdle: () => !running, signal: running ? new AbortController().signal : undefined });
   await booted.lifecycle.get("session_start")({}, context);
   return { ...booted, context };
 }
@@ -89,7 +95,7 @@ describe("background completion notification wiring", () => {
     b.context.hasUI = true;
     await spawn(b, "waiting child");
     await flush();
-    const replacement = ctx({ hasUI: true });
+    const replacement = ctx({ hasUI: true, sessionManager: b.context.sessionManager });
     replacement.ui.onTerminalInput = vi.fn(() => vi.fn());
     await b.lifecycle.get("session_start")({}, replacement);
     expect(pendingStatuses(b)).toEqual(["1 worker result waiting for the main agent", undefined]);

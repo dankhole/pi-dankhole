@@ -10,6 +10,7 @@
  * queues, call the real tool with wait:true, drain the queue, and assert the
  * call returns the final result.
  */
+import { type ExtensionAPI, SessionManager } from "@earendil-works/pi-coding-agent";
 import { describe, expect, it, vi } from "vitest";
 import type * as AgentRunnerModule from "../../src/workers/agent-runner.js";
 
@@ -21,7 +22,11 @@ vi.mock("../../src/workers/agent-runner.js", async () => {
 import { runAgent } from "../../src/workers/agent-runner.js";
 import subagentsExtension from "../../src/workers/index.js";
 
+let parentSessionManager: SessionManager;
+
 function makePi() {
+  const sessionManager = SessionManager.inMemory(process.cwd());
+  parentSessionManager = sessionManager;
   const tools = new Map<string, any>();
   const lifecycle = new Map<string, any>();
   const pi = {
@@ -36,8 +41,11 @@ function makePi() {
       emit: vi.fn(),
       on: vi.fn(() => vi.fn()),
     },
-    appendEntry: vi.fn(),
-    sendMessage: vi.fn(),
+    appendEntry: vi.fn((type: string, data: unknown) => { sessionManager.appendCustomEntry(type, data); }),
+    sendMessage: vi.fn((message: Parameters<ExtensionAPI["sendMessage"]>[0]) => {
+      sessionManager.appendCustomMessageEntry(message.customType, message.content, message.display, message.details);
+      queueMicrotask(() => { lifecycle.get("turn_start")?.(); });
+    }),
   } as any;
   return { pi, tools, lifecycle };
 }
@@ -45,11 +53,14 @@ function makePi() {
 function ctx() {
   return {
     hasUI: false,
+    isIdle: () => true,
+    hasPendingMessages: () => false,
+    signal: undefined,
     ui: { setStatus: vi.fn(), setWidget: vi.fn(), notify: vi.fn() },
     cwd: process.cwd(),
     model: undefined,
     modelRegistry: { find: vi.fn(), getAvailable: vi.fn(() => []) },
-    sessionManager: { getSessionId: vi.fn(() => "s1"), getBranch: vi.fn(() => []) },
+    sessionManager: parentSessionManager,
     getSystemPrompt: vi.fn(() => "parent"),
   } as any;
 }
@@ -136,6 +147,7 @@ describe("get_subagent_result wait:true on a queued agent", () => {
   it("aborts a running result wait without aborting or consuming the child", async () => {
     const { pi, tools, lifecycle } = makePi();
     subagentsExtension(pi);
+    await lifecycle.get("session_start")({}, ctx());
 
     let resolveRun: (() => void) | undefined;
     let childSignal: AbortSignal | undefined;
@@ -191,6 +203,7 @@ describe("get_subagent_result wait:true on a queued agent", () => {
   it("aborts a queued result wait before the agent starts", async () => {
     const { pi, tools, lifecycle } = makePi();
     subagentsExtension(pi);
+    await lifecycle.get("session_start")({}, ctx());
 
     const resolvers = deferredRuns();
     let queuedId: string | undefined;

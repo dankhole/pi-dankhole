@@ -691,6 +691,13 @@ export async function runAgent(
     isolated ? [] : (agentConfig?.extSelectors ?? []),
   );
   const noExtensions = extensions === false;
+  // Tool scope normally does not control loading. This explicit opt-in avoids
+  // starting builtin:mcp only when NONE of its tools can pass that scope. Match
+  // its exact owner, not an unrelated extension called mcp or an MCP tool prefix.
+  // Disable it before loader discovery so its factory and session handlers never
+  // run; this also intentionally omits its resources and /mcp command.
+  const skipUnreachableBuiltinMcp = config.mcpStartup === "skip-unreachable"
+    && extNames.size > 0 && !extNames.has("builtin:mcp");
 
   const extensionsSpec = Array.isArray(extensions)
     ? parseExtensionsSpec(extensions, configCwd)
@@ -764,7 +771,7 @@ export async function runAgent(
     // keeps all the built-ins out. Discovered extensions still follow `extensions:`.
     disabledBuiltinExtensions: process.argv.some((a) => a === "--no-extensions" || a === "-ne")
       ? ["codemode", "tool-search", "mcp"]
-      : process.argv.includes("--no-mcp")
+      : process.argv.includes("--no-mcp") || skipUnreachableBuiltinMcp
         ? ["mcp"]
         : undefined,
     cwd: configCwd,
@@ -818,7 +825,7 @@ export async function runAgent(
   // flags path-like and "*" entries — excludes are plain names only.
   if (hasExcludes && discoveredNames) {
     for (const name of excludeNames) {
-      if (!discoveredNames.has(name)) {
+      if (!discoveredNames.has(name) && !(skipUnreachableBuiltinMcp && name === "builtin:mcp")) {
         options.onToolActivity?.({
           type: "end",
           toolName: `extension-error:exclude_extensions: "${name}" for agent "${label}" did not match any discovered extension`,
@@ -831,7 +838,9 @@ export async function runAgent(
       loader.getExtensions().extensions.flatMap((e) => extensionCanonicalNames(e.path)),
     );
     for (const name of keepNames) {
-      if (!survivingNames.has(name)) {
+      // An intentional startup-policy skip is neither a missing extension nor
+      // an exclude typo, even if extensions: explicitly included this built-in.
+      if (!survivingNames.has(name) && !(skipUnreachableBuiltinMcp && name === "builtin:mcp")) {
         options.onToolActivity?.({
           type: "end",
           toolName: excludeNames.has(name)

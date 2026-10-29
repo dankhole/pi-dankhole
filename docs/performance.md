@@ -2,6 +2,9 @@
 
 The later [idle-redraw follow-up](idle-redraw-performance.md) covers completion-card caching,
 pinned-prompt measurement and completion/lifecycle diagnostics for the reported `nodeHost` incident.
+The subsequent [Pi follow-up plan](pi-follow-up-plan.md) and [matched measurements](pi-live-measurement.md)
+cover shared visibility frames, completion recovery, live card settings and opt-in child MCP startup.
+The sections below retain historical behavior and results, not claims about the final follow-up.
 
 ## Scope and baseline
 

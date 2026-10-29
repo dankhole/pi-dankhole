@@ -12,7 +12,7 @@ const root = process.env.PI_PACKAGE_DIR ?? resolve(dirname(realpathSync(execFile
 const fromPi = path => import(pathToFileURL(join(root, path)).href);
 const requirePi = createRequire(join(root, "package.json"));
 const tuiPath = dirname(requirePi.resolve("@earendil-works/pi-tui"));
-const { Container, Text, visibleWidth } = await import(pathToFileURL(join(tuiPath, "index.js")).href);
+const { Container, Text, TuiAltScreen, visibleWidth } = await import(pathToFileURL(join(tuiPath, "index.js")).href);
 const { renderLayoutFrame, getScrollViewBox } = await import(pathToFileURL(join(tuiPath, "layout.js")).href);
 const { loadExtensions } = await fromPi("dist/core/extensions/loader.js");
 const { KeybindingsManager } = await fromPi("dist/core/keybindings.js");
@@ -48,7 +48,7 @@ export default pi => { registerPinnedPrompt(pi, ${enabled}, ${conversationPanels
 async function emit(extension, name, ctx) {
   for (const handler of extension.handlers.get(name) ?? []) await handler({ type: name }, ctx);
 }
-function setup(identified = false) {
+function setup(identified = false, native = false) {
   const manager = identified ? SessionManager.inMemory(scratch) : undefined;
   const chat = new Container();
   const header = new Container();
@@ -70,8 +70,17 @@ function setup(identified = false) {
   const statuses = new Map();
   let footer;
   let branch = [];
-  const tui = { children: [document], layoutRoot: viewport.root, mode: "fullscreen",
-    terminal: { rows: 15, columns: 90 }, requestRender() {} };
+  const terminal = { rows: 15, columns: 90, write() {}, hideCursor() {}, showCursor() {} };
+  const tui = native ? new TuiAltScreen(terminal, false)
+    : { children: [document], mode: "fullscreen", terminal, requestRender() {} };
+  tui.requestRender = () => {};
+  if (native) tui.setLayoutRoot(viewport.root);
+  else tui.layoutRoot = viewport.root;
+  if (native) {
+    tui.addChild(document);
+    tui.stopped = false;
+    tui.altScreenActive = true;
+  }
   const ctx = { mode: "tui", hasUI: true, thinkingLevel: "high", hasPendingMessages: () => false,
     getContextUsage: () => undefined,
     sessionManager: manager ?? {
@@ -109,7 +118,12 @@ function setup(identified = false) {
   } };
   return { ...viewport, manager, chat, document, header, ctx, tui, widgets, notices, statuses, get footer() { return footer; }, get editor() { return editor; },
     branch(value) { branch = value; },
-    frame(width = 90, height = 15) { return renderLayoutFrame(viewport.root, width, height, () => {}); },
+    frame(width = 90, height = 15) {
+      if (!native) return renderLayoutFrame(viewport.root, width, height, () => {});
+      Object.assign(tui.terminal, { columns: width, rows: height });
+      tui.doRender();
+      return tui.currentLayout;
+    },
     addUser(text) {
       manager?.appendMessage({ role: "user", content: text, timestamp: Date.now() });
       const user = new UserMessageComponent(text); chat.addChild(user); return user;
@@ -542,12 +556,12 @@ test("widget disposal, shutdown and repeated starts restore only the added bar",
   assert.deepEqual(view.root.children, originalChildren);
 });
 
-test("full extension wiring combines all UI features and cleans on reload", async () => {
+for (const native of [false, true]) test(`full extension wiring combines all UI features and cleans on reload (${native ? "real TuiAltScreen" : "direct layout"})`, async () => {
   const loaded = await loadExtensions([join(project, "src/styling/index.ts")], scratch);
   assert.deepEqual(loaded.errors, []);
   loaded.runtime.getAllTools = () => [];
   const extension = loaded.extensions[0];
-  const view = setup();
+  const view = setup(false, native);
   view.addUser("full extension input");
   const resolver = extension.toolRenderers[0];
   for (let index = 0; index < 2; index++) {
@@ -641,6 +655,7 @@ test("full extension wiring combines all UI features and cleans on reload", asyn
     for (const widget of view.widgets.values()) widget.dispose?.();
     assert.equal(view.root.children.length, 2);
     assert.equal(view.chat.render, originalRender);
+    if (native) assert.equal(view.tui.doRender, TuiAltScreen.prototype.doRender, "the last UI consumer restores the native frame method");
   } finally { await emit(extension, "session_shutdown", view.ctx); }
   assert.equal(view.statuses.size, 0);
 });

@@ -10,8 +10,9 @@
  *   /agents                 — Interactive agent management menu
  */
 
-import { existsSync, readFileSync } from "node:fs";
-import { join } from "node:path";
+import { randomUUID } from "node:crypto";
+import { existsSync, readFileSync, statSync } from "node:fs";
+import { isAbsolute, join } from "node:path";
 import { type AgentSession, defineTool, type ExtensionAPI, type ExtensionCommandContext, type ExtensionContext, getAgentDir, getSettingsListTheme } from "@earendil-works/pi-coding-agent";
 import { Container, isKeyRelease, Key, matchesKey, type ScrollViewScrollbar, type SettingItem, SettingsList, Spacer, Text } from "@earendil-works/pi-tui";
 import { type Static, Type } from "typebox";
@@ -19,13 +20,15 @@ import { abortable } from "./abortable.js";
 import { AgentManager, type SpawnOptions } from "./agent-manager.js";
 import { getAgentConversation, getDefaultMaxTurns, getGraceTurns, getRememberAgents, normalizeMaxTurns, SUBAGENT_TOOL_NAMES, setDefaultMaxTurns, setGraceTurns, setRememberAgents, steerAgent } from "./agent-runner.js";
 import { inChildSessionContext } from "./child-context.js";
-import { CompletionDiagnostics, describeCompletionDiagnostic } from "./completion-diagnostics.js";
-import { CompletionOutbox } from "./completion-outbox.js";
+import { CompletionDiagnostics, describeCompletionDiagnostic, observePublicParent } from "./completion-diagnostics.js";
+import { CompletionJournal, type CompletionResult, type CompletionSnapshot } from "./completion-journal.js";
+import { CompletionOutbox, type OutboxMessage } from "./completion-outbox.js";
 import { type RpcHandle, registerRpcHandlers } from "./cross-extension-rpc.js";
 import { assertSupportedResumeParams, isolationParam, launchConfigParams, resolveAgentInvocationConfig } from "./invocation-config.js";
 import { describeModel, resolveModel } from "./model-resolver.js";
 import { checkModelScope, isScopeModelsEnabled, setScopeModelsEnabled } from "./model-scope.js";
 import { createOutputFilePath, ensureOutputFile, getOutputTranscriptDefault, setOutputTranscriptDefault, streamToOutputFile, writeInitialEntry } from "./output-file.js";
+import { ParentLifecycle } from "./parent-lifecycle.js";
 import { applyAndEmitLoaded, type SubagentsSettings, saveAndEmitChanged, type ToolDescriptionMode } from "./settings.js";
 import { getForegroundOutcomeNote, getStatusNote, partialOutputSuffix } from "./status-note.js";
 import { type AgentInvocation, type AgentRecord, type NotificationDetails, type ViewerMarkdownMode, type WidgetMode } from "./types.js";
@@ -75,10 +78,6 @@ export function renderRunningAgentStatus(
 
 /** How long a foreground `Agent` call runs before its row offers ctrl+b. */
 const BACKGROUND_HINT_DELAY_MS = 2000;
-
-/** Finite observation only: arbitrarily long compaction hooks need a host finalizer signal. */
-const COMPACT_IDLE_OBSERVATION_MS = 30_000;
-const COMPACT_IDLE_RETRY_MS = 500;
 
 /** Format an agent's lifetime token total, or "" when zero. */
 function formatLifetimeTokens(o: { lifetimeUsage: LifetimeUsage }): string {
@@ -226,8 +225,8 @@ function buildNotificationDetails(record: AgentRecord, resultMaxLen: number, act
     turnCount: activity?.turnCount ?? 0,
     maxTurns: activity?.maxTurns,
     totalTokens,
-    // Retain raw cost independently of presentation. Completion cards capture
-    // showCost when constructed; toggling it does not update historical cards.
+    // Retain raw cost independently of presentation; cards read the live setting.
+    // Notification/model-context content still captures the completion-time setting.
     totalCost: getLifetimeCost(record.lifetimeUsage),
     durationMs: record.completedAt ? record.completedAt - record.startedAt : 0,
     outputFile: record.outputFile,
@@ -249,7 +248,7 @@ export default function (pi: ExtensionAPI) {
   pi.registerMessageRenderer<NotificationDetails>(
     "subagent-notification",
     (message, { expanded }, theme) => message.details
-      ? new CompletionCards(message.details, expanded, theme, showCost)
+      ? new CompletionCards(message.details, expanded, theme, isShowCostEnabled)
       : undefined
   );
 
@@ -306,12 +305,59 @@ export default function (pi: ExtensionAPI) {
   // the result (get_subagent_result, rpc consume) cancels it before it is sent.
   const completionStatusKey = "subagents:pending-completions";
   let completionStatusUi: ExtensionContext["ui"] | undefined;
+  let completionStatusText: string | undefined;
   let parentCompacting = false;
-  let parentRunStarted = false;
+  let automaticDeliveryPaused = false;
+  let explicitRecoveryCheck = false;
+  interface CompletionOwner {
+    sessionId: string;
+    journal: CompletionJournal;
+    context: ExtensionContext;
+    captureOpen: boolean;
+    closing: boolean;
+    receiptCursor: number;
+  }
+  let completionOwner: CompletionOwner | undefined;
+  const completionRuns = new Map<string, { owner: CompletionOwner; deliveryId: string }>();
+  const completionWarnings = new Set<string>();
+
+  function completionWarning(kind: string, message: string): void {
+    if (completionWarnings.has(kind)) return;
+    completionWarnings.add(kind);
+    try { if (currentCtx?.hasUI) currentCtx.ui.notify(message, "warning"); } catch { /* stale presentation */ }
+  }
+
+  function pinCompletionRun(record: AgentRecord, replace = false): void {
+    if (completionOwner && (replace || !completionRuns.has(record.id))) {
+      completionRuns.set(record.id, { owner: completionOwner, deliveryId: randomUUID() });
+    }
+  }
+
+  /** Only persisted entry objects are receipt evidence; event payloads are never acknowledgements. */
+  function reconcileCompletions(): void {
+    const owner = completionOwner;
+    if (!owner || owner.closing || !owner.captureOpen) return;
+    try {
+      const entries = owner.context.sessionManager.getEntries();
+      const fresh = entries.length >= owner.receiptCursor ? entries.slice(owner.receiptCursor) : entries;
+      const confirmed = owner.journal.reconcile(fresh);
+      owner.receiptCursor = entries.length;
+      if (confirmed.length > 0) outbox.acknowledge(confirmed);
+    } catch {
+      completionWarning("receipt-read", "Completion delivery receipts could not be checked; unconfirmed results remain recoverable, not automatically retried.");
+    }
+  }
+
+  function consumeCompletion(workerId: string): boolean {
+    const consumed = completionOwner?.journal.consumeWorker(workerId) ?? 0;
+    outbox.cancel(workerId);
+    return consumed > 0;
+  }
 
   function clearCompletionStatus(): void {
     const ui = completionStatusUi;
     completionStatusUi = undefined;
+    completionStatusText = undefined;
     try { ui?.setStatus(completionStatusKey, undefined); } catch { /* stale UI */ }
   }
 
@@ -320,23 +366,28 @@ export default function (pi: ExtensionAPI) {
       const count = outbox.getPendingState().count;
       if (count === 0) clearCompletionStatus();
       else if (currentCtx?.hasUI) {
-        const waitingFor = parentCompacting ? "compaction" : "the main agent";
+        const state = outbox.getState();
+        const waitingFor = state.held + state.uncertain > 0 ? "recovery (/agents recover)"
+          : state.inFlight > 0 ? "delivery confirmation" : parentCompacting ? "compaction" : "the main agent";
         // Pi 1.4's TUI routes Escape to abortCompaction during compaction.
         const cancelHint = parentCompacting && currentCtx.mode === "tui" ? " — Esc to cancel" : "";
+        const text = `${count} worker result${count === 1 ? "" : "s"} waiting for ${waitingFor}${cancelHint}`;
+        if (completionStatusUi === currentCtx.ui && completionStatusText === text) return;
         completionStatusUi = currentCtx.ui;
-        completionStatusUi.setStatus(completionStatusKey,
-          `${count} worker result${count === 1 ? "" : "s"} waiting for ${waitingFor}${cancelHint}`);
+        completionStatusText = text;
+        completionStatusUi.setStatus(completionStatusKey, text);
       }
     } catch { /* stale UI, including getters, must not affect delivery */ }
   }
 
   const completionDiagnostics: CompletionDiagnostics = new CompletionDiagnostics(
     () => outbox.getPendingState(),
-    () => ({
-      idle: currentCtx?.isIdle(),
-      queuedMessages: currentCtx?.hasPendingMessages(),
-      signal: currentCtx?.signal ? currentCtx.signal.aborted ? "aborted" : "active" : "absent",
-    }),
+    () => {
+      const state = outbox.getState();
+      const durability = completionOwner ? completionOwner.journal.summary().durabilityDegraded ? "unverified/degraded" : "verified" : "unknown";
+      return { ...observePublicParent(currentCtx), idleObservation: parentLifecycle.getObservationState(),
+        deliveryState: `queued=${state.queued}, in-flight=${state.inFlight}, uncertain=${state.uncertain}, held=${state.held}, automatic delivery paused=${automaticDeliveryPaused}, durability=${durability}` };
+    },
     (snapshot, notify) => {
       // The immediate status above is the only banner owner. The watchdog
       // adds a bounded warning, never a delivery or a duplicate status entry.
@@ -345,8 +396,9 @@ export default function (pi: ExtensionAPI) {
       }
     },
     () => ({ widget: widget.getAnimationTimerCount(), fleet: fleet.getRefreshTimerCount(), foreground: foregroundSpinnerCount }),
+    () => outbox.getWatchdogState(),
   );
-  const outbox = new CompletionOutbox(
+  const outbox: CompletionOutbox = new CompletionOutbox(
     (message) => pi.sendMessage<NotificationDetails>({
       customType: "subagent-notification",
       content: message.content,
@@ -355,32 +407,68 @@ export default function (pi: ExtensionAPI) {
     }, { deliverAs: "steer", triggerTurn: true }),
     // The low-level signal disappears between retry attempts; the host stays
     // busy until automatic recovery and abort cleanup have actually settled.
-    () => currentCtx !== undefined && !currentCtx.isIdle(),
-    () => {
-      completionDiagnostics.pendingChanged();
-      updateCompletionStatus();
-      if (outbox.getPendingState().count === 0) cancelCompactIdleCheck();
-      else scheduleCompactIdleCheck(0);
+    () => !completionOwner || completionOwner.closing || (automaticDeliveryPaused && !explicitRecoveryCheck) || !parentLifecycle.isPublicIdle(),
+    undefined,
+    {
+      getOwnerSessionId: () => completionOwner?.closing ? undefined : completionOwner?.sessionId,
+      onAttempt: ids => { completionOwner?.journal.attempt(ids); },
+      onFailure: failure => completionWarning(`outbox-${failure.kind}`,
+        "Completion delivery could not be confirmed. Results remain recoverable; use /agents recover before deliberately retrying. A retry may duplicate a prior send."),
+      onStateChange: () => {
+        completionDiagnostics.pendingChanged();
+        parentLifecycle.pendingChanged();
+        updateCompletionStatus();
+      },
     },
   );
   const QUEUE_WAIT_POLL_MS = 50;
 
-  function notifyCompletion(record: AgentRecord) {
-    const activity = agentActivity.get(record.id);
-    agentActivity.delete(record.id);
-    widget.markFinished(record.id);
-    fleet.onAgentFinished(record.id);
-    // Built now, so a resume before the send cannot rewrite it. A record that
-    // cannot be formatted is skipped, as a failed send always was.
+  function captureCompletion(record: AgentRecord): CompletionSnapshot | undefined {
+    if (record.status === "running" || record.status === "queued") return undefined;
+    const pin = completionRuns.get(record.id);
+    if (!pin) {
+      completionWarning("missing-owner", "A terminal worker has no valid completion session owner; its live result remains readable, but automatic notification and restart recovery are unavailable.");
+      return undefined;
+    }
+    if (pin.owner.closing && record.status === "stopped") return undefined;
+    const result: CompletionResult = {
+      id: record.id, description: record.description, status: record.status,
+      result: record.result, error: record.error, startedAt: record.startedAt, completedAt: record.completedAt,
+      toolUses: record.toolUses, lifetimeUsage: record.lifetimeUsage, compactionCount: record.compactionCount,
+      outputFile: record.outputFile, sessionFile: record.sessionFile, invocation: record.invocation,
+    };
+    let message: OutboxMessage;
     try {
-      const footer = record.outputFile ? `\nFull transcript available at: ${record.outputFile}` : '';
-      const message = {
-        content: formatTaskNotification(record, 500, showCost) + footer,
-        details: buildNotificationDetails(record, 500, activity),
+      const footer = record.outputFile ? `\nFull transcript available at: ${record.outputFile}` : "";
+      message = { content: formatTaskNotification(record, 500, showCost) + footer,
+        details: buildNotificationDetails(record, 500, agentActivity.get(record.id)) };
+    } catch {
+      // Session/UI-derived metadata must not prevent plain terminal result capture.
+      message = {
+        content: `Worker ${record.id} ${record.status}.\n${record.result ?? record.error ?? "No output."}`,
+        details: {
+          id: record.id, description: record.description, status: record.status, invocation: record.invocation,
+          toolUses: record.toolUses, turnCount: 0, totalTokens: getLifetimeTotal(record.lifetimeUsage),
+          totalCost: getLifetimeCost(record.lifetimeUsage), durationMs: Math.max(0, (record.completedAt ?? record.startedAt) - record.startedAt),
+          resultPreview: (record.result ?? record.error ?? "No output.").slice(0, 500),
+        },
       };
-      outbox.add(record.id, message);
-    } catch { /* ignore stale completion side-effect errors */ }
-    widget.update();
+      completionWarning("format", "Completion presentation metadata was unavailable; the terminal result was captured without it.");
+    }
+    let leaf: string | null = null;
+    try { leaf = pin.owner.context.sessionManager.getLeafId(); } catch { /* provenance remains unknown */ }
+    try { return pin.owner.journal.capture(result, message, leaf, pin.deliveryId); }
+    catch {
+      completionWarning("capture", "A completion could not be journaled. Its live worker result remains available through get_subagent_result; automatic notification and restart recovery are not guaranteed.");
+      return undefined;
+    }
+  }
+
+  function finishCompletionPresentation(record: AgentRecord): void {
+    agentActivity.delete(record.id);
+    try { widget.markFinished(record.id); } catch { /* presentation never owns result delivery */ }
+    try { fleet.onAgentFinished(record.id); } catch { /* isolate each surface */ }
+    try { widget.update(); } catch { /* stale UI */ }
   }
 
   /** Helper: build event data for lifecycle events from an AgentRecord. */
@@ -420,47 +508,42 @@ export default function (pi: ExtensionAPI) {
     };
   }
 
-  // Background completion: capture a notification for the next safe boundary.
+  // Capture first: synchronous lifecycle consumers must see the immutable run.
   const manager = new AgentManager((record) => {
-    // Emit lifecycle event based on terminal status
-    const isError = record.status === "error" || record.status === "stopped" || record.status === "aborted";
-    const eventData = buildEventData(record);
-    if (isError) {
-      pi.events.emit("subagents:failed", eventData);
-    } else {
-      pi.events.emit("subagents:completed", eventData);
+    const snapshot = captureCompletion(record);
+    const pin = completionRuns.get(record.id);
+    try {
+      const isError = record.status === "error" || record.status === "stopped" || record.status === "aborted";
+      pi.events.emit(isError ? "subagents:failed" : "subagents:completed", buildEventData(record));
+    } catch { completionWarning("lifecycle", "A worker completion observer failed; the captured result remains recoverable."); }
+    try {
+      if (pin && pin.owner === completionOwner && pin.owner.captureOpen && !(pin.owner.closing && record.status === "stopped")) {
+        pi.appendEntry("subagents:record", {
+          id: record.id, description: record.description, status: record.status, result: record.result, error: record.error,
+          startedAt: record.startedAt, completedAt: record.completedAt,
+        });
+      }
+    } catch { completionWarning("legacy-write", "Worker history metadata could not be written; completion recovery is tracked separately."); }
+    if (record.resultConsumed && snapshot && pin) pin.owner.journal.resolve([snapshot.deliveryId], "consumed");
+    if (snapshot && pin && pin.owner === completionOwner && !pin.owner.closing
+      && pin.owner.journal.get(snapshot.deliveryId)?.state === "pending") {
+      outbox.add(record.id, snapshot.message, snapshot);
     }
-
-    // Persist final record for cross-extension history reconstruction
-    pi.appendEntry("subagents:record", {
-      id: record.id, description: record.description,
-      status: record.status, result: record.result, error: record.error,
-      startedAt: record.startedAt, completedAt: record.completedAt,
-    });
-
-    // Skip notification if result was already consumed via get_subagent_result
-    if (record.resultConsumed) {
-      agentActivity.delete(record.id);
-      widget.markFinished(record.id);
-      fleet.onAgentFinished(record.id);
-      widget.update();
-      return;
-    }
-
-    notifyCompletion(record);
+    finishCompletionPresentation(record);
   }, undefined, (record) => {
+    pinCompletionRun(record);
     // Programmatic spawns need the same live surfaces as Agent-tool spawns.
-    if (currentCtx?.hasUI) {
-      widget.ensureTimer();
-      widget.update();
-      fleet.ensureTimer();
-      fleet.update();
-    }
-    // Emit started event when agent transitions to running (including from queue)
-    pi.events.emit("subagents:started", {
-      id: record.id,
-      description: record.description,
-    });
+    try {
+      if (currentCtx?.hasUI) {
+        widget.ensureTimer();
+        widget.update();
+        fleet.ensureTimer();
+        fleet.update();
+      }
+    } catch { /* A stale surface must not fail worker startup. */ }
+    // Emit started event when agent transitions to running (including from queue).
+    try { pi.events.emit("subagents:started", { id: record.id, description: record.description }); }
+    catch { completionWarning("started-observer", "A worker-start observer failed; worker execution continues."); }
   }, (record, info) => {
     // Emit compacted event when agent's session compacts (preserves count on record).
     pi.events.emit("subagents:compacted", {
@@ -561,6 +644,8 @@ export default function (pi: ExtensionAPI) {
         }
       },
     });
+    const spawned = manager.getRecord(id);
+    if (spawned) pinCompletionRun(spawned);
     agentActivity.set(id, state);
     return id;
   };
@@ -579,67 +664,19 @@ export default function (pi: ExtensionAPI) {
   // --- Cross-extension RPC via pi.events ---
   let currentCtx: ExtensionContext | undefined;
   let sessionGeneration = 0;
-  let compactIdleCheck: ReturnType<typeof setTimeout> | undefined;
-  let compactIdleObservation: { context: ExtensionContext; generation: number; deadline: number } | undefined;
   let foregroundSpinnerCount = 0;
-
-  function cancelCompactIdleCheck(): void {
-    if (compactIdleCheck !== undefined) clearTimeout(compactIdleCheck);
-    compactIdleCheck = undefined;
-  }
-
-  function clearCompactIdleObservation(): void {
-    cancelCompactIdleCheck();
-    compactIdleObservation = undefined;
-  }
-
-  function scheduleCompactIdleCheck(delay: number): void {
-    const observation = compactIdleObservation;
-    if (!observation || compactIdleCheck !== undefined || parentRunStarted
-      || currentCtx !== observation.context || sessionGeneration !== observation.generation
-      || outbox.getPendingState().count === 0 || performance.now() >= observation.deadline) return;
-    const timer = setTimeout(() => {
-      if (compactIdleCheck !== timer) return;
-      compactIdleCheck = undefined;
-      if (compactIdleObservation !== observation
-        || currentCtx !== observation.context || sessionGeneration !== observation.generation
-        || outbox.getPendingState().count === 0 || performance.now() > observation.deadline) return;
-      try {
-        // A missing low-level signal is not proof that retry/preparation ended.
-        // Observed parent runs and new input own their next turn until a boundary.
-        if (parentRunStarted || observation.context.signal !== undefined) {
-          clearCompactIdleObservation();
-          return;
-        }
-        outbox.onIdle(); // Rechecks public idle for every attempted delivery.
-        const remaining = observation.deadline - performance.now();
-        if (remaining > 0) scheduleCompactIdleCheck(Math.min(COMPACT_IDLE_RETRY_MS, remaining));
-      } catch { clearCompactIdleObservation(); /* invalidation is not proof of idle */ }
-    }, delay);
-    compactIdleCheck = timer;
-    timer.unref();
-  }
-
-  function checkIdleAfterCompact(): void {
-    clearCompactIdleObservation();
-    if (!currentCtx || parentRunStarted) return;
-    // The host awaits later compaction handlers before clearing busy state.
-    // Keep the original 30s deadline even while the queue is empty: a worker
-    // may finish in a later handler. Only pending completions arm a timer.
-    // Arrivals never extend the deadline; expiry retains queue/diagnostics.
-    compactIdleObservation = {
-      context: currentCtx,
-      generation: sessionGeneration,
-      deadline: performance.now() + COMPACT_IDLE_OBSERVATION_MS,
-    };
-    scheduleCompactIdleCheck(0);
-  }
+  const parentLifecycle: ParentLifecycle = new ParentLifecycle(
+    () => outbox.getState().queued,
+    () => { reconcileCompletions(); outbox.onIdle(); reconcileCompletions(); },
+    () => { completionDiagnostics.observe("summary_abort"); },
+  );
 
   function afterSummary(event: "session_compact" | "session_compact_failed" | "session_tree"): void {
     // Do not retain errors or summary content in diagnostics.
     completionDiagnostics.observe(event);
+    reconcileCompletions();
     parentCompacting = false;
-    checkIdleAfterCompact();
+    parentLifecycle.afterSummary();
     updateCompletionStatus();
   }
 
@@ -656,19 +693,66 @@ export default function (pi: ExtensionAPI) {
   // bound session_start, so a filtered-out activation never advertises (#142).
   pi.on("session_start", async (_event, ctx) => {
     if (!ownsManagerRegistry) return;
-    clearCompactIdleObservation();
     parentCompacting = false;
-    parentRunStarted = false;
+    automaticDeliveryPaused = false;
     clearCompletionStatus();
     sessionGeneration++;
     currentCtx = ctx;
+    parentLifecycle.bind(ctx);
     completionDiagnostics.observe("session_start");
-    updateCompletionStatus();
-    if (ctx.hasUI) {
-      widget.setUICtx(ctx.ui);
-      fleet.setUICtx(ctx.ui as any);
-      watchHandoffKey(ctx.ui);
+    try {
+      const sessionId = ctx.sessionManager.getSessionId();
+      if (completionOwner?.sessionId === sessionId) {
+        completionOwner.context = ctx;
+        reconcileCompletions();
+      } else {
+        automaticDeliveryPaused = false;
+        explicitRecoveryCheck = false;
+        if (completionOwner) { completionOwner.captureOpen = false; completionOwner.closing = true; }
+        for (const entry of outbox.entries()) outbox.cancel(entry.id);
+        completionWarnings.clear();
+        const owner: CompletionOwner = {
+          sessionId, context: ctx, captureOpen: true, closing: false, receiptCursor: 0,
+          journal: new CompletionJournal(sessionId, (type, data) => {
+            if (completionOwner !== owner || !owner.captureOpen) throw new Error("Completion session owner is no longer active");
+            pi.appendEntry(type, data);
+          }, { onWarning: warning => {
+            // Public readonly session managers cannot prove disk durability. Report
+            // that uncertainty in recovery/diagnostics, not on every normal session.
+            if (warning.kind !== "memory-only") completionWarning(`journal-${warning.kind}`, warning.message);
+          } }),
+        };
+        completionOwner = owner;
+        let entries: ReturnType<ExtensionContext["sessionManager"]["getEntries"]> = [];
+        try { entries = ctx.sessionManager.getEntries(); }
+        catch { completionWarning("startup-read", "Saved completion recovery could not be inspected. New results remain tracked in memory; restart recovery is unverified."); }
+        const summary = owner.journal.restore(entries);
+        owner.receiptCursor = entries.length;
+        for (const completion of owner.journal.list()) {
+          if (completion.state === "pending" || completion.state === "uncertain") {
+            const snapshot = completion.snapshot;
+            outbox.restore(snapshot.workerId, snapshot.message, snapshot, completion.state === "uncertain");
+          }
+        }
+        try {
+          if (summary.pending + summary.uncertain > 0 && ctx.hasUI) {
+            ctx.ui.notify(`Recovered ${summary.pending} pending and ${summary.uncertain} uncertain worker completion(s). Nothing was replayed. Use /agents recover to inspect, retry or dismiss.`, "warning");
+          }
+        } catch { /* Recovery state survives unavailable presentation. */ }
+      }
+    } catch {
+      if (completionOwner) { completionOwner.captureOpen = false; completionOwner.closing = true; }
+      completionOwner = undefined;
+      completionWarning("session-owner", "Completion session ownership could not be established; automatic delivery is held rather than sent to an unknown session.");
     }
+    updateCompletionStatus();
+    try {
+      if (ctx.hasUI) {
+        widget.setUICtx(ctx.ui);
+        fleet.setUICtx(ctx.ui as any);
+        watchHandoffKey(ctx.ui);
+      }
+    } catch { /* Presentation cannot prevent recovery/RPC initialization. */ }
     manager.clearCompleted(true);
     // A double-bind must not leak RPC listeners.
     if (!rpcHandle) {
@@ -679,17 +763,21 @@ export default function (pi: ExtensionAPI) {
         manager: {
           spawn: spawnTopLevel,
           awaitStartup: (id) => manager.awaitStartup(id),
-          getRecord: (id) => manager.getRecord(id),
+          getRecord: (id) => manager.getRecord(id) ?? completionOwner?.journal.getLatestResult(id),
           abort: (id) => manager.abort(id),
           consumeResult: (id) => {
             const record = manager.getRecord(id);
             // Same guard as get_subagent_result: a running agent has no result
             // to consume, and its notification is still the caller's only
             // signal that it finished.
-            if (!record) return false;
+            if (!record) {
+              if (!completionOwner?.journal.getLatestResult(id)) return false;
+              consumeCompletion(id);
+              return true;
+            }
             if (record.status === "running" || record.status === "queued") return false;
+            consumeCompletion(record.id);
             record.resultConsumed = true;
-            outbox.cancel(record.id);
             return true;
           },
           steer: (id, message) => manager.steer(id, message),
@@ -715,9 +803,10 @@ export default function (pi: ExtensionAPI) {
     rpcHandle?.unsubConsume();
     rpcHandle?.unsubSteer();
     rpcHandle = undefined;
-    clearCompactIdleObservation();
+    const closingOwner = completionOwner;
+    if (closingOwner) closingOwner.closing = true;
+    parentLifecycle.bind(undefined);
     parentCompacting = false;
-    parentRunStarted = false;
     clearCompletionStatus();
     sessionGeneration++;
     completionDiagnostics.dispose();
@@ -741,6 +830,7 @@ export default function (pi: ExtensionAPI) {
     // pi awaits this handler, and the process exits right after — unawaited, those
     // handlers would never run. Internally bounded, so a hung one can't strand quit.
     await manager.dispose(pi);
+    if (closingOwner) closingOwner.captureOpen = false;
     // Every agent is stopped and every child session has shut down, so no more
     // `subagents:usage` can arrive. A ledger flushing in its own
     // `session_shutdown` may have run before this handler aborted the agents
@@ -887,6 +977,7 @@ export default function (pi: ExtensionAPI) {
     opts: { outputTranscript: boolean; maxTurns?: number; toolCallId?: string },
   ): Promise<AgentRecord | undefined> {
     const id = existing.id;
+    pinCompletionRun(existing, true);
     const description = existing.description;
     // Completion must refer to this continuation's tool call, not an older run.
     existing.toolCallId = opts.toolCallId;
@@ -972,40 +1063,52 @@ export default function (pi: ExtensionAPI) {
   pi.on("turn_end", (event) => {
     const stopReason = event.message.role === "assistant" ? event.message.stopReason : undefined;
     completionDiagnostics.observe("turn_end", stopReason);
+    if (stopReason === "aborted") automaticDeliveryPaused = true;
+    else if (stopReason !== "error") automaticDeliveryPaused = false;
+    reconcileCompletions();
     outbox.onTurnEnd(stopReason);
+    reconcileCompletions();
   });
-  pi.on("agent_settled", () => {
-    parentRunStarted = false;
-    clearCompactIdleObservation();
+  pi.on("agent_settled", (event) => {
+    parentLifecycle.settle();
     completionDiagnostics.observe("agent_settled");
-    outbox.onSettled();
+    // User abort must not immediately start another model turn with waiting results.
+    automaticDeliveryPaused = event?.aborted === true;
+    reconcileCompletions();
+    outbox.onSettled(automaticDeliveryPaused);
+    reconcileCompletions();
   });
   pi.on("input", () => {
-    clearCompactIdleObservation();
+    parentLifecycle.invalidate();
     completionDiagnostics.observe("input");
   });
   pi.on("before_agent_start", () => {
-    clearCompactIdleObservation();
+    parentLifecycle.invalidate();
     completionDiagnostics.observe("before_agent_start");
   });
   pi.on("agent_start", () => {
-    parentRunStarted = true;
-    clearCompactIdleObservation();
+    parentLifecycle.startRun();
     completionDiagnostics.observe("agent_start");
   });
-  pi.on("turn_start", () => { completionDiagnostics.observe("turn_start"); });
+  pi.on("turn_start", () => { reconcileCompletions(); completionDiagnostics.observe("turn_start"); });
   pi.on("tool_execution_end", () => { completionDiagnostics.observe("tool_execution_end"); });
   pi.on("agent_end", () => { completionDiagnostics.observe("agent_end"); });
   pi.on("agent_before_settle", () => { completionDiagnostics.observe("agent_before_settle"); });
-  pi.on("session_before_compact", () => {
-    clearCompactIdleObservation();
+  pi.on("before_provider_request", () => { completionDiagnostics.observe("before_provider_request"); });
+  pi.on("after_provider_response", () => { completionDiagnostics.observe("after_provider_response"); });
+  pi.on("session_before_compact", (event) => {
+    parentLifecycle.beforeSummary(event?.signal);
     parentCompacting = true;
     completionDiagnostics.observe("session_before_compact");
     updateCompletionStatus();
   });
   pi.on("session_compact", () => afterSummary("session_compact"));
   pi.on("session_compact_failed", () => afterSummary("session_compact_failed"));
-  // Pi 1.4 has no tree-summary failure event; successful navigation is observable.
+  pi.on("session_before_tree", (event) => {
+    parentLifecycle.beforeSummary(event.signal);
+    completionDiagnostics.observe("session_before_tree");
+  });
+  // No tree failure/finalizer event: signal abort permits only bounded public-idle observation.
   pi.on("session_tree", () => afterSummary("session_tree"));
 
   // Apply persisted settings on startup and emit `subagents:settings_loaded`.
@@ -1346,6 +1449,7 @@ Terse command-style prompts produce shallow, generic work.
           existing.description = params.description;
         }
         const resumeDescription = existing.description;
+        if (!runInBackground) pinCompletionRun(existing, true);
         const outputTranscript = existing.config?.outputTranscript ?? Boolean(existing.outputFile);
         const resumeMaxTurns = resumeTurnLimit(existing, params.max_turns);
 
@@ -1537,6 +1641,7 @@ Terse command-style prompts produce shallow, generic work.
         // Wire metadata before startup yields to session creation.
         const record = manager.getRecord(id);
         if (record) {
+          pinCompletionRun(record);
           record.toolCallId = toolCallId;
           attachTranscript(record, id);
         }
@@ -1691,12 +1796,18 @@ Terse command-style prompts produce shallow, generic work.
           // Deliberately does NOT set fgId: that drives agentActivity, the
           // widget and the `finally` cleanup below, none of which should see an
           // agent that has no session and may never get one.
-          onQueued: (_id, ahead) => { queuedAhead = ahead; streamUpdate(); },
+          onQueued: (id, ahead) => {
+            const queued = manager.getRecord(id);
+            if (queued) pinCompletionRun(queued);
+            queuedAhead = ahead;
+            streamUpdate();
+          },
           ...fgCallbacks,
         }, (fgAgentId) => {
           // onSpawned: called synchronously after spawn, before onSessionCreated fires.
           // Set up the output file so streamToOutputFile can pick it up.
           const fgRec = manager.getRecord(fgAgentId);
+          if (fgRec) pinCompletionRun(fgRec);
           attachTranscript(fgRec, fgAgentId);
           // Fires once the run promise exists, i.e. the agent is running. From
           // here until this call returns, the run can be handed off.
@@ -1806,7 +1917,13 @@ Terse command-style prompts produce shallow, generic work.
     execute: async (_toolCallId, params, signal, _onUpdate, _ctx) => {
       const record = manager.getRecord(params.agent_id);
       if (!record) {
-        return textResult(`Agent not found: "${params.agent_id}". It may have been cleaned up.`);
+        const recovered = completionOwner?.journal.getLatestResult(params.agent_id);
+        if (!recovered) return textResult(`Agent not found: "${params.agent_id}". It may have been cleaned up.`);
+        const output = `Recovered terminal worker: ${recovered.id}\nStatus: ${recovered.status}${getStatusNote(recovered.status)}\nDescription: ${recovered.description}\n\n`
+          + (recovered.result?.trim() || recovered.error || "No output.")
+          + "\n\nRecovered result only; no live conversation, resumability, or new usage was restored.";
+        consumeCompletion(recovered.id);
+        return textResult(output);
       }
 
       // Wait for completion if requested. Cancellation stops only this tool
@@ -1852,8 +1969,8 @@ Terse command-style prompts produce shallow, generic work.
 
       // Mark result as consumed — suppresses the completion notification
       if (record.status !== "running" && record.status !== "queued") {
+        consumeCompletion(record.id);
         record.resultConsumed = true;
-        outbox.cancel(record.id);
       }
 
       // Verbose: include full conversation
@@ -2381,11 +2498,112 @@ Terse command-style prompts produce shallow, generic work.
     ctx.ui.notify(message, level);
   }
 
+  function checkCompletionIdleExplicitly(deliveryId?: string): boolean {
+    explicitRecoveryCheck = true;
+    try {
+      if (deliveryId === undefined) return parentLifecycle.checkNow();
+      if (!parentLifecycle.isPublicIdle()) return false;
+      reconcileCompletions();
+      outbox.onIdle(deliveryId);
+      reconcileCompletions();
+      return true;
+    } finally { explicitRecoveryCheck = false; }
+  }
+
+  async function recoverCompletions(args: string[], ctx: ExtensionCommandContext): Promise<void> {
+    reconcileCompletions();
+    const owner = completionOwner;
+    if (!owner || owner.closing) { ctx.ui.notify("No active completion recovery owner.", "warning"); return; }
+    const [action = "list", id] = args;
+    if (action === "list") {
+      const summary = owner.journal.summary();
+      const rows = owner.journal.list().filter(item => item.state === "pending" || item.state === "uncertain")
+        .map(item => `${item.snapshot.deliveryId} — worker ${item.snapshot.workerId}: ${item.state}`);
+      ctx.ui.notify(`Completion recovery: pending=${summary.pending}, uncertain=${summary.uncertain}, delivered=${summary.delivered}, consumed=${summary.consumed}, dismissed=${summary.dismissed}; durability=${summary.durabilityDegraded ? "unverified/degraded" : "verified"}; legacy records=${summary.legacyRecords} (not recoverable snapshots).\n`
+        + (rows.join("\n") || "No unresolved snapshots.")
+        + "\nUse /agents recover inspect <delivery-id>, retry <delivery-id>, dismiss <worker-id> (all captured unresolved runs), consume <worker-id>, or check. Restored results never replay automatically.", "info");
+      return;
+    }
+    if (action === "check") {
+      const checked = checkCompletionIdleExplicitly();
+      ctx.ui.notify(checked
+        ? "Public idle verified; checked already-queued completions. Held/uncertain results require explicit retry. Send acceptance is not durable delivery confirmation."
+        : "Parent is busy or its state is unknown; no completion delivery was forced. Escape requests cancellation in Pi; a hook may still need to return.", checked ? "info" : "warning");
+      return;
+    }
+    if (action === "consume" && id) {
+      const recovered = owner.journal.getLatestResult(id);
+      if (!recovered) { ctx.ui.notify("No captured terminal result for that worker.", "warning"); return; }
+      consumeCompletion(id);
+      const record = manager.getRecord(id);
+      if (record && record.status !== "running" && record.status !== "queued") record.resultConsumed = true;
+      ctx.ui.notify("Captured worker results marked consumed; no live worker was stopped or resumed.", "info");
+      return;
+    }
+    if (action === "dismiss" && id) {
+      const unresolved = owner.journal.list().filter(item => item.snapshot.workerId === id
+        && (item.state === "pending" || item.state === "uncertain"));
+      if (unresolved.length === 0) {
+        ctx.ui.notify("No unresolved captured runs for that worker ID. Dismiss takes a worker ID, not a delivery ID.", "warning"); return;
+      }
+      owner.journal.resolve(unresolved.map(item => item.snapshot.deliveryId), "dismissed");
+      outbox.cancel(id);
+      ctx.ui.notify(`Dismissed ${unresolved.length} captured unresolved completion(s) for worker ${id}. No live worker was stopped, and future runs are unaffected.`, "info");
+      return;
+    }
+    const completion = id ? owner.journal.get(id) : undefined;
+    if (!completion) { ctx.ui.notify("Unknown delivery ID. Use /agents recover to list captured completions.", "warning"); return; }
+    if (action === "inspect") {
+      const record = completion.snapshot.record;
+      const output = record.result ?? record.error ?? "No output.";
+      const preview = output.slice(0, 2_000);
+      let transcript = "";
+      try {
+        if (record.outputFile && record.outputFile.length <= 1_024 && isAbsolute(record.outputFile)
+          && !/[\u0000-\u001f\u007f]/.test(record.outputFile) && statSync(record.outputFile).isFile()) {
+          transcript = `\nSaved transcript: ${record.outputFile}`;
+        }
+      } catch { /* A saved path is only a hint when the file still exists. */ }
+      ctx.ui.notify(`Worker ${record.id}: ${record.status}; delivery ${completion.state}\n${preview}${output.length > preview.length ? "\n[preview truncated]" : ""}`
+        + `\nUse get_subagent_result with agent_id="${record.id}" for the full latest captured result.${transcript}`
+        + "\nTerminal result only; inspection does not consume it or restore execution/resumability.", "info");
+      return;
+    }
+    if (action === "retry") {
+      if (completion.state !== "pending" && completion.state !== "uncertain") {
+        ctx.ui.notify("That completion is already resolved; it was not requeued.", "warning"); return;
+      }
+      const generation = sessionGeneration;
+      if (completion.attempted || completion.state === "uncertain") {
+        if (!ctx.hasUI || !await ctx.ui.confirm("Retry uncertain completion?", "A previous send may already have reached the conversation. Retrying can duplicate the notification and start another model turn. Retry this delivery ID?")) return;
+      }
+      const latest = owner.journal.get(completion.snapshot.deliveryId);
+      if (owner !== completionOwner || owner.closing || generation !== sessionGeneration
+        || !latest || (latest.state !== "pending" && latest.state !== "uncertain")) {
+        ctx.ui.notify("Completion/session state changed; nothing was retried.", "warning"); return;
+      }
+      const requeued = outbox.retry(completion.snapshot.deliveryId)
+        || outbox.entries().some(entry => entry.deliveryId === completion.snapshot.deliveryId && entry.state === "queued");
+      const checked = requeued && checkCompletionIdleExplicitly(completion.snapshot.deliveryId);
+      ctx.ui.notify(requeued
+        ? checked ? "Selected completion checked at public idle; other queued results wait for the next safe boundary, and delivery stays unconfirmed until a transcript receipt appears."
+          : "Selected completion is queued; the parent is busy or unknown, so it waits for a safe boundary."
+        : "Completion was already queued or is no longer available; nothing was resent.", "info");
+      return;
+    }
+    ctx.ui.notify("Use /agents recover list, inspect <delivery-id>, retry <delivery-id>, dismiss <worker-id> (all captured unresolved runs), consume <worker-id>, or check.", "warning");
+  }
+
   pi.registerCommand("agents", {
-    description: "Manage agents; diagnostics shows completion wait observations",
+    description: "Manage agents; diagnostics inspects waits; recover lists and deliberately recovers captured results",
     handler: async (args, ctx) => {
       if (args.trim() === "diagnostics") {
         ctx.ui.notify(describeCompletionDiagnostic(completionDiagnostics.snapshot()), "info");
+        return;
+      }
+      const words = args.trim().split(/\s+/);
+      if (words[0] === "recover") {
+        await recoverCompletions(words.slice(1), ctx);
         return;
       }
       await showAgentsMenu(ctx);
