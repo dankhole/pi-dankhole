@@ -1,5 +1,8 @@
 # Extension performance work
 
+The later [idle-redraw follow-up](idle-redraw-performance.md) covers completion-card caching,
+pinned-prompt measurement and completion/lifecycle diagnostics for the reported `nodeHost` incident.
+
 ## Scope and baseline
 
 This work targets `pi-dankhole` only. Quarterdeck, original source projects, installed extension registration and running sessions are unchanged. Synthetic CPU measurements identify avoidable extension work; they do not establish the cause of the reported interactive incident or promise that all host/terminal latency is removed.
@@ -119,3 +122,30 @@ git diff --check
 These interface checks use the default Pi installation on `PATH`, not a substituted host. Worker runtime code is unchanged by this integration; its earlier full validation remains applicable. The complete package suite and benchmarks were not rerun for the merge.
 
 No live provider calls, installed configuration changes, session restarts or Quarterdeck changes were made. Git staging/commits were performed only after the user explicitly requested merging the latest `master` and squashing this work onto it. Already-running sessions have not been reloaded, and real interactive incident latency has not been remeasured.
+
+## Idle redraw incident (2026-10-29)
+
+### Observation
+
+The supplied investigation reported Activity Monitor showing about 280% `nodeHost` CPU across Quarterdeck-launched Pi agents, and one apparently idle agent using about 15%. A ten-second V8 profile reportedly showed full frames every 80 ms, taking 10–15 ms each, with repeated completion-card painting and pinned-prompt measurements. These are historical incident observations, not a reproduction of the peak in this checkout.
+
+Concurrent investigation notes proposed an unfinished manual compaction or `/tree` summary, then a hung `before_agent_start`, as possible busy-state causes; the user did not recall starting a summary. Neither explanation is confirmed. A hung `agent_settled` handler does not fit the reported busy state because Pi reports idle while dispatching that event. Worker records can be persisted while their parent notification messages remain undelivered; the two stores must not be conflated.
+
+### Reconciled changes
+
+- `CompletionCards` retains one width's final rows with immutable display snapshots and effective-palette invalidation. Pi rebuilds custom messages on expansion/invalidation; `showCost` remains captured at construction.
+- `FleetList` stops the 200 ms refresh for an indefinitely viewed settled result, while preserving theme refresh, active/sessionless-worker discovery and finished-row linger.
+- `CompletionOutbox` reports its pending count. An event-driven status immediately identifies results waiting for the main agent or for compaction, with an Escape hint in the TUI. A separate bounded watchdog supplies lifecycle diagnostics without a duplicate status banner.
+- After compaction or successful tree navigation, one guarded public-idle observation window lasts at most 30 seconds, checking at 500 ms intervals after the initial check. Input, preparation and run starts invalidate it. Late arrivals can rearm within the original deadline, never extend it; expiry never forces delivery.
+- Keep-awake remains activation-owned. The concurrent implementation's unconditional child-scope skip was not retained: child scope alone proves neither enabled parent ownership nor coverage of retained foreground resumes. Compatible parent tracking/cleanup tests and explicit uncovered-child regressions are retained. Safe redundant-child suppression requires a separate positive ownership contract.
+
+### Concurrent measurements and remaining limits
+
+The concurrent, pre-reconciliation implementation notes recorded these synthetic Pi 1.4.0 measurements at 120×40, medians of 41 samples with only a status row changing. They are retained as historical evidence, **not measurements of the final combined implementation**:
+
+| Fixture | Before | After |
+| --- | ---: | ---: |
+| 17 completion cards + pinned prompt | 5.41 ms | 0.16 ms |
+| 500 assistant messages + 20 cards + pinned prompt | 12.37 ms | 5.25 ms |
+
+The separately reproduced comparison for this work is in [idle-redraw follow-up](idle-redraw-performance.md). Default panels/grouping now support fresh bounded-suffix pin measurement, but native painting, manual scrolling and pending-question visibility can still walk history. No rendered-history cache is retained across frames. Pending-result status cannot inspect messages already handed to Pi's deferred queue; results held only in the in-memory outbox do not survive process exit. Production CPU has not been remeasured.

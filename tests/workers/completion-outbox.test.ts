@@ -15,12 +15,14 @@ describe("CompletionOutbox", () => {
   let running: boolean;
   let send: ReturnType<typeof vi.fn>;
   let outbox: CompletionOutbox;
+  let pendingChanged: ReturnType<typeof vi.fn>;
 
   beforeEach(() => {
     vi.useFakeTimers();
     running = true;
     send = vi.fn();
-    outbox = new CompletionOutbox(send, () => running);
+    pendingChanged = vi.fn();
+    outbox = new CompletionOutbox(send, () => running, pendingChanged);
   });
 
   afterEach(() => {
@@ -119,6 +121,114 @@ describe("CompletionOutbox", () => {
     send.mockImplementation(() => { throw new Error("stale extension context"); });
     outbox.add("a", message("a"));
     expect(() => outbox.onSettled()).not.toThrow();
+  });
+
+  it("public-idle recovery rechecks busy state and is inert after disposal", () => {
+    outbox.add("a", message("a"));
+    outbox.onIdle();
+    expect(send).not.toHaveBeenCalled();
+    running = false;
+    outbox.onIdle();
+    expect(send).toHaveBeenCalledExactlyOnceWith(message("a"));
+    outbox.dispose();
+    outbox.onIdle();
+    expect(send).toHaveBeenCalledOnce();
+  });
+
+  it("diagnostic observer failures cannot prevent safe-boundary delivery", () => {
+    outbox = new CompletionOutbox(send, () => running, () => { throw new Error("stale diagnostic UI"); });
+    expect(() => outbox.add("a", message("a"))).not.toThrow();
+    expect(() => outbox.onSettled()).not.toThrow();
+    expect(send).toHaveBeenCalledExactlyOnceWith(message("a"));
+  });
+
+  it("retains monotonic pending ages while count notifications are deduplicated", () => {
+    outbox.add("a", message("a"));
+    vi.advanceTimersByTime(1_000);
+    vi.setSystemTime(Date.now() - 60_000);
+    expect(outbox.getPendingState()).toEqual({ count: 1, oldestAgeMs: 1_000 });
+    outbox.cancel("absent");
+    expect(pendingChanged.mock.calls).toEqual([[1]]);
+    outbox.add("b", message("b"));
+    outbox.cancel("a");
+    expect(outbox.getPendingState()).toEqual({ count: 1, oldestAgeMs: 0 });
+    vi.advanceTimersByTime(500);
+    expect(outbox.getPendingState()).toEqual({ count: 1, oldestAgeMs: 500 });
+    expect(pendingChanged.mock.calls).toEqual([[1], [2], [1]]);
+  });
+
+  it("reports waiting results immediately, coalesces unchanged counts, and uses no timers", () => {
+    expect(pendingChanged).not.toHaveBeenCalled();
+    expect(vi.getTimerCount()).toBe(0);
+    outbox.add("a", message("a"));
+    expect(pendingChanged).toHaveBeenCalledExactlyOnceWith(1);
+    outbox.add("b", message("b"));
+    expect(pendingChanged).toHaveBeenLastCalledWith(2);
+    outbox.cancel("absent");
+    outbox.onTurnEnd("error");
+    vi.advanceTimersByTime(26 * 60_000);
+    expect(pendingChanged.mock.calls).toEqual([[1], [2]]);
+    expect(send).not.toHaveBeenCalled();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it.each(["flush", "cancel", "dispose"])("clears waiting status on %s, without redundant updates", action => {
+    outbox.add("a", message("a"));
+    if (action === "flush") outbox.onSettled();
+    else if (action === "cancel") outbox.cancel("a");
+    else outbox.dispose();
+    expect(pendingChanged.mock.calls).toEqual([[1], [0]]);
+    outbox.onSettled();
+    outbox.cancel("a");
+    outbox.dispose();
+    expect(pendingChanged.mock.calls).toEqual([[1], [0]]);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("does not flash waiting status for immediate idle delivery", () => {
+    running = false;
+    outbox.add("a", message("a"));
+    expect(send).toHaveBeenCalledOnce();
+    expect(pendingChanged).not.toHaveBeenCalled();
+  });
+
+  it("updates the status when one of several results is consumed", () => {
+    outbox.add("a", message("a"));
+    outbox.add("b", message("b"));
+    outbox.cancel("a");
+    expect(pendingChanged.mock.calls).toEqual([[1], [2], [1]]);
+    outbox.onTurnEnd("toolUse");
+    expect(pendingChanged).toHaveBeenLastCalledWith(0);
+    expect(send).toHaveBeenCalledExactlyOnceWith(message("b"));
+  });
+
+  it("does not let status failures change delivery or cancellation", () => {
+    pendingChanged.mockImplementation(() => { throw new Error("stale UI"); });
+    outbox.add("a", message("a"));
+    outbox.add("b", message("b"));
+    outbox.cancel("a");
+    outbox.onSettled();
+    expect(send).toHaveBeenCalledExactlyOnceWith(message("b"));
+  });
+
+  it("delivers at a post-summary idle check exactly once, without a timer", () => {
+    outbox.add("a", message("a"));
+    outbox.onIdle();
+    expect(send).not.toHaveBeenCalled();
+    running = false;
+    outbox.onIdle();
+    outbox.onIdle();
+    expect(send).toHaveBeenCalledExactlyOnceWith(message("a"));
+    expect(pendingChanged).toHaveBeenLastCalledWith(0);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("ignores post-summary idle checks after disposal", () => {
+    outbox.add("a", message("a"));
+    outbox.dispose();
+    running = false;
+    outbox.onIdle();
+    expect(send).not.toHaveBeenCalled();
   });
 
   it("shutdown drops pending and later completions", () => {

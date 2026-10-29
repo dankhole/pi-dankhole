@@ -47,6 +47,7 @@ export type FleetUICtx = {
 type MainEntry = { kind: "main" };
 type AgentEntry = { kind: "agent"; record: AgentRecord };
 type FleetEntry = MainEntry | AgentEntry;
+type FleetSnapshot = { entries: FleetEntry[]; hasActive: boolean };
 
 /** Whole elapsed minutes, using the same rounding as the other worker surfaces. */
 export function formatFleetElapsed(ms: number): string {
@@ -140,9 +141,16 @@ export class FleetList {
     this.inputUnsub = ui.onTerminalInput(data => this.handleKey(data));
   }
 
+  /** Read-only diagnostics; does not create or refresh presentation. */
+  getRefreshTimerCount(): number {
+    return this.timer === undefined ? 0 : 1;
+  }
+
   /** Ensure the re-render timer is running (called when an agent spawns). */
   ensureTimer(): void {
-    if (!this.timer) this.timer = setInterval(() => this.update(), TICK_MS);
+    // A late spawn/finally callback after dispose has no UI to update; update()
+    // would return early forever without clearing an interval created here.
+    if (this.ui && this.enabled && !this.timer) this.timer = setInterval(() => this.update(), TICK_MS);
   }
 
   /**
@@ -154,23 +162,26 @@ export class FleetList {
   }
 
   dispose(): void {
+    // Widget removal can synchronously invalidate it. Detach first so neither
+    // that callback nor a later overlay close can revive UI or its timer.
+    const ui = this.ui;
+    this.ui = undefined;
     if (this.timer) { clearInterval(this.timer); this.timer = undefined; }
     this.inputUnsub?.();
     this.inputUnsub = undefined;
     if (this.viewerClose) { this.viewerClose(); this.viewerClose = undefined; }
     this.viewingAgentId = undefined;
-    if (this.ui && this.widgetRegistered) this.ui.setWidget(FLEET_KEY, undefined);
+    if (ui && this.widgetRegistered) ui.setWidget(FLEET_KEY, undefined);
     this.widgetRegistered = false;
     this.tui = undefined;
     this.active = false;
-    // Null last so a `viewerClose()` microtask above can't re-register the widget.
-    this.ui = undefined;
   }
 
   /** Re-register/refresh the below-editor widget; clears it when nothing remains. */
-  update(snapshot?: FleetEntry[]): void {
+  update(snapshot?: FleetSnapshot): void {
     if (!this.ui) return;
-    const roster = this.enabled ? snapshot ?? this.roster() : [];
+    const current = this.enabled ? snapshot ?? this.roster() : { entries: [], hasActive: false };
+    const roster = current.entries;
     const hasRows = roster.length > 1;
 
     if (!hasRows) {
@@ -179,21 +190,35 @@ export class FleetList {
         this.widgetRegistered = false;
         this.tui = undefined;
       }
-      if (this.timer) { clearInterval(this.timer); this.timer = undefined; }
+      // Pending sessions must still be discovered even with no visible rows.
+      if (current.hasActive) this.ensureTimer();
+      else if (this.timer) { clearInterval(this.timer); this.timer = undefined; }
       this.active = false;
       this.selectedIndex = 0;
       return;
     }
 
     this.clampSelection(roster);
-    this.ensureTimer(); // keep stats ticking whenever the list is shown (e.g. after a re-enable)
+    // A viewed result remains listed indefinitely, but its stats are frozen.
+    // Include workers awaiting a session: their session-created callbacks do
+    // not necessarily refresh the fleet, so the tick must discover them later.
+    const now = Date.now();
+    const needsTimer = current.hasActive || roster.some(entry => entry.kind === "agent"
+      && entry.record.completedAt != null && now - entry.record.completedAt < FINISHED_LINGER_MS);
+    if (needsTimer) this.ensureTimer();
+    else if (this.timer) { clearInterval(this.timer); this.timer = undefined; }
 
     if (!this.widgetRegistered) {
       this.ui.setWidget(FLEET_KEY, (tui, theme) => {
         this.tui = tui;
         return {
           render: (w: number) => this.renderBar(w, theme),
-          invalidate: () => { this.widgetRegistered = false; this.tui = undefined; },
+          invalidate: () => {
+            this.widgetRegistered = false;
+            this.tui = undefined;
+            // Static viewed results have no tick to pick up a changed theme.
+            this.update();
+          },
         };
       }, { placement: "belowEditor" });
       this.widgetRegistered = true;
@@ -212,22 +237,23 @@ export class FleetList {
    * Pending agents with no session yet are hidden until they start.
    * (`listAgents()` is newest-first, so we re-sort.)
    */
-  private agentRecords(): AgentRecord[] {
+  private roster(): FleetSnapshot {
+    const records = this.manager.listAgents();
     const now = Date.now();
-    return this.manager.listAgents()
-      .filter(a => a.session && (
-        a.status === "running" || a.status === "queued"
-        || a.id === this.viewingAgentId
-        || (a.completedAt != null && now - a.completedAt < FINISHED_LINGER_MS)
-      ))
-      .sort((a, b) => a.startedAt - b.startedAt);
-  }
-
-  private roster(): FleetEntry[] {
-    return [
-      { kind: "main" },
-      ...this.agentRecords().map(record => ({ kind: "agent" as const, record })),
-    ];
+    return {
+      // Carry activity alongside the visible roster so navigation/close can
+      // share one fresh manager read without losing session-less workers.
+      hasActive: records.some(a => a.status === "running" || a.status === "queued"),
+      entries: [
+        { kind: "main" },
+        ...records.filter(a => a.session && (
+          a.status === "running" || a.status === "queued"
+          || a.id === this.viewingAgentId
+          || (a.completedAt != null && now - a.completedAt < FINISHED_LINGER_MS)
+        )).sort((a, b) => a.startedAt - b.startedAt)
+          .map(record => ({ kind: "agent" as const, record })),
+      ],
+    };
   }
 
   private clampSelection(roster: FleetEntry[]): void {
@@ -262,11 +288,11 @@ export class FleetList {
       // Activate: ↓ or ← at an empty prompt moves focus into the list.
       const isActivator = matchesKey(data, "down") || matchesKey(data, "left");
       if (isActivator && this.ui.getEditorText() === "") {
-        const roster = this.roster();
-        if (roster.length > 1) {
+        const snapshot = this.roster();
+        if (snapshot.entries.length > 1) {
           this.active = true;
           this.selectedIndex = 0;
-          this.update(roster);
+          this.update(snapshot);
           return { consume: true };
         }
       }
@@ -274,25 +300,26 @@ export class FleetList {
     }
 
     // Share one fresh roster across selection, clamping and refresh.
-    const roster = this.roster();
+    const snapshot = this.roster();
+    const roster = snapshot.entries;
     // Active — arrows navigate, Enter opens, Esc / Up-past-top exits.
     if (matchesKey(data, "down")) {
       const max = roster.length - 1;
       this.selectedIndex = Math.min(max, this.selectedIndex + 1);
-      this.update(roster);
+      this.update(snapshot);
       return { consume: true };
     }
     if (matchesKey(data, "up")) {
-      if (this.selectedIndex === 0) { this.deactivate(roster); return { consume: true }; }
+      if (this.selectedIndex === 0) { this.deactivate(snapshot); return { consume: true }; }
       this.selectedIndex -= 1;
-      this.update(roster);
+      this.update(snapshot);
       return { consume: true };
     }
-    if (matchesKey(data, "escape")) { this.deactivate(roster); return { consume: true }; }
-    if (matchesKey(data, Key.enter)) { this.openSelected(roster); return { consume: true }; }
+    if (matchesKey(data, "escape")) { this.deactivate(snapshot); return { consume: true }; }
+    if (matchesKey(data, Key.enter)) { this.openSelected(snapshot); return { consume: true }; }
 
     // Any other key cancels navigation and flows to the editor.
-    this.deactivate(roster);
+    this.deactivate(snapshot);
     return undefined;
   }
 
@@ -312,17 +339,17 @@ export class FleetList {
     return typeof c.getText === "function" && typeof c.setText === "function";
   }
 
-  private deactivate(roster?: FleetEntry[]): void {
+  private deactivate(snapshot?: FleetSnapshot): void {
     this.active = false;
     this.selectedIndex = 0;
-    this.update(roster);
+    this.update(snapshot);
   }
 
-  private openSelected(roster: FleetEntry[]): void {
-    const entry = roster[this.selectedIndex];
+  private openSelected(snapshot: FleetSnapshot): void {
+    const entry = snapshot.entries[this.selectedIndex];
     if (!entry || entry.kind === "main") {
       // `main` = return to the prompt; the native transcript is already shown.
-      this.deactivate(roster);
+      this.deactivate(snapshot);
       return;
     }
     const record = entry.record;
@@ -372,7 +399,8 @@ export class FleetList {
     // still feels natural if the list reordered (an earlier agent finished)
     // while the overlay was open. If that agent is gone, leave the index for
     // update()'s clamp to settle.
-    const roster = this.roster();
+    const snapshot = this.roster();
+    const roster = snapshot.entries;
     const viewed = this.viewingAgentId;
     if (viewed !== undefined) {
       const idx = roster.findIndex(e => e.kind === "agent" && e.record.id === viewed);
@@ -382,15 +410,15 @@ export class FleetList {
     this.viewingAgentId = undefined;
     const now = Date.now();
     // Closing a viewer removes its special retention without another fetch/sort.
-    this.update(roster.filter(e => e.kind === "main"
+    this.update({ ...snapshot, entries: roster.filter(e => e.kind === "main"
       || e.record.status === "running" || e.record.status === "queued"
-      || (e.record.completedAt != null && now - e.record.completedAt < FINISHED_LINGER_MS)));
+      || (e.record.completedAt != null && now - e.record.completedAt < FINISHED_LINGER_MS)) });
   }
 
   // ---- Rendering ----
 
   private renderBar(width: number, theme: Theme): string[] {
-    const rows = this.roster().slice(1) as AgentEntry[];
+    const rows = this.roster().entries.slice(1) as AgentEntry[];
     if (rows.length === 0) return [];
     // Clamp locally so a render between a roster shrink and the next update()
     // (e.g. on terminal resize) never loses the selection marker.

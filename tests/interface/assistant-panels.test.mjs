@@ -19,6 +19,7 @@ const local = name => jiti.import(resolve(dirname(fileURLToPath(import.meta.url)
 const { installAssistantPanels, registerAssistantPanels } = await local("assistant-panels.ts");
 const { installGrouping, getChildLineOffset } = await local("grouping.ts");
 const { installPinnedPrompt } = await local("pinned-prompt.ts");
+const { freshTranscriptChildren, registerTranscriptRenderer } = await local("transcript-measurement.ts");
 const { registerTextPanels } = await local("text-panels.ts");
 const { assistantBackground, conversationProse, userBackground } = await local("palette.ts");
 const { Container, Markdown, MouseRegion, ScrollView, Spacer, Text, VStack, backgroundAnsi, colorToRgb, mixColors, parseColor, visibleWidth } = await import(pathToFileURL(requirePi.resolve("@earendil-works/pi-tui")).href);
@@ -724,6 +725,49 @@ test("grouping and pinning compose in either install order without geometry or m
     if (panelsFirst) cleanups.forEach(cleanup => cleanup());
     else cleanups.reverse().forEach(cleanup => cleanup());
     assert.equal(Object.hasOwn(f.document, "render"), false);
+  }
+});
+
+test("fresh panel children prepare streaming wrappers and spacers without rendering historical messages", () => {
+  const f = fixture();
+  const dispose = f.install();
+  const a = assistant([text("new answer")]);
+  const originalRender = a.render;
+  let renders = 0;
+  a.render = function(width) { renders++; return originalRender.call(this, width); };
+  f.chat.addChild(a);
+  const md = a.contentContainer.children.find(child => child instanceof Markdown);
+  const originalChildren = [...a.contentContainer.children];
+  try {
+    assert.equal(Object.hasOwn(md, "render"), false);
+    assert.equal(freshTranscriptChildren(f.document), f.document.children);
+    assert.equal(Object.hasOwn(md, "render"), true, "fresh preparation installs current panel wrappers before suffix measurement");
+    assert.equal(a.contentContainer.children.length, originalChildren.length + 2);
+    for (let index = 0; index < 10; index++) freshTranscriptChildren(f.document);
+    assert.equal(a.contentContainer.children.length, originalChildren.length + 2, "preparation does not duplicate panel geometry");
+    a.updateContent(message([text("streamed answer")]), true);
+    const next = a.contentContainer.children.find(child => child instanceof Markdown);
+    assert.equal(freshTranscriptChildren(f.document), f.document.children);
+    assert.equal(Object.hasOwn(md, "render"), false);
+    assert.equal(Object.hasOwn(next, "render"), true);
+    assert.equal(renders, 0, "fresh reconciliation is not a hidden full render pass");
+    f.chat.clear();
+    freshTranscriptChildren(f.document);
+    assert.equal(Object.hasOwn(next, "render"), false, "branch/compaction removals release detached wrappers during prepare too");
+    f.document.render = () => ["foreign document"];
+    assert.equal(freshTranscriptChildren(f.document), undefined);
+  } finally { dispose(); }
+});
+
+test("panel freshness never certifies a foreign original or a merely preserving renderer", () => {
+  for (const preserving of [false, true]) {
+    const f = fixture([assistant([text("answer")])]);
+    const native = f.document.render;
+    f.document.render = function(width) { const lines = native.call(this, width); return preserving ? lines : lines.slice().reverse(); };
+    const unregister = preserving ? registerTranscriptRenderer(f.document, f.document.render) : () => {};
+    const dispose = f.install();
+    try { assert.equal(freshTranscriptChildren(f.document), undefined); }
+    finally { dispose(); unregister(); }
   }
 });
 

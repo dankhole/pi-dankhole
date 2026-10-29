@@ -16,7 +16,8 @@ const jiti = createJiti(import.meta.url, { alias: {
   "@earendil-works/pi-tui": requirePi.resolve("@earendil-works/pi-tui"),
 } });
 const { getChildLineOffset, getChildLineOffsets, installGrouping, registerGrouping } = await jiti.import(resolve(dirname(fileURLToPath(import.meta.url)), "../../src/styling/grouping.ts"));
-const { Container, ScrollView, Text, VStack, visibleWidth } = await import(pathToFileURL(requirePi.resolve("@earendil-works/pi-tui")).href);
+const { freshTranscriptChildren } = await jiti.import(resolve(dirname(fileURLToPath(import.meta.url)), "../../src/styling/transcript-measurement.ts"));
+const { Container, MouseRegion, ScrollView, Text, VStack, visibleWidth } = await import(pathToFileURL(requirePi.resolve("@earendil-works/pi-tui")).href);
 const { ToolExecutionComponent } = await fromPi("dist/modes/interactive/components/tool-execution.js");
 const { AssistantMessageComponent } = await fromPi("dist/modes/interactive/components/assistant-message.js");
 const { InteractiveMode } = await fromPi("dist/modes/interactive/interactive-mode.js");
@@ -352,6 +353,54 @@ test("unchanged groups retain projection, summary widgets and native slots while
     assert.equal(openChildren[0], a);
     a.setExpanded(true);
     assert.match(plain(f.chat).join("\n"), /failed/);
+  } finally { f.dispose(); }
+});
+
+test("fresh displayed children reconcile live boundaries and late images without rendering history", () => {
+  const a = row();
+  const b = row();
+  const transparent = assistant([{ type: "toolCall", id: "fresh", name: "read", arguments: {} }]);
+  const f = fixture([a, transparent, b]);
+  let renders = 0;
+  for (const child of [a, b, transparent]) {
+    const render = child.render;
+    child.render = function(width) { renders++; return render.call(this, width); };
+  }
+  try {
+    const group = freshTranscriptChildren(f.chat)[0];
+    assert.equal(group.constructor.name, "ToolGroup");
+    assert.equal(renders, 0);
+    transparent.updateContent({ role: "assistant", stopReason: "toolUse", content: [{ type: "text", text: "new boundary" }] });
+    assert.deepEqual(freshTranscriptChildren(f.chat), [a, transparent, b], "same-object semantic mutation breaks the run before painting");
+    transparent.updateContent({ role: "assistant", stopReason: "toolUse", content: [{ type: "toolCall", id: "fresh", name: "read", arguments: {} }] });
+    assert.equal(freshTranscriptChildren(f.chat)[0], group, "unchanged leading member retains its owned group");
+    a.updateResult({ ...result(), content: [{ type: "image", data: "not rendered", mimeType: "image/png" }] });
+    assert.deepEqual(freshTranscriptChildren(f.chat), [a, transparent, b], "late images cannot remain hidden in a cached group");
+    const c = row();
+    f.chat.children = [b, transparent, c];
+    assert.deepEqual(freshTranscriptChildren(f.chat)[0].members, [b, c], "same-length replacement and rebuild use current native children");
+    assert.equal(renders, 0, "membership reconciliation never calls a historical renderer");
+    const foreign = () => ["foreign rows"];
+    f.chat.render = foreign;
+    assert.equal(freshTranscriptChildren(f.chat), undefined, "a foreign replacement cannot inherit the grouping capability");
+    f.dispose();
+    assert.equal(f.chat.render, foreign);
+  } finally { f.dispose(); }
+});
+
+test("fresh projection clears parent mouse heights before a suffix-only repaint", () => {
+  const a = row();
+  const b = row();
+  let clicks = 0;
+  const target = new MouseRegion(new Text("target", 0, 0), () => { clicks++; return { handled: true }; });
+  const f = fixture([a, b, target]);
+  try {
+    f.chat.render(100); // Parent hit metadata initially contains a two-line group.
+    a.updateResult({ ...result(), content: [{ type: "image", data: "not rendered", mimeType: "image/png" }] });
+    assert.deepEqual(freshTranscriptChildren(f.chat), [a, b, target]);
+    const y = a.render(100).length + b.render(100).length;
+    assert.equal(f.chat.handleMouse({ type: "click", button: "left", x: 2, y, screenX: 2, screenY: y, width: 100, height: y + 1 })?.handled, true);
+    assert.equal(clicks, 1, "the native pre-paint fallback measures current projected children rather than old group heights");
   } finally { f.dispose(); }
 });
 

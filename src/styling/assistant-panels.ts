@@ -285,10 +285,13 @@ export function installAssistantPanels(tui: unknown, options: AssistantPanelOpti
     for (const assistant of bottoms.keys()) if (!liveBottoms.has(assistant)) removeSpacer(assistant, bottoms);
     for (const component of patches.keys()) if (!current.has(component)) restore(component);
   };
+  const prepare = () => {
+    if (disposed) return false;
+    try { sync(); return true; }
+    catch { warn(); dispose(); return false; }
+  };
   function render(width: number): string[] {
-    if (!disposed) {
-      try { sync(); } catch { warn(); dispose(); }
-    }
+    prepare();
     return original.call(document, width);
   }
   try {
@@ -296,7 +299,13 @@ export function installAssistantPanels(tui: unknown, options: AssistantPanelOpti
     sync();
     // This wrapper reconciles native children, then returns original rows unchanged.
     // Never certify a foreign renderer merely because it refreshes mouseLayout.
-    if (preservesCoordinates && document.render === render) unregisterRenderer = registerTranscriptRenderer(document, render);
+    if (preservesCoordinates && document.render === render) unregisterRenderer = registerTranscriptRenderer(document, render, () => {
+      // Suffix measurement may skip document painting, never reconciliation.
+      // Only the exact native concatenator proves these freshly patched children
+      // are the returned document rows; other preserving wrappers stay full-pass.
+      if (original !== Container.prototype.render || !prepare()) return undefined;
+      return document.children;
+    });
     options.requestRender();
   } catch { warn(); dispose(); }
   return dispose;

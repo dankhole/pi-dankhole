@@ -23,13 +23,13 @@ const jiti = createJiti(import.meta.url, { alias: {
   "@earendil-works/pi-tui": requirePi.resolve("@earendil-works/pi-tui"),
 } });
 const source = path => jiti.import(resolve(dirname(fileURLToPath(import.meta.url)), "../../src", path));
-const { isTranscriptRendererSupported, registerTranscriptRenderer, TranscriptMeasurement, withTranscriptMeasurement } = await source("styling/transcript-measurement.ts");
+const { freshTranscriptChildren, isTranscriptRendererSupported, registerTranscriptRenderer, TranscriptMeasurement, withTranscriptMeasurement } = await source("styling/transcript-measurement.ts");
 const { installPinnedPrompt } = await source("styling/pinned-prompt.ts");
 const { installGrouping } = await source("styling/grouping.ts");
 const { installAssistantPanels } = await source("styling/assistant-panels.ts");
 const { QUESTION_CONTENT, questionListVisibility } = await source("questions/question-viewport.ts");
 
-function fixture({ pin = true, grouping = true, count = 60 } = {}) {
+function fixture({ pin = true, grouping = true, count = 60, reminder = true, panels = false } = {}) {
   const chat = new Container();
   const header = new Container(); header.addChild(new Text("Header", 0, 0));
   const document = new Container();
@@ -63,15 +63,16 @@ function fixture({ pin = true, grouping = true, count = 60 } = {}) {
   const tui = { mode: "fullscreen", children: [document], layoutRoot: viewport.root, terminal: { columns: 90, rows: 20 }, requestRender() {} };
   const disposeGrouping = installGrouping(tui, { groupConsecutive: grouping, defaultMode: "compact", tools: {}, backgrounds: "tool" },
     { theme: () => themes.theme, requestRender() {}, warn(message) { assert.fail(message); } });
+  const disposePanels = panels ? installAssistantPanels(tui, { theme: () => themes.theme, requestRender() {}, warn: assert.fail }) : () => {};
   const pinned = pin ? installPinnedPrompt(tui, () => themes.theme,
     () => ({ id: "prompt", text: "Selected prompt", displayed: true, rows: [{ id: "prompt", kind: "UserMessageComponent" }] }), assert.fail) : undefined;
   const show = questionListVisibility(tui, [pending]);
-  widgetsAbove.addChild({ invalidate() {}, render(width) { return show(width) ? ["Questions reminder"] : []; } });
-  return { tui, chat, cards, pending, document, viewport, show, user,
+  if (reminder) widgetsAbove.addChild({ invalidate() {}, render(width) { return show(width) ? ["Questions reminder"] : []; } });
+  return { tui, chat, cards, pending, document, viewport, show, user, widgetsAbove,
     frame() { return renderLayoutFrame(viewport.root, tui.terminal.columns, tui.terminal.rows, () => {}); },
     reset() { nativeRenders = 0; cardRenders = 0; metadataReads = 0; },
     counts() { return { nativeRenders, cardRenders, metadataReads }; },
-    dispose() { show.dispose(); pinned?.dispose(); disposeGrouping(); for (const dispose of rendererDisposers) dispose(); },
+    dispose() { show.dispose(); pinned?.dispose(); disposePanels(); disposeGrouping(); for (const dispose of rendererDisposers) dispose(); },
   };
 }
 
@@ -91,6 +92,152 @@ test("one visibility calculation shares a fresh transcript pass with nested pinn
       t.diagnostic(`pin=${pin}, grouping=${grouping}: ${counts.nativeRenders / 60} native/card render passes per fullscreen frame`);
     } finally { f.dispose(); }
   }
+});
+
+test("pin-only follow-end measures a bounded fresh suffix with owned grouping and panel projections too", () => {
+  const counts = [];
+  for (const grouping of [false, true]) for (const panels of [false, true]) for (const count of [60, 600]) {
+    const f = fixture({ grouping, panels, count, reminder: false });
+    try {
+      f.frame(); f.reset();
+      const entry = f.viewport.root.entries[0];
+      for (let index = 0; index < 10; index++) assert.equal(entry.visible({ width: 90, height: 20 }), true);
+      const measured = f.counts();
+      assert.equal(measured.cardRenders, measured.nativeRenders);
+      assert.equal(measured.metadataReads, 0);
+      assert.equal(measured.nativeRenders, 60,
+        "each of ten calculations freshly renders six native self-shell cards, independent of history size");
+      counts.push(measured.nativeRenders);
+      f.reset();
+      f.viewport.transcript.scrollToStart();
+      assert.equal(entry.visible({ width: 90, height: 20 }), false);
+      assert.equal(f.counts().nativeRenders, count, "manual scrolling uses fresh full coordinates immediately");
+    } finally { f.dispose(); }
+  }
+  assert.ok(counts.every(count => count === counts[0]), "history size and owned wrappers do not increase suffix rendering work");
+});
+
+test("default panels/grouping/pin bound actual grouped suffix rendering; pending reminders retain one shared pass", () => {
+  for (const reminder of [false, true]) for (const count of [60, 600]) {
+    const f = fixture({ grouping: true, panels: true, count, reminder });
+    try {
+      f.chat.children = [f.user, ...f.cards.flatMap((card, index) => {
+        const tools = [0, 1].map(part => {
+          const tool = new ToolExecutionComponent("bash", `grouped-${index}-${part}`, {}, { showImages: false }, undefined, { requestRender() {} }, process.cwd());
+          tool.updateResult({ content: [{ type: "text", text: "done" }], details: undefined, isError: false });
+          return tool;
+        });
+        return [...tools, card];
+      })];
+      f.frame();
+      const groups = freshTranscriptChildren(f.chat).filter(child => child.constructor.name === "ToolGroup");
+      assert.equal(groups.length, count, "the fixture contains real collapsed groups between question-card boundaries");
+      let groupRenders = 0;
+      for (const group of groups) {
+        const render = group.render;
+        group.render = function(width) { groupRenders++; return render.call(this, width); };
+      }
+      f.reset();
+      if (reminder) {
+        assert.equal(f.show(90), false, "the last pending question remains visible through both projections");
+        assert.equal(f.counts().nativeRenders, count);
+        assert.equal(groupRenders, count, "nested pin/reminder calculation renders each group only once");
+      } else {
+        assert.equal(f.viewport.root.entries[0].visible({ width: 90, height: 20 }), true);
+        assert.equal(f.counts().nativeRenders, 4);
+        assert.equal(groupRenders, 3, "only a viewport-filling suffix of actual group summaries is rendered");
+      }
+      assert.equal(f.counts().metadataReads, reminder ? 1 : 0);
+    } finally { f.dispose(); }
+  }
+});
+
+test("default projected suffix visibility matches fresh native rows through group toggles, late images and replacements", () => {
+  const f = fixture({ grouping: true, panels: true, count: 0, reminder: false });
+  try {
+    const tools = [0, 1].map(index => {
+      const tool = new ToolExecutionComponent("bash", `toggle-${index}`, { command: "echo result" }, { showImages: false }, undefined, { requestRender() {} }, process.cwd());
+      tool.updateResult({ content: [{ type: "text", text: "result\n".repeat(40) }], details: undefined, isError: false });
+      return tool;
+    });
+    f.chat.children = [f.user, ...tools];
+    const check = () => {
+      // Evaluate the optimized predicate first: no full document render may
+      // prepare membership/wrappers for it after the mutation under test.
+      const actual = f.viewport.root.entries[0].visible({ width: 90, height: 20 });
+      const lines = f.document.render(90);
+      const row = lines.findIndex(line => line.includes("Selected prompt"));
+      assert.ok(row >= 0);
+      const viewport = 20 - f.viewport.root.entries.at(-1).component.render(90).length;
+      assert.equal(actual, row < Math.max(0, lines.length - viewport));
+      return actual;
+    };
+    assert.equal(check(), false, "collapsed groups leave native user text visible");
+    tools[0].setExpanded(true);
+    assert.equal(check(), true, "native global/detail expansion is sampled immediately");
+    tools[0].setExpanded(false);
+    assert.equal(check(), false);
+    const click = () => {
+      const lines = f.chat.render(90);
+      const y = lines.findIndex(line => /2 tools/.test(line));
+      assert.ok(y >= 0);
+      assert.equal(f.chat.handleMouse({ type: "click", button: "left", x: 3, y, screenX: 3, screenY: y, width: 90, height: lines.length })?.handled, true);
+    };
+    click();
+    assert.equal(check(), true, "manual list expansion is retained by fresh preparation");
+    for (const tool of tools) tool.setExpanded(true);
+    check();
+    for (const tool of tools) tool.setExpanded(false);
+    assert.equal(check(), true, "global collapse does not close a manually opened list");
+    click();
+    assert.equal(check(), false);
+    tools[0].updateResult({ content: [{ type: "image", data: "not rendered", mimeType: "image/png" }], details: undefined, isError: false });
+    check();
+    f.chat.children[1] = new Text("replacement\n".repeat(40), 0, 0);
+    assert.equal(check(), true, "same-length replacement is not hidden by previous grouping membership");
+  } finally { f.dispose(); }
+});
+
+test("outer pin visibility uses its own viewport after a nested reminder checks a larger one", () => {
+  for (const grouping of [false, true]) {
+    const f = fixture({ grouping, count: 10 });
+    try {
+      // Keep the pending question above the selected prompt. Only its reminder
+      // should consume the extra row that hides the prompt's last text row.
+      f.pending.toolCallId = "question-0";
+      f.chat.children = [f.cards[0], f.user, ...f.cards.slice(1)];
+      const widget = f.widgetsAbove.children.pop();
+      const dock = f.viewport.root.entries.at(-1).component.render(90).length;
+      f.widgetsAbove.addChild(widget);
+      const rows = f.user.render(90);
+      const target = rows.findIndex(line => line.includes("Selected prompt"));
+      assert.ok(target >= 0);
+      const after = f.cards.slice(1).reduce((sum, card) => sum + card.render(90).length, 0);
+      f.tui.terminal.rows = dock + after + rows.length - target;
+      assert.equal(f.viewport.root.entries[0].visible({ width: 90, height: f.tui.terminal.rows }), true,
+        "nested visibility without the reminder cannot overwrite the outer result with it");
+      assert.equal(f.show(90), true, "the earlier pending question still needs its reminder");
+    } finally { f.dispose(); }
+  }
+});
+
+test("captured heights and offsets do not allocate child line slices", () => {
+  const content = new Text("one\ntwo", 0, 0);
+  const region = new MouseRegion(content, () => undefined);
+  const container = new Container(); container.addChild(region);
+  const measurement = new TranscriptMeasurement();
+  const lines = measurement.render(container, 40);
+  let slices = 0;
+  const slice = lines.slice;
+  lines.slice = function(...args) { slices++; return slice.apply(this, args); };
+  assert.equal(measurement.height(region, 40), 2);
+  assert.equal(measurement.height(content, 40), 2);
+  assert.equal(measurement.offsets(container, 40).get(region), 0);
+  assert.equal(measurement.offsets(region, 40).get(content), 0);
+  assert.equal(measurement.offsets(content, 40), undefined);
+  assert.equal(slices, 0, "height/offset/overlap checks need only the captured native metadata");
+  assert.equal(measurement.render(content, 40).length, 2);
+  assert.equal(slices, 1, "rows remain lazily available when content visibility needs them");
 });
 
 test("snapshots expire after calculation, including same-object streaming and same-length replacements", () => {
@@ -119,13 +266,14 @@ test("native concatenation and MouseRegion rows are reused without render patche
   const region = new MouseRegion(content, () => undefined);
   const container = new Container(); container.addChild(region);
   const original = content.render;
-  withTranscriptMeasurement(container, measurement => {
+  withTranscriptMeasurement(container, (measurement, shared) => {
+    assert.equal(shared, false);
     assert.equal(measurement.offsets(container, 40).get(region), 0);
     assert.equal(measurement.offsets(region, 40).get(content), 0);
     assert.deepEqual(measurement.render(content, 40), ["one", "two"]);
     assert.equal(content.render, original);
     assert.equal(renders, 1);
-    withTranscriptMeasurement(container, nested => assert.equal(nested, measurement));
+    withTranscriptMeasurement(container, (nested, shared) => { assert.equal(nested, measurement); assert.equal(shared, true); });
   });
   assert.equal(new TranscriptMeasurement().offsets(container, 40).get(region), 0);
   assert.equal(renders, 2, "a later calculation refreshes native rendering");

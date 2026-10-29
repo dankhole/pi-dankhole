@@ -236,40 +236,49 @@ export function installGrouping(tui: unknown, settings: Settings, options: Group
     options.warn(`Compact tools: grouping disabled after an incompatible transcript update (${error instanceof Error ? error.message : String(error)}); keeping individual rows.`);
   };
 
+  // Reconcile membership without rendering history. Pin visibility may consume
+  // a fresh bounded suffix of this same projection; native painting still owns
+  // complete mouse geometry and renders it through the normal path below.
+  function refreshProjection(): void {
+    const children: Component[] = [];
+    let members: NativeTool[] = [];
+    let slots: Component[] = [];
+    const flush = () => {
+      if (members.length > 1) {
+        let group = groups.get(members[0]);
+        if (!group) {
+          group = new ToolGroup(groupOptions, fail, settings);
+          groups.set(members[0], group);
+        }
+        group.update(members, slots);
+        children.push(group);
+      } else for (const slot of slots) children.push(slot);
+      members = [];
+      slots = [];
+    };
+    for (const child of chat.children) {
+      if (eligible(child, settings)) {
+        members.push(child);
+        slots.push(child);
+      } else if (members.length && transparent(child)) {
+        slots.push(child);
+      } else {
+        flush();
+        children.push(child);
+      }
+    }
+    flush();
+    if (children.length !== projected.children.length || children.some((child, index) => child !== projected.children[index])) {
+      projected.children = children;
+    }
+    // A suffix-only measurement does not repaint the parent. Clear old native
+    // hit heights so any pre-paint mouse event uses fresh child rendering.
+    (projected as unknown as { mouseLayout?: unknown }).mouseLayout = undefined;
+  }
   function render(width: number): string[] {
     if (disposed) return originalRender.call(chat, width);
     try {
-      const children: Component[] = [];
-      let members: NativeTool[] = [];
-      let slots: Component[] = [];
-      const flush = () => {
-        if (members.length > 1) {
-          let group = groups.get(members[0]);
-          if (!group) {
-            group = new ToolGroup(groupOptions, fail, settings);
-            groups.set(members[0], group);
-          }
-          group.update(members, slots);
-          children.push(group);
-        } else for (const slot of slots) children.push(slot);
-        members = [];
-        slots = [];
-      };
-      for (const child of chat.children) {
-        if (eligible(child, settings)) {
-          members.push(child);
-          slots.push(child);
-        } else if (members.length && transparent(child)) {
-          slots.push(child);
-        } else {
-          flush();
-          children.push(child);
-        }
-      }
-      flush();
-      if (children.length !== projected.children.length || children.some((child, index) => child !== projected.children[index])) {
-        projected.children = children;
-      }
+      refreshProjection();
       return projected.render(width);
     } catch (error) {
       fail(error);
@@ -287,7 +296,11 @@ export function installGrouping(tui: unknown, settings: Settings, options: Group
   try {
     Object.defineProperty(chat, "render", { configurable: true, writable: true, value: render });
     Object.defineProperty(chat, "handleMouse", { configurable: true, writable: true, value: handleMouse });
-    unregisterProjection = registerTranscriptProjection(chat, { view: projected, render });
+    unregisterProjection = registerTranscriptProjection(chat, { view: projected, render, freshChildren: () => {
+      if (disposed || projected.render !== Container.prototype.render) return undefined;
+      try { refreshProjection(); return projected.children; }
+      catch (error) { fail(error); return undefined; }
+    } });
   } catch (error) { fail(error); }
   return dispose;
 }

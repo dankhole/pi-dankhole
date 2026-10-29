@@ -19,6 +19,7 @@ import { abortable } from "./abortable.js";
 import { AgentManager, type SpawnOptions } from "./agent-manager.js";
 import { getAgentConversation, getDefaultMaxTurns, getGraceTurns, getRememberAgents, normalizeMaxTurns, SUBAGENT_TOOL_NAMES, setDefaultMaxTurns, setGraceTurns, setRememberAgents, steerAgent } from "./agent-runner.js";
 import { inChildSessionContext } from "./child-context.js";
+import { CompletionDiagnostics, describeCompletionDiagnostic } from "./completion-diagnostics.js";
 import { CompletionOutbox } from "./completion-outbox.js";
 import { type RpcHandle, registerRpcHandlers } from "./cross-extension-rpc.js";
 import { assertSupportedResumeParams, isolationParam, launchConfigParams, resolveAgentInvocationConfig } from "./invocation-config.js";
@@ -74,6 +75,10 @@ export function renderRunningAgentStatus(
 
 /** How long a foreground `Agent` call runs before its row offers ctrl+b. */
 const BACKGROUND_HINT_DELAY_MS = 2000;
+
+/** Finite observation only: arbitrarily long compaction hooks need a host finalizer signal. */
+const COMPACT_IDLE_OBSERVATION_MS = 30_000;
+const COMPACT_IDLE_RETRY_MS = 500;
 
 /** Format an agent's lifetime token total, or "" when zero. */
 function formatLifetimeTokens(o: { lifetimeUsage: LifetimeUsage }): string {
@@ -221,9 +226,8 @@ function buildNotificationDetails(record: AgentRecord, resultMaxLen: number, act
     turnCount: activity?.turnCount ?? 0,
     maxTurns: activity?.maxTurns,
     totalTokens,
-    // Carried unconditionally; the renderer gates on the setting. Details are
-    // data, and a notification rendered before a mid-session toggle should not
-    // be stuck with the old answer.
+    // Retain raw cost independently of presentation. Completion cards capture
+    // showCost when constructed; toggling it does not update historical cards.
     totalCost: getLifetimeCost(record.lifetimeUsage),
     durationMs: record.completedAt ? record.completedAt - record.startedAt : 0,
     outputFile: record.outputFile,
@@ -300,6 +304,48 @@ export default function (pi: ExtensionAPI) {
   // pending as one message at the parent's next boundary (see
   // completion-outbox.ts). Each is built when the agent finishes, and reading
   // the result (get_subagent_result, rpc consume) cancels it before it is sent.
+  const completionStatusKey = "subagents:pending-completions";
+  let completionStatusUi: ExtensionContext["ui"] | undefined;
+  let parentCompacting = false;
+  let parentRunStarted = false;
+
+  function clearCompletionStatus(): void {
+    const ui = completionStatusUi;
+    completionStatusUi = undefined;
+    try { ui?.setStatus(completionStatusKey, undefined); } catch { /* stale UI */ }
+  }
+
+  function updateCompletionStatus(): void {
+    try {
+      const count = outbox.getPendingState().count;
+      if (count === 0) clearCompletionStatus();
+      else if (currentCtx?.hasUI) {
+        const waitingFor = parentCompacting ? "compaction" : "the main agent";
+        // Pi 1.4's TUI routes Escape to abortCompaction during compaction.
+        const cancelHint = parentCompacting && currentCtx.mode === "tui" ? " — Esc to cancel" : "";
+        completionStatusUi = currentCtx.ui;
+        completionStatusUi.setStatus(completionStatusKey,
+          `${count} worker result${count === 1 ? "" : "s"} waiting for ${waitingFor}${cancelHint}`);
+      }
+    } catch { /* stale UI, including getters, must not affect delivery */ }
+  }
+
+  const completionDiagnostics: CompletionDiagnostics = new CompletionDiagnostics(
+    () => outbox.getPendingState(),
+    () => ({
+      idle: currentCtx?.isIdle(),
+      queuedMessages: currentCtx?.hasPendingMessages(),
+      signal: currentCtx?.signal ? currentCtx.signal.aborted ? "aborted" : "active" : "absent",
+    }),
+    (snapshot, notify) => {
+      // The immediate status above is the only banner owner. The watchdog
+      // adds a bounded warning, never a delivery or a duplicate status entry.
+      if (snapshot && notify && currentCtx?.hasUI) {
+        currentCtx.ui.notify(describeCompletionDiagnostic(snapshot), "warning");
+      }
+    },
+    () => ({ widget: widget.getAnimationTimerCount(), fleet: fleet.getRefreshTimerCount(), foreground: foregroundSpinnerCount }),
+  );
   const outbox = new CompletionOutbox(
     (message) => pi.sendMessage<NotificationDetails>({
       customType: "subagent-notification",
@@ -310,6 +356,12 @@ export default function (pi: ExtensionAPI) {
     // The low-level signal disappears between retry attempts; the host stays
     // busy until automatic recovery and abort cleanup have actually settled.
     () => currentCtx !== undefined && !currentCtx.isIdle(),
+    () => {
+      completionDiagnostics.pendingChanged();
+      updateCompletionStatus();
+      if (outbox.getPendingState().count === 0) cancelCompactIdleCheck();
+      else scheduleCompactIdleCheck(0);
+    },
   );
   const QUEUE_WAIT_POLL_MS = 50;
 
@@ -526,6 +578,71 @@ export default function (pi: ExtensionAPI) {
 
   // --- Cross-extension RPC via pi.events ---
   let currentCtx: ExtensionContext | undefined;
+  let sessionGeneration = 0;
+  let compactIdleCheck: ReturnType<typeof setTimeout> | undefined;
+  let compactIdleObservation: { context: ExtensionContext; generation: number; deadline: number } | undefined;
+  let foregroundSpinnerCount = 0;
+
+  function cancelCompactIdleCheck(): void {
+    if (compactIdleCheck !== undefined) clearTimeout(compactIdleCheck);
+    compactIdleCheck = undefined;
+  }
+
+  function clearCompactIdleObservation(): void {
+    cancelCompactIdleCheck();
+    compactIdleObservation = undefined;
+  }
+
+  function scheduleCompactIdleCheck(delay: number): void {
+    const observation = compactIdleObservation;
+    if (!observation || compactIdleCheck !== undefined || parentRunStarted
+      || currentCtx !== observation.context || sessionGeneration !== observation.generation
+      || outbox.getPendingState().count === 0 || performance.now() >= observation.deadline) return;
+    const timer = setTimeout(() => {
+      if (compactIdleCheck !== timer) return;
+      compactIdleCheck = undefined;
+      if (compactIdleObservation !== observation
+        || currentCtx !== observation.context || sessionGeneration !== observation.generation
+        || outbox.getPendingState().count === 0 || performance.now() > observation.deadline) return;
+      try {
+        // A missing low-level signal is not proof that retry/preparation ended.
+        // Observed parent runs and new input own their next turn until a boundary.
+        if (parentRunStarted || observation.context.signal !== undefined) {
+          clearCompactIdleObservation();
+          return;
+        }
+        outbox.onIdle(); // Rechecks public idle for every attempted delivery.
+        const remaining = observation.deadline - performance.now();
+        if (remaining > 0) scheduleCompactIdleCheck(Math.min(COMPACT_IDLE_RETRY_MS, remaining));
+      } catch { clearCompactIdleObservation(); /* invalidation is not proof of idle */ }
+    }, delay);
+    compactIdleCheck = timer;
+    timer.unref();
+  }
+
+  function checkIdleAfterCompact(): void {
+    clearCompactIdleObservation();
+    if (!currentCtx || parentRunStarted) return;
+    // The host awaits later compaction handlers before clearing busy state.
+    // Keep the original 30s deadline even while the queue is empty: a worker
+    // may finish in a later handler. Only pending completions arm a timer.
+    // Arrivals never extend the deadline; expiry retains queue/diagnostics.
+    compactIdleObservation = {
+      context: currentCtx,
+      generation: sessionGeneration,
+      deadline: performance.now() + COMPACT_IDLE_OBSERVATION_MS,
+    };
+    scheduleCompactIdleCheck(0);
+  }
+
+  function afterSummary(event: "session_compact" | "session_compact_failed" | "session_tree"): void {
+    // Do not retain errors or summary content in diagnostics.
+    completionDiagnostics.observe(event);
+    parentCompacting = false;
+    checkIdleAfterCompact();
+    updateCompletionStatus();
+  }
+
   // RPC handlers + the `subagents:ready` broadcast are wired on `session_start`
   // (a bound lifecycle event), not at factory time. pi runs every extension
   // factory before the `extensions:` filter and only fires lifecycle events for
@@ -539,7 +656,14 @@ export default function (pi: ExtensionAPI) {
   // bound session_start, so a filtered-out activation never advertises (#142).
   pi.on("session_start", async (_event, ctx) => {
     if (!ownsManagerRegistry) return;
+    clearCompactIdleObservation();
+    parentCompacting = false;
+    parentRunStarted = false;
+    clearCompletionStatus();
+    sessionGeneration++;
     currentCtx = ctx;
+    completionDiagnostics.observe("session_start");
+    updateCompletionStatus();
     if (ctx.hasUI) {
       widget.setUICtx(ctx.ui);
       fleet.setUICtx(ctx.ui as any);
@@ -591,6 +715,12 @@ export default function (pi: ExtensionAPI) {
     rpcHandle?.unsubConsume();
     rpcHandle?.unsubSteer();
     rpcHandle = undefined;
+    clearCompactIdleObservation();
+    parentCompacting = false;
+    parentRunStarted = false;
+    clearCompletionStatus();
+    sessionGeneration++;
+    completionDiagnostics.dispose();
     currentCtx = undefined;
     // Only release the global slot if this activation claimed it — a child
     // session's shutdown must not delete the root session's registry entry.
@@ -830,6 +960,7 @@ export default function (pi: ExtensionAPI) {
 
   // Grab UI context from first tool execution + clear lingering widget on new turn
   pi.on("tool_execution_start", async (_event, ctx) => {
+    completionDiagnostics.observe("tool_execution_start");
     widget.setUICtx(ctx.ui as UICtx);
     fleet.setUICtx(ctx.ui as unknown as FleetUICtx);
     watchHandoffKey(ctx.ui);
@@ -839,9 +970,43 @@ export default function (pi: ExtensionAPI) {
   // The parent's tool batch is done and its next model call not yet made: the
   // boundary where completions are delivered, as in Claude Code.
   pi.on("turn_end", (event) => {
-    outbox.onTurnEnd(event.message.role === "assistant" ? event.message.stopReason : undefined);
+    const stopReason = event.message.role === "assistant" ? event.message.stopReason : undefined;
+    completionDiagnostics.observe("turn_end", stopReason);
+    outbox.onTurnEnd(stopReason);
   });
-  pi.on("agent_settled", () => outbox.onSettled());
+  pi.on("agent_settled", () => {
+    parentRunStarted = false;
+    clearCompactIdleObservation();
+    completionDiagnostics.observe("agent_settled");
+    outbox.onSettled();
+  });
+  pi.on("input", () => {
+    clearCompactIdleObservation();
+    completionDiagnostics.observe("input");
+  });
+  pi.on("before_agent_start", () => {
+    clearCompactIdleObservation();
+    completionDiagnostics.observe("before_agent_start");
+  });
+  pi.on("agent_start", () => {
+    parentRunStarted = true;
+    clearCompactIdleObservation();
+    completionDiagnostics.observe("agent_start");
+  });
+  pi.on("turn_start", () => { completionDiagnostics.observe("turn_start"); });
+  pi.on("tool_execution_end", () => { completionDiagnostics.observe("tool_execution_end"); });
+  pi.on("agent_end", () => { completionDiagnostics.observe("agent_end"); });
+  pi.on("agent_before_settle", () => { completionDiagnostics.observe("agent_before_settle"); });
+  pi.on("session_before_compact", () => {
+    clearCompactIdleObservation();
+    parentCompacting = true;
+    completionDiagnostics.observe("session_before_compact");
+    updateCompletionStatus();
+  });
+  pi.on("session_compact", () => afterSummary("session_compact"));
+  pi.on("session_compact_failed", () => afterSummary("session_compact_failed"));
+  // Pi 1.4 has no tree-summary failure event; successful navigation is observable.
+  pi.on("session_tree", () => afterSummary("session_tree"));
 
   // Apply persisted settings on startup and emit `subagents:settings_loaded`.
   // Global + project merged; missing → defaults; corrupt file emits a warning
@@ -1488,14 +1653,15 @@ Terse command-style prompts produce shallow, generic work.
         spinnerFrame++;
         streamUpdate();
       }, 80);
+      foregroundSpinnerCount++;
       const stopPresentation = () => {
+        if (presentationStopped) return;
         presentationStopped = true;
+        foregroundSpinnerCount--;
         clearInterval(spinnerInterval);
       };
       signal?.addEventListener("abort", stopPresentation, { once: true });
       if (signal?.aborted) stopPresentation();
-
-      streamUpdate();
 
       // ctrl+b or the viewer's `b` wakes this with the run already handed over
       // (`sendForegroundToBackground`), raced against the run below. The
@@ -1507,6 +1673,9 @@ Terse command-style prompts produce shallow, generic work.
 
       let fgResult: { record: AgentRecord } | undefined;
       try {
+        // Keep even the initial presentation callback under the timer/listener
+        // cleanup: a synchronous UI failure must not leak the 80ms interval.
+        streamUpdate();
         fgResult = await Promise.race([manager.spawnAndWait(pi, ctx, params.prompt, {
           description: params.description!,
           config,
@@ -2213,8 +2382,14 @@ Terse command-style prompts produce shallow, generic work.
   }
 
   pi.registerCommand("agents", {
-    description: "Manage agents",
-    handler: async (_args, ctx) => { await showAgentsMenu(ctx); },
+    description: "Manage agents; diagnostics shows completion wait observations",
+    handler: async (args, ctx) => {
+      if (args.trim() === "diagnostics") {
+        ctx.ui.notify(describeCompletionDiagnostic(completionDiagnostics.snapshot()), "info");
+        return;
+      }
+      await showAgentsMenu(ctx);
+    },
   });
 
 

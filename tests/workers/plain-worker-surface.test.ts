@@ -78,7 +78,14 @@ describe("plain worker surface", () => {
   it("leaves normal input and file autocomplete alone", async () => {
     const context = ctx();
     await booted.lifecycle.get("session_start")?.({}, context);
-    expect(booted.lifecycle.has("input")).toBe(false);
+    // Agent mentions were removed: an input listener may only observe (it cancels
+    // the post-summary delivery check), never handle or transform user input.
+    const input = booted.lifecycle.get("input");
+    if (input) {
+      const event = { type: "input", text: "@worker do something", images: [], source: "interactive" };
+      expect(await input(event, context)).toBeUndefined();
+      expect(event.text).toBe("@worker do something");
+    }
     expect(context.ui.addAutocompleteProvider).not.toHaveBeenCalled();
   });
 });

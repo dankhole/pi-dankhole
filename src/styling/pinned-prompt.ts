@@ -2,7 +2,7 @@ import { stripVTControlCharacters } from "node:util";
 import { type ExtensionAPI, parseSkillBlock, type Theme } from "@earendil-works/pi-coding-agent";
 import { type Component, type TUI, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { userBackground } from "./palette.ts";
-import { isTranscriptRendererSupported, withTranscriptMeasurement } from "./transcript-measurement.ts";
+import { freshTranscriptChildren, isTranscriptRendererSupported, withTranscriptMeasurement } from "./transcript-measurement.ts";
 
 interface Tree extends Component { children: Component[] }
 interface Stack extends Tree {
@@ -107,26 +107,59 @@ export function installPinnedPrompt(tui: TUI, getTheme: () => Theme, fromHistory
     && scrollEntry.maxSize === undefined && scrollEntry.visible === undefined
     && dockEntry?.basis === "auto" && dockEntry.grow === 0 && dockEntry.shrink === 1 && dockEntry.minSize === 1
     && dockEntry.maxSize === undefined && dockEntry.visible === undefined;
-  const show = ({ width: columns, height }: { width: number; height: number }) => withTranscriptMeasurement(tui, measurement => {
+  const show = ({ width: columns, height }: { width: number; height: number }) => withTranscriptMeasurement(tui, (measurement, shared) => {
     const latest = measurement.memo(identities, currentPrompt);
     shown = !disposed && !!latest.text;
     if (!shown || !measurable() || !latest.identified || !latest.component || !isTranscriptRendererSupported(latest.component) || !Number.isFinite(transcript.scrollTop)
       || typeof transcript.isFollowingEnd !== "boolean" || height >= Number.MAX_SAFE_INTEGER) return shown;
     width = columns;
     const contentWidth = transcript.getContentWidth(columns);
+    let viewport: number | undefined;
+    const viewportHeight = () => viewport ??= Math.min(height, Math.max(1, height - Math.max(1, dockEntry.component.render(columns).length)));
+    // At follow-end, a target row's distance from the document end depends only
+    // on its fresh suffix. Owned grouping/panel adapters must reconcile their
+    // native concatenation before exposing children; no previous-frame layout
+    // or membership is reused. Unknown wrappers retain full measurement.
+    // Nested reminders keep their one full pass instead of rendering a suffix
+    // which their subsequent native document pass would repeat.
+    if (!shared && transcript.isFollowingEnd) {
+      const visibleHeight = viewportHeight();
+      shown = true; // Dock measurement may have evaluated a nested pin predicate.
+      const documentChildren = freshTranscriptChildren(document);
+      const children = documentChildren?.at(-1) === chat ? freshTranscriptChildren(chat) : undefined;
+      const target = children?.lastIndexOf(latest.component) ?? -1;
+      if (children && target >= 0) {
+        let after = 0;
+        for (let index = children.length - 1; index > target; index--) {
+          after += measurement.height(children[index], contentWidth);
+          if (after >= visibleHeight) return shown;
+        }
+        const rows = measurement.render(latest.component, contentWidth);
+        for (let index = Math.max(0, Math.ceil(rows.length + after - visibleHeight)); index < rows.length; index++) {
+          if (clean(rows[index])) { shown = false; break; }
+        }
+        return shown;
+      }
+    }
     const lines = measurement.render(document, contentWidth);
     const preceding = measurement.offsets(document, contentWidth)?.get(chat);
     const offset = measurement.offsets(chat, contentWidth)?.get(latest.component);
     if (preceding === undefined || offset === undefined) return shown;
     const start = preceding + offset;
-    const rows = measurement.render(latest.component, contentWidth);
-    // Blank padding and blank markdown lines are not visible message content.
-    const contentRows = rows.flatMap((line, index) => clean(line) ? [start + index] : []);
-    if (!contentRows.length) return shown;
-    const viewport = Math.min(height, Math.max(1, height - Math.max(1, dockEntry.component.render(columns).length)));
-    const maxTop = Math.max(0, lines.length - viewport);
+    const visibleHeight = viewportHeight();
+    shown = true; // Our viewport, not the nested reminder's no-reminder viewport.
+    const maxTop = Math.max(0, lines.length - visibleHeight);
     const top = transcript.isFollowingEnd ? maxTop : Math.min(Math.max(0, transcript.scrollTop), maxTop);
-    shown = !contentRows.some(row => row >= top && row < top + viewport);
+    const first = Math.max(0, Math.ceil(top - start));
+    const end = Math.min(measurement.height(latest.component, contentWidth), top + visibleHeight - start);
+    // Inspect only intersecting rows, and don't materialize the target's slice
+    // at all when it is off-screen. Blank padding is not message content.
+    if (first < end) {
+      const rows = measurement.render(latest.component, contentWidth);
+      for (let index = first; index < end; index++) {
+        if (clean(rows[index])) { shown = false; break; }
+      }
+    }
     return shown;
   });
   const jump = () => withTranscriptMeasurement(tui, measurement => {
@@ -154,6 +187,11 @@ export function installPinnedPrompt(tui: TUI, getTheme: () => Theme, fromHistory
     transcript.scrollTo(preceding + offset, { disableFollow: true });
     tui.requestRender();
   });
+  // One primitive-keyed entry, not a transcript/layout cache. Large unchanged
+  // prompts need not be stripped and truncated on every unrelated repaint.
+  let paintedText: string | undefined;
+  let paintedWidth = 0;
+  let paintedBody = "";
   const bar: Component = {
     invalidate() {},
     render(columns) {
@@ -161,9 +199,14 @@ export function installPinnedPrompt(tui: TUI, getTheme: () => Theme, fromHistory
       // Painting needs history text only, not another provenance/row association pass.
       const text = fromHistory()?.text ?? latestInput(chat)?.text;
       if (disposed || !shown || !text || columns <= 0) return [];
-      const body = truncateToWidth(` ↑ You: ${clean(text)}  · click to jump`, columns);
+      if (text !== paintedText || columns !== paintedWidth) {
+        paintedText = text;
+        paintedWidth = columns;
+        const body = truncateToWidth(` ↑ You: ${clean(text)}  · click to jump`, columns);
+        paintedBody = body + " ".repeat(Math.max(0, columns - visibleWidth(body)));
+      }
       const theme = getTheme();
-      const line = theme.fg("userMessageText", body + " ".repeat(Math.max(0, columns - visibleWidth(body))));
+      const line = theme.fg("userMessageText", paintedBody);
       const background = conversationPanels ? userBackground(theme) : "";
       return [background ? background + line + "\x1b[49m" : theme.bg("userMessageBg", line)];
     },

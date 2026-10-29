@@ -610,14 +610,14 @@ test("full extension wiring combines all UI features and cleans on reload", asyn
     assert.equal(question.terminate, true);
     const pending = view.widgets.get("compact-tools:questions");
     const pendingRows = pending.render(90);
-    assert.equal(pendingRows.length, 3, "one top spacer, question text, and one bottom spacer without a header");
+    assert.equal(pendingRows.length, 4, "top spacer, collapsible header, question text, and bottom spacer");
     assert.equal(plain(pendingRows[0]), " ".repeat(90));
     assert.match(pendingRows[0], /\x1b\[48;/, "top buffer is filled rather than terminal gray");
     assert.equal(pendingRows.at(-1), pendingRows[0], "bottom buffer uses the same regular amber");
-    assert.equal(pendingRows[0].match(/\x1b\[48;[^m]+m/)?.[0], pendingRows[1].match(/\x1b\[48;[^m]+m/)?.[0], "reminder buffers match the ordinary question fill rather than darker separators");
-    assert.equal(pending.handleMouse({ type: "click", button: "left", x: 3, y: 2 }), undefined, "reminder bottom spacing has no answer target");
-    assert.match(plain(pendingRows[1]), /Q1: Keep the ordinary input available/);
-    assert.doesNotMatch(pendingRows.map(plain).join("\n"), /Questions ·|\d+ pending/);
+    assert.equal(pendingRows[0].match(/\x1b\[48;[^m]+m/)?.[0], pendingRows[2].match(/\x1b\[48;[^m]+m/)?.[0], "reminder buffers match the ordinary question fill rather than darker separators");
+    assert.equal(pending.handleMouse({ type: "click", button: "left", x: 3, y: 3 }), undefined, "reminder bottom spacing has no answer target");
+    assert.match(plain(pendingRows[1]), /▾ Questions · 1 pending/);
+    assert.match(plain(pendingRows[2]), /Q1: Keep the ordinary input available/);
     assert.doesNotMatch(plain(view.editor.render(90)[1]), /pending question|· \/q/);
     assert.equal(view.statuses.has("compact-tools:questions"), false, "only the widget shows pending questions");
     assert.match(plain(view.frame().lines[0]), /full extension input/);
@@ -661,14 +661,76 @@ test("pin painting does not repeat provenance resolution or native component mea
   const entry = view.root.entries[0];
   assert.equal(entry.visible({ width: 90, height: 15 }), true);
   assert.equal(scans, 1);
-  assert.equal(renders, 1, "one fresh document pass supplies target rows and offsets too");
+  assert.equal(renders, 0, "a fresh viewport-filling suffix proves the prompt off-screen without rendering it");
   for (let index = 0; index < 100; index++) entry.component.render(90);
   assert.equal(scans, 1, "painting needs history text only");
-  assert.equal(renders, 1);
+  assert.equal(renders, 0);
   await extension.commands.get("latest-input").handler("", view.ctx);
   assert.equal(scans, 2, "jump resolves current provenance afresh");
-  assert.equal(renders, 2, "jump also measures the document only once");
+  assert.equal(renders, 1, "jump always measures fresh full coordinates, even after a suffix-only visibility check");
   await emit(extension, "session_shutdown", view.ctx);
+});
+
+test("native suffix visibility refreshes same-object streaming, replacement, padding and live dock bounds", async () => {
+  const extension = await load();
+  const view = setup(true);
+  const user = view.addUser("Suffix target");
+  const tail = new Text("long tail\n".repeat(40), 0, 0);
+  view.chat.addChild(tail);
+  await emit(extension, "session_start", view.ctx);
+  const entry = view.root.entries[0];
+  const show = (width = 90, height = 15) => entry.visible({ width, height });
+  assert.equal(show(), true);
+  tail.setText("short tail");
+  assert.equal(show(), false, "same object and unchanged width/leaf/count shrink immediately");
+  view.chat.children[view.chat.children.length - 1] = new Text("replacement\n".repeat(40), 0, 0);
+  assert.equal(show(), true, "same-length array replacement grows immediately");
+  assert.equal(show(90, 60), false, "height-only resize reveals the native prompt");
+  const widget = new Text("dock\n".repeat(30), 0, 0);
+  view.ctx.ui.setWidget("height-changing-widget", () => widget);
+  assert.equal(show(90, 60), true, "current dock height, not the previous frame's bounds");
+  view.ctx.ui.setWidget("height-changing-widget", undefined);
+  const rows = user.render(90);
+  let last = rows.length - 1;
+  while (!plain(rows[last]).trim()) last--;
+  const after = view.chat.children.at(-1).render(90).length;
+  const dock = view.root.entries.at(-1).component.render(90).length;
+  const paddingOnlyHeight = dock + after + rows.length - last - 1;
+  assert.equal(show(90, paddingOnlyHeight), true, "trailing padding alone never hides the pin");
+  assert.equal(show(90, paddingOnlyHeight + 1), false, "one actual content row is sufficient");
+  view.chat.children[view.chat.children.length - 1] = new Text("wide words ".repeat(8), 0, 0);
+  assert.equal(show(90, 12), false);
+  assert.equal(show(12, 12), true, "width-only resize refreshes suffix wrapping");
+  await emit(extension, "session_shutdown", view.ctx);
+});
+
+test("pin text caching follows primitive text, width and live theme rather than session identity", async () => {
+  const extension = await load();
+  const view = setup(true);
+  view.addUser("AAAA");
+  view.chat.addChild(new Text("tail\n".repeat(40), 0, 0));
+  await emit(extension, "session_start", view.ctx);
+  const entry = view.root.entries[0];
+  assert.equal(entry.visible({ width: 90, height: 15 }), true);
+  const before = entry.component.render(90)[0];
+  view.addUser("BBBB");
+  view.chat.addChild(new Text("tail\n".repeat(40), 0, 0));
+  assert.equal(entry.visible({ width: 90, height: 15 }), true);
+  assert.match(plain(entry.component.render(90)[0]), /BBBB/);
+  assert.doesNotMatch(plain(entry.component.render(90)[0]), /AAAA/);
+  assert.equal(visibleWidth(entry.component.render(12)[0]), 12);
+  assert.equal(visibleWidth(entry.component.render(90)[0]), 90);
+  try {
+    themeModule.initTheme("light", false);
+    const light = entry.component.render(90)[0];
+    assert.notEqual(light, before);
+    assert.match(plain(light), /BBBB/);
+    themeModule.initTheme("dark", false);
+    assert.notEqual(entry.component.render(90)[0], light, "colors are repainted even with the same primitive text and width");
+  } finally {
+    themeModule.initTheme("dark", false);
+    await emit(extension, "session_shutdown", view.ctx);
+  }
 });
 
 test("unsupported foreign chat coordinates retain the pin and explain an unavailable jump", async () => {

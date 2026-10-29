@@ -12,14 +12,16 @@ const requirePi = createRequire(join(root, "package.json"));
 const { createJiti } = requirePi("jiti");
 const jiti = createJiti(import.meta.url);
 const { registerKeepAwake } = await jiti.import(resolve(dirname(fileURLToPath(import.meta.url)), "../../src/session/keep-awake.ts"));
+const { inChildSessionContext, runInChildSessionContext } = await jiti.import(resolve(dirname(fileURLToPath(import.meta.url)), "../../src/workers/child-context.ts"));
 
-function harness({ enabled = true, platform = "darwin", managed = false } = {}) {
+function harness({ enabled = true, platform = "darwin", managed = false, exitBus = new EventEmitter() } = {}) {
   const handlers = new Map();
   const bus = new EventEmitter();
-  const exits = new EventEmitter();
+  const exits = exitBus;
   const intervals = new Set();
   const children = [];
   const calls = [];
+  const activeAtSpawn = [];
   const notices = [];
   let idle = true;
   const records = new Map();
@@ -30,12 +32,13 @@ function harness({ enabled = true, platform = "darwin", managed = false } = {}) 
   });
   let service = managed ? registry() : undefined;
   let spawnError;
-  const ctx = { isIdle: () => idle, ui: { notify: (...args) => notices.push(args) } };
+  const ctx = { mode: "print", hasUI: false, isIdle: () => idle, ui: { notify: (...args) => notices.push(args) } };
   const backend = {
     platform, pid: 1234,
     manager: () => service,
     spawn(...args) {
       calls.push(args);
+      activeAtSpawn.push(children.filter(child => child.kills.length === 0).length);
       if (spawnError) throw spawnError;
       const child = new EventEmitter();
       child.kills = [];
@@ -64,7 +67,7 @@ function harness({ enabled = true, platform = "darwin", managed = false } = {}) 
     for (const handler of handlers.get(name) ?? []) await handler({ type: name, ...event }, ctx);
   };
   return {
-    handlers, backend, pi, bus, exits, intervals, children, calls, notices, emit, ctx,
+    handlers, backend, pi, bus, exits, intervals, children, calls, activeAtSpawn, notices, emit, ctx,
     start: () => emit("session_start"),
     shutdown: () => emit("session_shutdown"),
     idle(value) { idle = value; },
@@ -95,6 +98,169 @@ test("default-off, invalid truthy values, and unsupported platforms are complete
     assert.equal(h.intervals.size, 0);
     assert.equal(h.listeners(), 0);
     assert.equal(h.exits.listenerCount("exit"), 0);
+  }
+});
+
+test("child scope and a root manager alone do not prove an enabled parent keep-awake owner", async () => {
+  // A worker-only root registrar can load an independently enabled interface in
+  // its child. No root keep-awake activation exists in this fixture.
+  const h = await runInChildSessionContext(async () => harness({ managed: true }));
+  assert.equal(inChildSessionContext(), false);
+  assert.ok(h.handlers.size > 0, "child scope is not evidence that another activation covers this child");
+  h.idle(false);
+  await h.start(); // bindExtensions dispatch occurs after the loading scope ends.
+  h.record("unrelated-root-worker", "running");
+  await h.emit("before_agent_start");
+  await h.emit("agent_start");
+  assert.equal(h.active().length, 1);
+  await h.emit("agent_end");
+  h.tick();
+  assert.equal(h.active().length, 1, "child retries remain covered without a parent holder");
+  h.idle(true);
+  await h.emit("agent_settled");
+  h.tick();
+  assert.equal(h.active().length, 0, "unrelated root work cannot retain the child's helper");
+  assert.equal(h.intervals.size, 1, "the retained child still observes future work until shutdown");
+  assert.equal(h.listeners(), 6);
+  assert.equal(h.exits.listenerCount("exit"), 1);
+  await h.start();
+  h.idle(false);
+  await h.emit("agent_start");
+  assert.equal(h.active().length, 1);
+  assert.equal(h.calls.length, 2);
+  await h.shutdown();
+  assert.equal(h.active().length, 0);
+  assert.equal(h.intervals.size, 0);
+  assert.equal(h.listeners(), 0);
+  assert.equal(h.exits.listenerCount("exit"), 0);
+  assert.equal(h.aggregateReads(), 0);
+  assert.deepEqual(h.notices, []);
+});
+
+test("a child foreground resume remains covered when the idle root receives no worker lifecycle events", async () => {
+  // AgentManager.resume's retained foreground path does not emit the manager's
+  // onStart/onComplete callbacks. Registry presence is not coverage of this run.
+  const parent = harness({ managed: true });
+  const child = await runInChildSessionContext(async () => harness({ managed: true }));
+  await parent.start();
+  await child.start();
+  child.idle(false);
+  await child.emit("agent_start");
+  parent.tick();
+  assert.equal(parent.active().length, 0);
+  assert.equal(child.active().length, 1);
+  child.idle(true);
+  await child.emit("agent_settled");
+  assert.equal(child.active().length, 0);
+  // A later retained-session resume needs to reacquire, without a session_start.
+  child.idle(false);
+  await child.emit("agent_start");
+  await child.emit("agent_end");
+  child.tick();
+  assert.equal(child.active().length, 1);
+  child.idle(true);
+  await child.emit("agent_settled");
+  assert.equal(child.active().length, 0);
+  await child.shutdown();
+  await parent.shutdown();
+});
+
+test("concurrent child activation and shutdown leave the headless parent's worker hold unchanged", async () => {
+  const pendingChild = runInChildSessionContext(async () => {
+    await Promise.resolve();
+    return harness();
+  });
+  const parent = harness();
+  const child = await pendingChild;
+  assert.ok(child.handlers.size > 0);
+  try {
+    await parent.start();
+    await child.start();
+    // Registration, not whichever async scope dispatches this event, owns state.
+    await runInChildSessionContext(async () => {
+      parent.idle(false);
+      await parent.emit("agent_start");
+    });
+    child.idle(false);
+    await child.emit("agent_start");
+    parent.bus.emit("subagents:started", { id: "worker" });
+    parent.idle(true);
+    await parent.emit("agent_settled");
+    parent.tick();
+    assert.equal(parent.active().length, 1);
+    assert.equal(child.active().length, 1, "independent child coverage is not globally deduplicated");
+    await child.shutdown();
+    assert.equal(child.active().length, 0);
+    assert.equal(child.intervals.size, 0);
+    assert.equal(child.listeners(), 0);
+    assert.equal(child.exits.listenerCount("exit"), 0);
+    assert.equal(parent.active().length, 1, "child shutdown must not release the parent's worker hold");
+    assert.equal(parent.calls.length, 1);
+    parent.bus.emit("subagents:completed", { id: "worker" });
+    assert.equal(parent.active().length, 0);
+  } finally {
+    await child.shutdown();
+    await parent.shutdown();
+  }
+});
+
+test("parent lifecycle during suspended child loading preserves both activations' independent ownership", async () => {
+  const loading = Promise.withResolvers();
+  const resumeLoading = Promise.withResolvers();
+  const workerLoad = runInChildSessionContext(async () => {
+    assert.equal(inChildSessionContext(), true);
+    const child = harness();
+    loading.resolve(child);
+    await resumeLoading.promise;
+    return child;
+  });
+  const child = await loading.promise;
+  const parent = harness();
+  try {
+    assert.equal(inChildSessionContext(), false);
+    await parent.start();
+    parent.idle(false);
+    await parent.emit("before_agent_start");
+    await parent.emit("agent_start");
+    parent.bus.emit("subagents:started", { id: "worker" });
+    resumeLoading.resolve();
+    await workerLoad;
+    // Initially idle children do not inherit unrelated root activity.
+    await child.start();
+    child.tick();
+    assert.equal(parent.active().length + child.active().length, 1);
+    child.idle(false);
+    await child.emit("agent_start");
+    assert.equal(parent.active().length + child.active().length, 2);
+    assert.equal(parent.calls.length + child.calls.length, 2);
+    // Dispatch context must not disable a root activation registered outside it.
+    await runInChildSessionContext(async () => {
+      parent.idle(true);
+      await parent.emit("agent_settled");
+    });
+    parent.tick();
+    assert.equal(parent.active().length, 1);
+    assert.equal(child.active().length, 1);
+    child.idle(true);
+    await child.emit("agent_settled");
+    assert.equal(child.active().length, 0);
+    assert.equal(parent.active().length, 1, "child settlement must not release the parent's worker hold");
+    assert.equal(child.intervals.size, 1);
+    assert.equal(child.listeners(), 6);
+    assert.equal(child.exits.listenerCount("exit"), 1);
+    parent.bus.emit("subagents:completed", { id: "worker" });
+    parent.tick();
+    assert.equal(parent.active().length + child.active().length, 0);
+    assert.equal(parent.calls.length + child.calls.length, 2);
+    assert.deepEqual(parent.children[0].kills, ["SIGKILL"]);
+    assert.deepEqual(child.children[0].kills, ["SIGKILL"]);
+    assert.deepEqual(parent.notices, []);
+    assert.deepEqual(child.notices, []);
+  } finally {
+    resumeLoading.resolve();
+    await workerLoad;
+    await child.shutdown();
+    await parent.shutdown();
   }
 });
 
@@ -374,6 +540,53 @@ test("repeated session_start cleans previous runtime state and process-exit clea
   await h.shutdown();
 });
 
+test("busy session_start re-entry releases the old helper before replacing it", async () => {
+  const h = harness();
+  h.idle(false);
+  await h.start();
+  const old = h.children[0];
+  // Native exit notification can arrive after session replacement.
+  old.kill = signal => { old.kills.push(signal); return true; };
+  await h.start();
+  assert.deepEqual(old.kills, ["SIGKILL"]);
+  assert.deepEqual(h.activeAtSpawn, [0, 0]);
+  assert.equal(h.active().length, 1);
+  old.emit("error", new Error("late old helper error"));
+  old.emit("exit", null, "SIGKILL");
+  await h.emit("agent_start");
+  h.tick();
+  assert.equal(h.calls.length, 2);
+  assert.equal(h.active().length, 1);
+  assert.equal(h.intervals.size, 1);
+  assert.equal(h.listeners(), 6);
+  assert.equal(h.exits.listenerCount("exit"), 1);
+  assert.deepEqual(h.notices, []);
+  await h.shutdown();
+  assert.equal(h.active().length, 0);
+});
+
+test("reload and session replacement release before the fresh activation can spawn", async () => {
+  for (const reason of ["reload", "new", "resume", "fork"]) {
+    const h = harness();
+    h.idle(false);
+    await h.start();
+    await h.emit("session_shutdown", { reason });
+    h.handlers.clear(); // Native Pi discards the old runtime before loading a fresh factory.
+    registerKeepAwake(h.pi, true, h.backend);
+    await h.start();
+    assert.deepEqual(h.activeAtSpawn, [0, 0]);
+    assert.equal(h.active().length, 1);
+    await h.emit("agent_start");
+    h.tick();
+    assert.equal(h.calls.length, 2);
+    await h.shutdown();
+    assert.equal(h.active().length, 0);
+    assert.equal(h.intervals.size, 0);
+    assert.equal(h.listeners(), 0);
+    assert.equal(h.exits.listenerCount("exit"), 0);
+  }
+});
+
 test("synchronous launch failure, async spawn error, and unexpected exit warn once without retry storms", async () => {
   for (const failure of ["throw", "error", "exit"]) {
     const h = harness();
@@ -396,6 +609,47 @@ test("synchronous launch failure, async spawn error, and unexpected exit warn on
     assert.equal(h.active().length, 1);
     await h.shutdown();
   }
+});
+
+test("settled retained activations retain their pollers and exit listeners until shutdown, without retaining helpers", async () => {
+  // Fake shared process bus, with its warning threshold disabled only in this
+  // fixture. Production still has its ordinary process-listener threshold.
+  const exits = new EventEmitter().setMaxListeners(0);
+  const retained = await runInChildSessionContext(async () =>
+    Array.from({ length: 12 }, () => harness({ exitBus: exits })));
+  for (const activation of retained) {
+    await activation.start();
+    activation.idle(false);
+    await activation.emit("agent_start");
+    activation.idle(true);
+    await activation.emit("agent_settled");
+    assert.equal(activation.active().length, 0);
+  }
+  assert.equal(exits.listenerCount("exit"), 12, "current lifecycle is activation-owned, not globally deduplicated");
+  assert.equal(retained.reduce((count, activation) => count + activation.intervals.size, 0), 12);
+  for (const activation of retained) await activation.shutdown();
+  assert.equal(exits.listenerCount("exit"), 0);
+  assert.ok(retained.every(activation => activation.intervals.size === 0));
+});
+
+test("same-process parent and child activations release only their own helpers", async () => {
+  const parent = harness();
+  const child = await runInChildSessionContext(async () => harness()); // Same host PID does not prove parent coverage.
+  await parent.start();
+  await child.start();
+  parent.idle(false);
+  child.idle(false);
+  await parent.emit("agent_start");
+  await child.emit("agent_start");
+  assert.equal(parent.active().length, 1);
+  assert.equal(child.active().length, 1);
+  await child.shutdown();
+  assert.equal(child.active().length, 0);
+  assert.equal(parent.active().length, 1, "child cleanup cannot release the parent's ownership");
+  parent.idle(true);
+  await parent.emit("agent_settled");
+  assert.equal(parent.active().length, 0);
+  await parent.shutdown();
 });
 
 test("broken optional manager never prevents main-agent operation", async () => {

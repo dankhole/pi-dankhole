@@ -42,11 +42,13 @@ vi.mock("../../src/workers/ui/fleet-list.js", () => ({
     setEnabled = vi.fn();
     update = vi.fn();
     ensureTimer = vi.fn();
+    getRefreshTimerCount = () => 0;
     onAgentFinished = vi.fn();
     dispose = vi.fn();
   },
 }));
 
+import { AgentManager } from "../../src/workers/agent-manager.js";
 import { runAgent } from "../../src/workers/agent-runner.js";
 import subagentsExtension from "../../src/workers/index.js";
 import type { AgentRecord } from "../../src/workers/types.js";
@@ -151,6 +153,105 @@ function terminalUi() {
 }
 
 describe("Agent tool — foreground run sent to the background", () => {
+  it("cleans the 80ms presentation interval and abort listener when the initial UI update throws", async () => {
+    vi.useFakeTimers();
+    try {
+      const { tools } = boot();
+      const baselineTimers = vi.getTimerCount(); // Manager maintenance survives until shutdown.
+      const controller = new AbortController();
+      const remove = vi.spyOn(controller.signal, "removeEventListener");
+      const onUpdate = vi.fn(() => { throw new Error("presentation failed"); });
+      await expect(runAgentTool(tools, "no run", { signal: controller.signal, onUpdate }))
+        .rejects.toThrow("presentation failed");
+      expect(runAgent).not.toHaveBeenCalled();
+      expect(vi.getTimerCount()).toBe(baselineTimers);
+      expect(remove).toHaveBeenCalledWith("abort", expect.any(Function));
+      vi.advanceTimersByTime(1_000);
+      expect(onUpdate).toHaveBeenCalledOnce();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it.each(["resolve", "handoff"])("reports and clears the foreground spinner when the race takes the %s path", async path => {
+    vi.useFakeTimers();
+    try {
+      const runs = controllableRuns();
+      const { tools, commands } = boot();
+      const baselineTimers = vi.getTimerCount();
+      const onUpdate = vi.fn();
+      const diagnosticCtx = ctx();
+      const execution = runAgentTool(tools, "timer run", { onUpdate });
+      await vi.advanceTimersByTimeAsync(0);
+      await commands.get("agents").handler("diagnostics", diagnosticCtx);
+      expect(diagnosticCtx.ui.notify).toHaveBeenLastCalledWith(expect.stringContaining("foreground80ms=1"), "info");
+      if (path === "handoff") {
+        backgroundActionFor!(registry().getRecord(runs.agentId("timer run")), vi.fn()).send();
+        await execution;
+      } else {
+        runs.finish("timer run", "DONE");
+        await execution;
+      }
+      const updates = onUpdate.mock.calls.length;
+      await commands.get("agents").handler("diagnostics", diagnosticCtx);
+      expect(diagnosticCtx.ui.notify).toHaveBeenLastCalledWith(expect.stringContaining("foreground80ms=0"), "info");
+      vi.advanceTimersByTime(1_000);
+      expect(onUpdate).toHaveBeenCalledTimes(updates);
+      if (path === "handoff") {
+        runs.finish("timer run", "DONE");
+        await vi.advanceTimersByTimeAsync(0);
+      }
+      expect(vi.getTimerCount()).toBe(baselineTimers);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("clears the foreground spinner/listener when Promise.race rejects", async () => {
+    vi.useFakeTimers();
+    const reject = vi.spyOn(AgentManager.prototype, "spawnAndWait").mockRejectedValueOnce(new Error("startup rejected"));
+    try {
+      const { tools, commands } = boot();
+      const baselineTimers = vi.getTimerCount();
+      const controller = new AbortController();
+      const remove = vi.spyOn(controller.signal, "removeEventListener");
+      await expect(runAgentTool(tools, "rejected", { signal: controller.signal })).rejects.toThrow("startup rejected");
+      expect(vi.getTimerCount()).toBe(baselineTimers);
+      expect(remove).toHaveBeenCalledWith("abort", expect.any(Function));
+      const diagnosticCtx = ctx();
+      await commands.get("agents").handler("diagnostics", diagnosticCtx);
+      expect(diagnosticCtx.ui.notify).toHaveBeenLastCalledWith(expect.stringContaining("foreground80ms=0"), "info");
+    } finally {
+      reject.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
+  it("never leaves a presentation timer or listener when cancellation preceded spawn", async () => {
+    vi.useFakeTimers();
+    try {
+      const { tools, commands } = boot();
+      const baselineTimers = vi.getTimerCount();
+      const controller = new AbortController();
+      controller.abort();
+      const remove = vi.spyOn(controller.signal, "removeEventListener");
+      vi.mocked(runAgent).mockImplementationOnce(async (_context, _prompt, options) => {
+        expect(options.signal?.aborted).toBe(true);
+        return { responseText: "", session: { dispose: vi.fn(), messages: [] } as any, aborted: true, steered: false };
+      });
+      const onUpdate = vi.fn();
+      await runAgentTool(tools, "already stopped", { signal: controller.signal, onUpdate });
+      expect(onUpdate).not.toHaveBeenCalled();
+      expect(vi.getTimerCount()).toBe(baselineTimers);
+      expect(remove).toHaveBeenCalledWith("abort", expect.any(Function));
+      const diagnosticCtx = ctx();
+      await commands.get("agents").handler("diagnostics", diagnosticCtx);
+      expect(diagnosticCtx.ui.notify).toHaveBeenLastCalledWith(expect.stringContaining("foreground80ms=0"), "info");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("ctrl+b returns every pending call as a background spawn, and each notifies once", async () => {
     const runs = controllableRuns();
     const { pi, tools, lifecycle } = boot();

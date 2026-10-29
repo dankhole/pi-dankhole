@@ -328,6 +328,11 @@ export class AgentWidget {
     this.update();
   }
 
+  /** Read-only diagnostics; does not create or refresh presentation. */
+  getAnimationTimerCount(): number {
+    return this.widgetInterval === undefined ? 0 : 1;
+  }
+
   /** Animate only when a visible running row has a spinner. Queues are static. */
   ensureTimer() {
     this.setAnimating(!!this.uiCtx && this.widgetAgents().some(a => a.status === "running"));
@@ -617,12 +622,17 @@ export class AgentWidget {
       clearInterval(this.widgetInterval);
       this.widgetInterval = undefined;
     }
-    if (this.uiCtx) {
-      this.uiCtx.setWidget("agents", undefined);
-      this.uiCtx.setStatus("subagents", undefined);
+    // Detach before clearing UI: even synchronous invalidation callbacks and
+    // late completion/finally callbacks must not re-register or re-arm it.
+    const uiCtx = this.uiCtx;
+    this.uiCtx = undefined;
+    if (uiCtx) {
+      uiCtx.setWidget("agents", undefined);
+      uiCtx.setStatus("subagents", undefined);
     }
     this.widgetRegistered = false;
     this.tui = undefined;
     this.lastStatusText = undefined;
+    this.finishedTurnAge.clear();
   }
 }

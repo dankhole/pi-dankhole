@@ -11,7 +11,13 @@ type MeasuredComponent = Component & {
   imageComponents?: Component[];
   toolDefinition?: { renderShell?: string };
 };
-interface Projection { render: Component["render"]; view: Component }
+interface Projection {
+  render: Component["render"];
+  view: Component;
+  /** Owned adapter: reconcile now, then return the exact native concatenation.
+   * This is a freshness capability, not a cached previous-frame child list. */
+  freshChildren?: () => readonly Component[] | undefined;
+}
 interface Rows {
   height: number;
   lines?: string[];
@@ -42,8 +48,23 @@ export function isTranscriptRendererSupported(component: Component): boolean {
 }
 
 /** Register an owned adapter which preserves its wrapped native coordinates. */
-export function registerTranscriptRenderer(component: Component, render: Component["render"]): () => void {
-  return registerTranscriptProjection(component, { render, view: component });
+export function registerTranscriptRenderer(component: Component, render: Component["render"],
+  freshChildren?: Projection["freshChildren"]): () => void {
+  return registerTranscriptProjection(component, { render, view: component, freshChildren });
+}
+
+/** Fresh displayed children only for exact native concatenation or an owned
+ * adapter which explicitly supplies that contract. Foreign replacements and
+ * merely coordinate-preserving wrappers never inherit this capability. */
+export function freshTranscriptChildren(component: Component): readonly Component[] | undefined {
+  const projection = projections.get(component);
+  if (projection && component.render === projection.render && projection.freshChildren) {
+    try {
+      const children = projection.freshChildren();
+      return projections.get(component) === projection && component.render === projection.render ? children : undefined;
+    } catch { return undefined; }
+  }
+  return component.render === Container.prototype.render ? (component as MeasuredComponent).children : undefined;
 }
 
 /** Fresh synchronous measurement only. Never retained as a rendered-history cache. */
@@ -117,11 +138,16 @@ export class TranscriptMeasurement {
     return this.lines(rows);
   }
 
+  /** Read a captured height without materializing a potentially large child slice. */
+  height(component: Component, width: number): number {
+    return this.measured.get(component)?.get(width)?.height ?? this.render(component, width).length;
+  }
+
   /** Displayed direct-child offsets from this render, not child.render() again.
    * Unknown/padded/transformed layouts do not supply guessed child coordinates.
    */
   offsets(component: Component, width: number): Map<Component, number> | undefined {
-    this.render(component, width);
+    if (!this.measured.get(component)?.has(width)) this.render(component, width);
     return this.measured.get(component)?.get(width)?.offsets;
   }
 }
@@ -130,12 +156,14 @@ const active = new WeakMap<object, TranscriptMeasurement>();
 
 /** Nested pin/reminder predicates share transcript rows, but not dock renders: the
  * reminder is deliberately suppressed while measuring its canonical viewport.
+ * A nested predicate must not start a partial render that its caller's full native
+ * pass would repeat. The shared flag lets pinning retain that one-pass contract.
  */
-export function withTranscriptMeasurement<T>(owner: object, calculate: (measurement: TranscriptMeasurement) => T): T {
+export function withTranscriptMeasurement<T>(owner: object, calculate: (measurement: TranscriptMeasurement, shared: boolean) => T): T {
   const existing = active.get(owner);
-  if (existing) return calculate(existing);
+  if (existing) return calculate(existing, true);
   const measurement = new TranscriptMeasurement();
   active.set(owner, measurement);
-  try { return calculate(measurement); }
+  try { return calculate(measurement, false); }
   finally { active.delete(owner); }
 }

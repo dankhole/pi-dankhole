@@ -48,6 +48,119 @@ const spawn = (b: Awaited<ReturnType<typeof boot>>, description: string) => b.to
 const turnEnd = (b: BootedPi) => b.lifecycle.get("turn_end")({ message: { role: "assistant", stopReason: "toolUse" } });
 
 describe("background completion notification wiring", () => {
+  const statusKey = "subagents:pending-completions";
+  const pendingStatuses = (b: Awaited<ReturnType<typeof boot>>) => b.context.ui.setStatus.mock.calls
+    .filter(([key]: [string, unknown]) => key === statusKey)
+    .map(([, value]: [string, unknown]) => value);
+
+  it("shows and coalesces waiting counts without sending until a boundary, then clears", async () => {
+    vi.mocked(runAgent).mockResolvedValue(completedRun());
+    const b = await boot(true);
+    b.context.hasUI = true;
+    await spawn(b, "first child");
+    await flush();
+    expect(b.context.ui.setStatus).toHaveBeenCalledWith(statusKey, "1 worker result waiting for the main agent");
+    await spawn(b, "second child");
+    await flush();
+    expect(pendingStatuses(b)).toEqual(["1 worker result waiting for the main agent", "2 worker results waiting for the main agent"]);
+    expect(b.pi.sendMessage).not.toHaveBeenCalled();
+    turnEnd(b);
+    expect(b.context.ui.setStatus).toHaveBeenLastCalledWith(statusKey, undefined);
+    expect(b.pi.sendMessage).toHaveBeenCalledOnce();
+    const calls = b.context.ui.setStatus.mock.calls.length;
+    turnEnd(b);
+    expect(b.context.ui.setStatus).toHaveBeenCalledTimes(calls);
+  });
+
+  it("clears the original UI's pending status on shutdown", async () => {
+    vi.mocked(runAgent).mockResolvedValue(completedRun());
+    const b = await boot(true);
+    b.context.hasUI = true;
+    await spawn(b, "waiting child");
+    await flush();
+    await b.lifecycle.get("session_shutdown")();
+    expect(pendingStatuses(b)).toEqual(["1 worker result waiting for the main agent", undefined]);
+    expect(b.pi.sendMessage).not.toHaveBeenCalled();
+  });
+
+  it("restores the unchanged pending count on the replacement UI and clears the original", async () => {
+    vi.mocked(runAgent).mockResolvedValue(completedRun());
+    const b = await boot(true);
+    b.context.hasUI = true;
+    await spawn(b, "waiting child");
+    await flush();
+    const replacement = ctx({ hasUI: true });
+    replacement.ui.onTerminalInput = vi.fn(() => vi.fn());
+    await b.lifecycle.get("session_start")({}, replacement);
+    expect(pendingStatuses(b)).toEqual(["1 worker result waiting for the main agent", undefined]);
+    expect(replacement.ui.setStatus).toHaveBeenCalledWith(statusKey, "1 worker result waiting for the main agent");
+    expect(b.pi.sendMessage).not.toHaveBeenCalled();
+    turnEnd(b);
+    expect(replacement.ui.setStatus).toHaveBeenLastCalledWith(statusKey, undefined);
+    expect(b.pi.sendMessage).toHaveBeenCalledOnce();
+  });
+
+  it("keeps the post-summary delivery check when a UI context getter throws", async () => {
+    vi.mocked(runAgent).mockResolvedValue(completedRun());
+    const b = await boot(true);
+    b.context.hasUI = true;
+    await spawn(b, "waiting child");
+    await flush();
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      Object.defineProperty(b.context, "hasUI", { get: () => { throw new Error("stale UI getter"); } });
+      expect(() => b.lifecycle.get("session_compact")()).not.toThrow();
+      b.context.isIdle = () => true;
+      b.context.signal = undefined;
+      await flush();
+      // The reconciled bounded idle check uses a timeout, not only immediates.
+      // Advance its initial probe deterministically instead of racing the timer phase.
+      await vi.advanceTimersByTimeAsync(0);
+      expect(b.pi.sendMessage).toHaveBeenCalledOnce();
+    } finally { vi.useRealTimers(); }
+  });
+
+  it("updates an existing pending count when compaction starts and ends, without polling", async () => {
+    vi.mocked(runAgent).mockResolvedValue(completedRun());
+    const b = await boot(true);
+    b.context.hasUI = true;
+    await spawn(b, "waiting child");
+    await flush();
+    b.lifecycle.get("session_before_compact")();
+    expect(pendingStatuses(b)).toEqual([
+      "1 worker result waiting for the main agent",
+      "1 worker result waiting for compaction — Esc to cancel",
+    ]);
+    b.lifecycle.get("session_compact_failed")();
+    expect(pendingStatuses(b).at(-1)).toBe("1 worker result waiting for the main agent");
+    await flush(); // an active low-level run stops the bounded idle check
+    expect(b.pi.sendMessage).not.toHaveBeenCalled();
+    expect(pendingStatuses(b)).toHaveLength(3);
+    turnEnd(b);
+    expect(pendingStatuses(b).at(-1)).toBeUndefined();
+  });
+
+  it("labels completions arriving during compaction, without promising Escape in RPC mode", async () => {
+    vi.mocked(runAgent).mockResolvedValue(completedRun());
+    const b = await boot(true);
+    b.context.hasUI = true;
+    b.context.mode = "rpc";
+    b.lifecycle.get("session_before_compact")();
+    await spawn(b, "waiting child");
+    await flush();
+    expect(pendingStatuses(b)).toEqual(["1 worker result waiting for compaction"]);
+  });
+
+  it("does not set UI status in a headless parent", async () => {
+    vi.mocked(runAgent).mockResolvedValue(completedRun());
+    const b = await boot(true);
+    await spawn(b, "headless child");
+    await flush();
+    expect(b.context.ui.setStatus).not.toHaveBeenCalledWith(statusKey, expect.anything());
+    turnEnd(b);
+    expect(b.pi.sendMessage).toHaveBeenCalledOnce();
+  });
+
   it("steers an individual completion immediately when already idle", async () => {
     vi.mocked(runAgent).mockResolvedValue(completedRun());
     const b = await boot(false);

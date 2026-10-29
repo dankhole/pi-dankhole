@@ -3,11 +3,13 @@
  * held while the parent runs and sent at its turn's end, as in Claude Code, and
  * without sibling joins or delayed idle batching.
  */
+import { EventEmitter } from "node:events";
 import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { fauxAssistantMessage } from "@earendil-works/pi-ai";
 import { type AgentSession, createAgentSession, DefaultResourceLoader, type ExtensionContext, getAgentDir, SessionManager, SettingsManager } from "@earendil-works/pi-coding-agent";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { type KeepAwakeBackend, registerKeepAwake } from "../../src/session/keep-awake.js";
 import type { AgentManager } from "../../src/workers/agent-manager.js";
 import type * as AgentRunnerModule from "../../src/workers/agent-runner.js";
 
@@ -39,14 +41,14 @@ afterEach(async () => {
 });
 
 /** Boot the extension with a parent whose run state the test controls. */
-async function boot(settings: Record<string, unknown> = {}) {
+async function boot(settings: Record<string, unknown> = {}, lowLevelRun = true) {
   hermetic = hermeticDir({ settings: { outputTranscript: false, ...settings } });
   booted = makePi();
   subagentsExtension(booted.pi);
-  const parent = { running: true };
+  const parent = { running: true, lowLevelRun };
   const signal = new AbortController().signal;
-  const parentCtx = ctx({ isIdle: () => !parent.running });
-  Object.defineProperty(parentCtx, "signal", { get: () => (parent.running ? signal : undefined) });
+  const parentCtx = ctx({ isIdle: () => !parent.running, hasPendingMessages: () => false });
+  Object.defineProperty(parentCtx, "signal", { get: () => (parent.running && parent.lowLevelRun ? signal : undefined) });
   await booted.lifecycle.get("session_start")({ type: "session_start" }, parentCtx);
   return { ...booted, parent, parentCtx };
 }
@@ -89,6 +91,450 @@ const turnEnd = (b: BootedPi, stopReason = "toolUse") =>
 const sentContents = (b: BootedPi): string[] => b.pi.sendMessage.mock.calls.map((c: any[]) => c[0].content);
 
 describe("completion delivery to a running parent", () => {
+  it.each(["before_compact", "later_handler"])("recovers after real host compaction awaits later handlers when the worker settles in %s", async settlement => {
+    vi.useFakeTimers();
+    const runs = controllableRuns();
+    hermetic = hermeticDir({ settings: { outputTranscript: false } });
+    const faux = registerFauxProvider({ provider: "faux", models: [{ id: "faux-1", contextWindow: 200_000 }] });
+    const settingsManager = SettingsManager.inMemory({ compaction: { enabled: false, keepRecentTokens: 100 }, retry: { enabled: false } });
+    const sessionManager = SessionManager.inMemory(hermetic.dir);
+    sessionManager.appendMessage({ role: "user", content: "early history ".repeat(2_000), timestamp: Date.now() });
+    sessionManager.appendMessage(fauxAssistantMessage("old reply ".repeat(2_000)));
+    sessionManager.appendMessage({ role: "user", content: "recent message", timestamp: Date.now() });
+    let parentCtx: ExtensionContext | undefined;
+    let laterHandlerStage = 0;
+    const loader = new DefaultResourceLoader({
+      cwd: hermetic.dir, agentDir: getAgentDir(), settingsManager,
+      extensionFactories: [pi => {
+        // The lifecycle is real; shutdown's unrelated worktree-prune OS boundary
+        // is fake so this test never executes Git or creates its timeout.
+        vi.spyOn(pi, "exec").mockResolvedValue({ stdout: "", stderr: "", code: 0, killed: false });
+        subagentsExtension(pi);
+      }, pi => {
+        pi.on("session_start", (_event, context) => { parentCtx = context; });
+        pi.on("session_before_compact", event => {
+          if (settlement === "before_compact") runs.settle("late completion");
+          return { compaction: { summary: "synthetic checkpoint", firstKeptEntryId: event.preparation.firstKeptEntryId, tokensBefore: event.preparation.tokensBefore } };
+        });
+        // Real ExtensionRunner.emit awaits this after the worker handler.
+        pi.on("session_compact", async () => {
+          laterHandlerStage = 1;
+          await new Promise<void>(resolve => setTimeout(resolve, 25));
+          laterHandlerStage = 2;
+          if (settlement === "later_handler") runs.settle("late completion");
+          await new Promise<void>(resolve => setTimeout(resolve, 25));
+          laterHandlerStage = 3;
+        });
+      }],
+      noSkills: true, noThemes: true, noContextFiles: true, noPromptTemplates: true,
+    });
+    await loader.reload();
+    const { session } = await createAgentSession({
+      ...fauxModelBackend(faux.getModel()), cwd: hermetic.dir, model: faux.getModel(),
+      resourceLoader: loader, settingsManager, sessionManager,
+    });
+    try {
+      await session.bindExtensions({});
+      const busyAtSend: boolean[] = [];
+      // Capture delivery without starting a synthetic follow-up model turn.
+      const send = vi.spyOn(session, "sendCustomMessage").mockImplementation(() => { busyAtSend.push(!parentCtx!.isIdle()); });
+      await session.getToolDefinition("Agent")!.execute(
+        "call-late", { prompt: "late completion", description: "late completion", run_in_background: true },
+        undefined, undefined, session.extensionRunner.createToolContext("call-late", undefined),
+      );
+      const compaction = session.compact();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(laterHandlerStage).toBe(1);
+      expect(parentCtx!.isIdle()).toBe(false);
+      expect(send).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(25);
+      expect(laterHandlerStage).toBe(2);
+      expect(parentCtx!.isIdle()).toBe(false);
+      expect(send).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(25);
+      await compaction;
+      expect(parentCtx!.isIdle()).toBe(true);
+      expect(send).not.toHaveBeenCalled(); // Even the late arrival was observed while still busy.
+      await vi.advanceTimersByTimeAsync(500);
+      expect(send).toHaveBeenCalledExactlyOnceWith(
+        expect.objectContaining({ content: expect.stringContaining("late completion done") }),
+        { deliverAs: "steer", triggerTurn: true },
+      );
+      expect(busyAtSend).toEqual([false]);
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(send).toHaveBeenCalledOnce();
+      expect(faux.state.callCount).toBe(0);
+    } finally {
+      await session.extensionRunner.emit({ type: "session_shutdown", reason: "quit" });
+      session.dispose();
+      faux.unregister();
+    }
+    await vi.advanceTimersByTimeAsync(0);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("keeps the post-summary window when consumption empties the outbox", async () => {
+    vi.useFakeTimers();
+    const runs = controllableRuns();
+    const b = await boot();
+    const alpha = agentIdOf(await spawn(b, b.parentCtx, "alpha"));
+    await spawn(b, b.parentCtx, "beta");
+    b.parent.running = false;
+    b.parentCtx.isIdle = () => false; // a later summary handler is awaiting I/O
+    const timersBefore = vi.getTimerCount();
+    b.lifecycle.get("session_compact")();
+    expect(vi.getTimerCount()).toBe(timersBefore); // an empty window owns no timer
+    runs.settle("alpha");
+    await vi.advanceTimersByTimeAsync(5);
+    await b.tools.get("get_subagent_result").execute("read", { agent_id: alpha }, undefined, undefined, b.parentCtx);
+    expect(vi.getTimerCount()).toBe(timersBefore);
+    // Queue beta while still busy, then let its scheduled check observe cleanup.
+    b.parentCtx.isIdle = vi.fn().mockReturnValueOnce(false).mockReturnValue(true);
+    runs.settle("beta");
+    await vi.advanceTimersByTimeAsync(5);
+    expect(sentContents(b)).toEqual([expect.stringContaining("beta done")]);
+  });
+
+  it("rearms after an empty drain only within the original compaction deadline", async () => {
+    vi.useFakeTimers();
+    const runs = controllableRuns();
+    const b = await boot({}, false);
+    const baselineTimers = vi.getTimerCount();
+    const first = agentIdOf(await spawn(b, b.parentCtx, "first arrival"));
+    runs.settle("first arrival");
+    await vi.advanceTimersByTimeAsync(0);
+    b.lifecycle.get("session_compact")({ reason: "manual", willRetry: false }, b.parentCtx);
+    await vi.advanceTimersByTimeAsync(0);
+    await b.tools.get("get_subagent_result").execute("consume", { agent_id: first }, undefined, undefined, b.parentCtx);
+    expect(vi.getTimerCount()).toBe(baselineTimers); // Empty queue cancels all observation ticking.
+    await vi.advanceTimersByTimeAsync(29_000);
+    const timeout = vi.spyOn(globalThis, "setTimeout");
+    await spawn(b, b.parentCtx, "second arrival");
+    runs.settle("second arrival");
+    await vi.advanceTimersByTimeAsync(750);
+    expect(timeout.mock.calls.some(call => call[1] === 500)).toBe(true); // Same window was rearmed.
+    expect(b.pi.sendMessage).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(250); // Original deadline, not 30s after the new arrival.
+    expect(vi.getTimerCount()).toBe(baselineTimers + 1); // Only the pending diagnostic watchdog remains.
+    b.parent.running = false;
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(b.pi.sendMessage).not.toHaveBeenCalled();
+    turnEnd(b);
+    expect(sentContents(b)).toEqual([expect.stringContaining("second arrival done")]);
+    expect(vi.getTimerCount()).toBe(baselineTimers);
+    timeout.mockRestore();
+  });
+
+  it("does not rearm for a first arrival after an empty compaction window has expired", async () => {
+    vi.useFakeTimers();
+    const runs = controllableRuns();
+    const b = await boot({}, false);
+    const baselineTimers = vi.getTimerCount();
+    b.lifecycle.get("session_compact")({ reason: "manual", willRetry: false }, b.parentCtx);
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(vi.getTimerCount()).toBe(baselineTimers);
+    const timeout = vi.spyOn(globalThis, "setTimeout");
+    await spawn(b, b.parentCtx, "expired arrival");
+    const isIdle = vi.spyOn(b.parentCtx, "isIdle");
+    runs.settle("expired arrival");
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(timeout.mock.calls.filter(call => call[1] === 500)).toHaveLength(0);
+    expect(vi.getTimerCount()).toBe(baselineTimers + 1);
+    b.parent.running = false;
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(isIdle).toHaveBeenCalledOnce(); // Enqueue only: arrival cannot open a new window.
+    expect(b.pi.sendMessage).not.toHaveBeenCalled();
+    turnEnd(b);
+    expect(sentContents(b)).toEqual([expect.stringContaining("expired arrival done")]);
+    expect(vi.getTimerCount()).toBe(baselineTimers);
+    isIdle.mockRestore();
+    timeout.mockRestore();
+  });
+
+  it("bounds busy compaction observation to 30 seconds and retains the completion/diagnostics on expiry", async () => {
+    vi.useFakeTimers();
+    const runs = controllableRuns();
+    const b = await boot({}, false);
+    b.parentCtx.hasUI = true;
+    const baselineTimers = vi.getTimerCount();
+    await spawn(b, b.parentCtx, "budget");
+    runs.settle("budget");
+    await vi.advanceTimersByTimeAsync(0);
+    const timeout = vi.spyOn(globalThis, "setTimeout");
+    b.lifecycle.get("session_compact")({ reason: "manual", willRetry: false }, b.parentCtx);
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(timeout.mock.calls.filter(call => call[1] === 500)).toHaveLength(60);
+    expect(vi.getTimerCount()).toBe(baselineTimers);
+    expect(b.pi.sendMessage).not.toHaveBeenCalled();
+    expect(b.parentCtx.ui.setStatus).toHaveBeenCalledWith("subagents:pending-completions", expect.stringContaining("1 worker result waiting"));
+    await b.commands.get("agents").handler("diagnostics", b.parentCtx);
+    expect(b.parentCtx.ui.notify).toHaveBeenLastCalledWith(expect.stringContaining("Completions pending: 1"), "info");
+    b.parent.running = false;
+    const expired = timeout.mock.calls.filter(call => call[1] === 500).at(-1)![0] as () => void;
+    expired(); // Even an already-dequeued retry cannot act after budget expiry.
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(b.pi.sendMessage).not.toHaveBeenCalled(); // No observation after the finite window.
+    turnEnd(b, "stop");
+    expect(b.pi.sendMessage).toHaveBeenCalledOnce();
+    timeout.mockRestore();
+  });
+
+  it.each(["consume", "deliver"])("cancels compaction retries when the outbox drains via %s, including an already-dequeued callback", async action => {
+    vi.useFakeTimers();
+    const runs = controllableRuns();
+    const b = await boot({}, false);
+    const baselineTimers = vi.getTimerCount();
+    const id = agentIdOf(await spawn(b, b.parentCtx, "cancel retry"));
+    runs.settle("cancel retry");
+    await vi.advanceTimersByTimeAsync(0);
+    const timeout = vi.spyOn(globalThis, "setTimeout");
+    b.lifecycle.get("session_compact")({ reason: "manual", willRetry: false }, b.parentCtx);
+    await vi.advanceTimersByTimeAsync(0);
+    const stale = timeout.mock.calls.at(-1)![0] as () => void;
+    expect(timeout.mock.calls.at(-1)![1]).toBe(500);
+    expect(timeout.mock.results.at(-1)!.value.hasRef()).toBe(false);
+    if (action === "consume") {
+      await b.tools.get("get_subagent_result").execute("consume", { agent_id: id }, undefined, undefined, b.parentCtx);
+    } else {
+      turnEnd(b);
+    }
+    expect(vi.getTimerCount()).toBe(baselineTimers);
+    b.parent.running = false;
+    stale();
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(b.pi.sendMessage).toHaveBeenCalledTimes(action === "consume" ? 0 : 1);
+    expect(vi.getTimerCount()).toBe(baselineTimers);
+    timeout.mockRestore();
+  });
+
+  it("does not retry compaction observation when there are no pending completions", async () => {
+    vi.useFakeTimers();
+    const b = await boot({}, false);
+    const baselineTimers = vi.getTimerCount();
+    const timeout = vi.spyOn(globalThis, "setTimeout");
+    b.lifecycle.get("session_compact")({ reason: "manual", willRetry: false }, b.parentCtx);
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(timeout.mock.calls.filter(call => call[1] === 500)).toHaveLength(0);
+    expect(vi.getTimerCount()).toBe(baselineTimers);
+    expect(b.pi.sendMessage).not.toHaveBeenCalled();
+    timeout.mockRestore();
+  });
+
+  it.each(["session_compact", "session_compact_failed"])("recovers manual %s completion delivery only after public idle in the next macrotask", async event => {
+    vi.useFakeTimers();
+    const runs = controllableRuns();
+    const b = await boot({}, false);
+    await spawn(b, b.parentCtx, "manual compact");
+    runs.settle("manual compact");
+    await vi.advanceTimersByTimeAsync(0);
+    b.lifecycle.get(event)({ type: event, reason: "manual", willRetry: false }, b.parentCtx);
+    expect(b.pi.sendMessage).not.toHaveBeenCalled(); // Handler still sees compaction busy.
+    b.parent.running = false; // Host compaction finalizer runs after the event returns.
+    await vi.advanceTimersByTimeAsync(0);
+    expect(sentContents(b)).toEqual([expect.stringContaining("manual compact done")]);
+    // No prompt, turn_end, or agent_settled was needed.
+  });
+
+  it.each(["session_compact", "session_compact_failed"])("does not deliver from %s while automatic retry/recovery remains publicly busy", async event => {
+    vi.useFakeTimers();
+    const runs = controllableRuns();
+    const b = await boot({}, false);
+    await spawn(b, b.parentCtx, "retry");
+    runs.settle("retry");
+    await vi.advanceTimersByTimeAsync(0);
+    b.lifecycle.get(event)({ type: event, reason: "overflow", willRetry: true }, b.parentCtx);
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(b.pi.sendMessage).not.toHaveBeenCalled();
+    b.parent.running = false;
+    b.lifecycle.get("agent_settled")({ aborted: false });
+    expect(b.pi.sendMessage).toHaveBeenCalledOnce();
+  });
+
+  it("invalidates a deferred compaction check on a new session generation even if the context object is reused", async () => {
+    vi.useFakeTimers();
+    const runs = controllableRuns();
+    const b = await boot({}, false);
+    await spawn(b, b.parentCtx, "pending");
+    runs.settle("pending");
+    await vi.advanceTimersByTimeAsync(0);
+    const timeout = vi.spyOn(globalThis, "setTimeout");
+    b.lifecycle.get("session_compact")({ reason: "manual", willRetry: false }, b.parentCtx);
+    const stale = timeout.mock.calls.at(-1)![0] as () => void;
+    expect(timeout.mock.results.at(-1)!.value.hasRef()).toBe(false);
+    b.parent.running = false;
+    await b.lifecycle.get("session_start")({}, b.parentCtx);
+    stale(); // Simulate an already-dequeued callback as well as normal timer cancellation.
+    await vi.advanceTimersByTimeAsync(0);
+    expect(b.pi.sendMessage).not.toHaveBeenCalled();
+    timeout.mockRestore();
+  });
+
+  it.each(["reload", "quit"])("cancels compaction idle recovery and rejects stale callbacks after %s shutdown/replacement", async reason => {
+    vi.useFakeTimers();
+    const runs = controllableRuns();
+    const old = await boot({}, false);
+    await spawn(old, old.parentCtx, "old compact");
+    runs.settle("old compact");
+    await vi.advanceTimersByTimeAsync(0);
+    const timeout = vi.spyOn(globalThis, "setTimeout");
+    old.lifecycle.get("session_compact_failed")({ reason: "manual", willRetry: false }, old.parentCtx);
+    await vi.advanceTimersByTimeAsync(0);
+    const stale = timeout.mock.calls.at(-1)![0] as () => void;
+    expect(timeout.mock.calls.at(-1)![1]).toBe(500);
+    await old.lifecycle.get("session_shutdown")({ reason });
+    expect(vi.getTimerCount()).toBe(0);
+    old.parent.running = false;
+    const replacement = makePi();
+    subagentsExtension(replacement.pi);
+    booted = replacement;
+    await replacement.lifecycle.get("session_start")({}, ctx({ hasPendingMessages: () => false }));
+    stale();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(old.pi.sendMessage).not.toHaveBeenCalled();
+    expect(replacement.pi.sendMessage).not.toHaveBeenCalled();
+    timeout.mockRestore();
+  });
+
+  it("diagnoses the actual extension widget/fleet timers without claiming to measure the host spinner", async () => {
+    vi.useFakeTimers();
+    const runs = controllableRuns();
+    const original = vi.mocked(runAgent).getMockImplementation()!;
+    vi.mocked(runAgent).mockImplementationOnce((context, prompt, options) => {
+      options.onSessionCreated?.({ dispose: vi.fn(), messages: [] } as unknown as AgentSession);
+      return original(context, prompt, options);
+    });
+    const b = await boot();
+    b.parentCtx.ui.onTerminalInput = vi.fn(() => vi.fn());
+    await b.lifecycle.get("tool_execution_start")({}, b.parentCtx);
+    await spawn(b, b.parentCtx, "timer task");
+    await b.commands.get("agents").handler("diagnostics", b.parentCtx);
+    expect(b.parentCtx.ui.notify).toHaveBeenLastCalledWith(expect.stringContaining("widget80ms=1, fleet200ms=1, foreground80ms=0"), "info");
+    expect(b.parentCtx.ui.notify.mock.lastCall[0]).toContain("Host spinner not measured");
+    runs.settle("timer task");
+    await vi.advanceTimersByTimeAsync(4_000); // Finished fleet row has now aged out.
+    await b.commands.get("agents").handler("diagnostics", b.parentCtx);
+    expect(b.parentCtx.ui.notify).toHaveBeenLastCalledWith(expect.stringContaining("widget80ms=0, fleet200ms=0, foreground80ms=0"), "info");
+    expect(b.parentCtx.ui.notify.mock.lastCall[0]).toContain("idle=false");
+    expect(b.pi.sendMessage).not.toHaveBeenCalled();
+  });
+
+  it("exposes stalled public/lifecycle observations without delivering, and result consumption clears the watchdog/status", async () => {
+    vi.useFakeTimers();
+    const runs = controllableRuns();
+    const b = await boot();
+    b.parentCtx.hasUI = true;
+    const baselineTimers = vi.getTimerCount(); // Manager maintenance, not presentation or diagnostics.
+    const id = agentIdOf(await spawn(b, b.parentCtx, "private task"));
+    runs.settle("private task");
+    await vi.advanceTimersByTimeAsync(0);
+    turnEnd(b, "error");
+    b.lifecycle.get("agent_end")?.({ type: "agent_end", messages: [] });
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(b.pi.sendMessage).not.toHaveBeenCalled();
+    expect(b.parentCtx.ui.notify).toHaveBeenCalledWith(expect.stringContaining("Last observed lifecycle: agent_end"), "warning");
+    expect(b.parentCtx.ui.notify.mock.calls[0][0]).toContain("Public parent idle=false");
+    expect(b.parentCtx.ui.notify.mock.calls[0][0]).not.toContain("private");
+    expect(b.parentCtx.ui.setStatus).toHaveBeenCalledWith("subagents:pending-completions", expect.stringContaining("1 worker result waiting"));
+
+    await b.commands.get("agents").handler("diagnostics", b.parentCtx);
+    expect(b.parentCtx.ui.notify).toHaveBeenLastCalledWith(expect.stringContaining("oldest 30s"), "info");
+    await b.tools.get("get_subagent_result").execute("consume", { agent_id: id }, undefined, undefined, b.parentCtx);
+    expect(b.parentCtx.ui.setStatus).toHaveBeenLastCalledWith("subagents:pending-completions", undefined);
+    const calls = b.parentCtx.ui.notify.mock.calls.length;
+    await vi.advanceTimersByTimeAsync(600_000);
+    expect(b.parentCtx.ui.notify).toHaveBeenCalledTimes(calls);
+    expect(vi.getTimerCount()).toBe(baselineTimers);
+    b.lifecycle.get("agent_settled")?.({ aborted: false });
+    expect(b.pi.sendMessage).not.toHaveBeenCalled();
+  });
+
+  it("removes the old activation's pending watchdog before session replacement", async () => {
+    vi.useFakeTimers();
+    const runs = controllableRuns();
+    const old = await boot();
+    old.parentCtx.hasUI = true;
+    await spawn(old, old.parentCtx, "old task");
+    runs.settle("old task");
+    await vi.advanceTimersByTimeAsync(0);
+    await old.lifecycle.get("session_shutdown")();
+    expect(vi.getTimerCount()).toBe(0);
+
+    const replacement = makePi();
+    subagentsExtension(replacement.pi);
+    booted = replacement;
+    const replacementCtx = ctx({ hasPendingMessages: () => false });
+    await replacement.lifecycle.get("session_start")({}, replacementCtx);
+    const baselineTimers = vi.getTimerCount();
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(vi.getTimerCount()).toBe(baselineTimers);
+    expect(old.parentCtx.ui.notify).not.toHaveBeenCalled();
+    expect(replacementCtx.ui.notify).not.toHaveBeenCalled();
+    expect(old.pi.sendMessage).not.toHaveBeenCalled();
+    expect(replacement.pi.sendMessage).not.toHaveBeenCalled();
+  });
+
+  it("keeps the real keep-awake owner held through parent recovery and stalled notifications, then releases at settlement", async () => {
+    vi.useFakeTimers();
+    const runs = controllableRuns();
+    const b = await boot();
+    const bus = new EventEmitter();
+    b.pi.events.on.mockImplementation((name: string, handler: (data: unknown) => void) => {
+      bus.on(name, handler);
+      return () => bus.off(name, handler);
+    });
+    b.pi.events.emit.mockImplementation((name: string, data: unknown) => bus.emit(name, data));
+    const helper = new EventEmitter();
+    const kill = vi.fn();
+    Object.assign(helper, { kill, unref: vi.fn() });
+    const backend: KeepAwakeBackend = {
+      platform: "darwin", pid: 123,
+      manager: () => (globalThis as Record<symbol, AgentManager>)[MANAGER_KEY],
+      spawn: vi.fn(() => helper) as unknown as KeepAwakeBackend["spawn"],
+      every(callback) { const timer = setInterval(callback, 500); timer.unref(); return () => clearInterval(timer); },
+      onExit: () => () => {},
+    };
+    const keepLifecycle = new Map<string, (...args: any[]) => void>();
+    registerKeepAwake({ ...b.pi, on: (name: string, handler: (...args: any[]) => void) => { keepLifecycle.set(name, handler); return () => {}; } }, true, backend);
+    keepLifecycle.get("session_start")!({}, b.parentCtx);
+    try {
+      await spawn(b, b.parentCtx, "alpha");
+      runs.settle("alpha");
+      await vi.advanceTimersByTimeAsync(0);
+      turnEnd(b, "error");
+      b.lifecycle.get("agent_end")?.({ type: "agent_end", messages: [] });
+      keepLifecycle.get("agent_end")?.({});
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect((globalThis as Record<symbol, AgentManager>)[MANAGER_KEY].hasRunning()).toBe(false);
+      expect(backend.spawn).toHaveBeenCalledOnce();
+      expect(kill).not.toHaveBeenCalled(); // Public parent busy is genuine ownership, not a timeout leak.
+      expect(b.pi.sendMessage).not.toHaveBeenCalled();
+      b.parent.running = false;
+      b.lifecycle.get("agent_settled")?.({ aborted: true });
+      keepLifecycle.get("agent_settled")?.({ aborted: true });
+      expect(kill).toHaveBeenCalledExactlyOnceWith("SIGKILL");
+      expect(b.pi.sendMessage).toHaveBeenCalledOnce();
+
+      // The same root manager emits lifecycle ownership for foreground workers,
+      // too: parent coverage is not limited to background notifications.
+      b.parent.running = true;
+      keepLifecycle.get("agent_start")?.({});
+      const foreground = spawn(b, b.parentCtx, "foreground", { run_in_background: false });
+      await vi.advanceTimersByTimeAsync(0);
+      b.parent.running = false;
+      keepLifecycle.get("agent_settled")?.({ aborted: false });
+      expect(kill).toHaveBeenCalledOnce(); // Known foreground worker still owns work.
+      runs.settle("foreground");
+      await foreground;
+      expect(kill).toHaveBeenCalledTimes(2);
+      expect(backend.spawn).toHaveBeenCalledTimes(2);
+    } finally {
+      keepLifecycle.get("session_shutdown")?.({});
+    }
+    await b.lifecycle.get("session_shutdown")();
+    expect(vi.getTimerCount()).toBe(0);
+    expect(bus.eventNames()).toEqual([]);
+  });
+
   it("holds a completion until the parent's turn ends, then steers it in", async () => {
     vi.useFakeTimers();
     const runs = controllableRuns();
@@ -190,7 +636,11 @@ describe("completion delivery to a running parent", () => {
       cwd: hermetic.dir,
       agentDir: getAgentDir(),
       settingsManager,
-      extensionFactories: [subagentsExtension, pi => {
+      extensionFactories: [pi => {
+        // Keep shutdown's unrelated worktree-prune OS boundary hermetic too.
+        vi.spyOn(pi, "exec").mockResolvedValue({ stdout: "", stderr: "", code: 0, killed: false });
+        subagentsExtension(pi);
+      }, pi => {
         pi.on("session_start", (_event, context) => { parentCtx = context; });
       }],
       noSkills: true, noThemes: true, noContextFiles: true, noPromptTemplates: true,
@@ -243,6 +693,265 @@ describe("completion delivery to a running parent", () => {
       expect(faux.state.callCount).toBe(2);
     } finally {
       await session.abort();
+      await session.extensionRunner.emit({ type: "session_shutdown", reason: "quit" });
+      session.dispose();
+      faux.unregister();
+    }
+  });
+
+  it.each(["session_compact", "session_compact_failed", "session_tree"])("defers %s until one coalesced idle check", async event => {
+    vi.useFakeTimers();
+    const runs = controllableRuns();
+    const b = await boot();
+    await spawn(b, b.parentCtx, "alpha");
+    runs.settle("alpha");
+    await vi.advanceTimersByTimeAsync(0);
+    const timersBefore = vi.getTimerCount();
+    b.lifecycle.get(event)();
+    b.lifecycle.get(event)();
+    expect(vi.getTimerCount()).toBe(timersBefore + 1);
+    expect(b.pi.sendMessage).not.toHaveBeenCalled();
+    b.parent.running = false; // Pi clears summary state after the extension hook returns.
+    await vi.advanceTimersByTimeAsync(0);
+    expect(sentContents(b)).toEqual([expect.stringContaining("alpha done")]);
+    b.lifecycle.get("agent_settled")();
+    expect(b.pi.sendMessage).toHaveBeenCalledOnce();
+  });
+
+  it.each(["input", "before_agent_start", "agent_start", "session_start", "session_shutdown"])("does not rearm a canceled empty recovery window when a completion arrives after %s", async event => {
+    vi.useFakeTimers();
+    const runs = controllableRuns();
+    const b = await boot({}, false);
+    const baselineTimers = vi.getTimerCount();
+    await spawn(b, b.parentCtx, "prepared input arrival");
+    const isIdle = vi.fn(() => !b.parent.running);
+    b.parentCtx.isIdle = isIdle;
+    b.lifecycle.get("session_tree")(); // Empty queue: retain the window without ticking.
+    await b.lifecycle.get(event)({}, ctx({ isIdle, signal: undefined, hasPendingMessages: () => false }));
+    runs.settle("prepared input arrival");
+    await vi.advanceTimersByTimeAsync(0);
+    const shutDown = event === "session_shutdown";
+    expect(vi.getTimerCount()).toBe(shutDown ? 0 : baselineTimers + 1); // Diagnostic watchdog only, unless disposed.
+    b.parent.running = false;
+    await vi.advanceTimersByTimeAsync(1_500);
+    expect(isIdle.mock.calls.length).toBeLessThanOrEqual(1); // Enqueue only: canceled windows never probe.
+    expect(b.pi.sendMessage).not.toHaveBeenCalled();
+    turnEnd(b);
+    expect(sentContents(b)).toEqual(shutDown ? [] : [expect.stringContaining("prepared input arrival done")]);
+    expect(vi.getTimerCount()).toBe(shutDown ? 0 : baselineTimers);
+  });
+
+  it("does not poll or deliver if queued work has made the parent busy again", async () => {
+    vi.useFakeTimers();
+    const runs = controllableRuns();
+    const b = await boot();
+    await spawn(b, b.parentCtx, "alpha");
+    runs.settle("alpha");
+    await vi.advanceTimersByTimeAsync(0);
+    const timersBefore = vi.getTimerCount();
+    b.lifecycle.get("session_compact")();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(b.pi.sendMessage).not.toHaveBeenCalled();
+    expect(vi.getTimerCount()).toBe(timersBefore);
+    b.parent.running = false;
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(b.pi.sendMessage).not.toHaveBeenCalled();
+    b.lifecycle.get("agent_settled")();
+    expect(b.pi.sendMessage).toHaveBeenCalledOnce();
+  });
+
+  it("caps summary cleanup probes and unrefs every timed backoff", async () => {
+    vi.useFakeTimers();
+    const runs = controllableRuns();
+    const b = await boot();
+    await spawn(b, b.parentCtx, "alpha");
+    runs.settle("alpha");
+    await vi.advanceTimersByTimeAsync(0);
+    b.parent.running = false; // no low-level run, but later summary handlers remain busy
+    const isIdle = vi.fn(() => false);
+    b.parentCtx.isIdle = isIdle;
+    const timersBefore = vi.getTimerCount();
+    const timeouts = vi.spyOn(globalThis, "setTimeout");
+    try {
+      b.lifecycle.get("session_compact")();
+      await vi.advanceTimersByTimeAsync(29_999);
+      expect(isIdle).toHaveBeenCalledTimes(60);
+      expect(timeouts.mock.calls.map(([, delay]) => delay)).toEqual([0, ...Array(60).fill(500)]);
+      for (const result of timeouts.mock.results) {
+        if (result.type === "return") expect(result.value.hasRef()).toBe(false);
+      }
+      expect(vi.getTimerCount()).toBe(timersBefore + 1);
+      expect(b.pi.sendMessage).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(1); // Deadline check plus the diagnostic's independent public-idle observation.
+      expect(isIdle).toHaveBeenCalledTimes(62);
+      expect(vi.getTimerCount()).toBe(timersBefore - 1);
+      await vi.advanceTimersByTimeAsync(10_000);
+      expect(isIdle).toHaveBeenCalledTimes(62);
+      b.lifecycle.get("agent_settled")();
+      expect(b.pi.sendMessage).toHaveBeenCalledOnce();
+    } finally {
+      timeouts.mockRestore();
+    }
+  });
+
+  it.each(["input", "before_agent_start", "session_start", "session_shutdown"])("cancels a timed summary backoff on %s", async event => {
+    vi.useFakeTimers();
+    const runs = controllableRuns();
+    const b = await boot();
+    await spawn(b, b.parentCtx, "alpha");
+    runs.settle("alpha");
+    await vi.advanceTimersByTimeAsync(0);
+    b.parent.running = false;
+    b.parentCtx.isIdle = () => false;
+    const timersBefore = vi.getTimerCount();
+    b.lifecycle.get("session_compact")();
+    await vi.advanceTimersByTimeAsync(5);
+    expect(vi.getTimerCount()).toBe(timersBefore + 1);
+    await b.lifecycle.get(event)({}, ctx());
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(b.pi.sendMessage).not.toHaveBeenCalled();
+    if (event === "input" || event === "before_agent_start") {
+      turnEnd(b);
+      expect(b.pi.sendMessage).toHaveBeenCalledOnce();
+    }
+  });
+
+  it("stops on agent_start even after its low-level signal disappears during retry", async () => {
+    vi.useFakeTimers();
+    const runs = controllableRuns();
+    const b = await boot();
+    await spawn(b, b.parentCtx, "alpha");
+    runs.settle("alpha");
+    await vi.advanceTimersByTimeAsync(0);
+    b.parent.running = false;
+    const isIdle = vi.fn(() => false);
+    b.parentCtx.isIdle = isIdle;
+    const timersBefore = vi.getTimerCount();
+    b.lifecycle.get("session_compact")();
+    await vi.advanceTimersByTimeAsync(5);
+    b.lifecycle.get("agent_start")();
+    const probes = isIdle.mock.calls.length;
+    expect(b.parentCtx.signal).toBeUndefined();
+    b.lifecycle.get("session_compact_failed")();
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(isIdle).toHaveBeenCalledTimes(probes);
+    expect(vi.getTimerCount()).toBe(timersBefore);
+    expect(b.pi.sendMessage).not.toHaveBeenCalled();
+    b.lifecycle.get("agent_settled")();
+    expect(b.pi.sendMessage).toHaveBeenCalledOnce();
+  });
+
+  it.each(["input", "before_agent_start", "session_start", "session_shutdown"])("cancels the post-summary immediate on %s", async event => {
+    vi.useFakeTimers();
+    const runs = controllableRuns();
+    const b = await boot();
+    await spawn(b, b.parentCtx, "alpha");
+    runs.settle("alpha");
+    await vi.advanceTimersByTimeAsync(0);
+    b.lifecycle.get("session_compact")();
+    await b.lifecycle.get(event)({}, ctx());
+    await vi.advanceTimersByTimeAsync(0);
+    expect(b.pi.sendMessage).not.toHaveBeenCalled();
+  });
+
+  it.each(["agent_end", "agent_settled", "before_agent_start"] as const)("characterizes Pi 1.4 delivery while an awaited %s handler is blocked", async blockedEvent => {
+    const runs = controllableRuns();
+    hermetic = hermeticDir({ settings: { outputTranscript: false } });
+    const faux = registerFauxProvider({ provider: "faux", models: [{ id: "faux-1", contextWindow: 200_000 }] });
+    faux.setResponses([
+      fauxAssistantMessage("Initial reply"),
+      fauxAssistantMessage("First continuation"),
+      fauxAssistantMessage("Second continuation"),
+    ]);
+    let release!: () => void;
+    const held = new Promise<void>(resolve => { release = resolve; });
+    let entered!: () => void;
+    const handlerEntered = new Promise<void>(resolve => { entered = resolve; });
+    let blocked = false;
+    let preparations = 0;
+    const input = vi.fn();
+    const laterSettlementHandler = vi.fn();
+    const settingsManager = SettingsManager.inMemory({ compaction: { enabled: false }, retry: { enabled: false } });
+    const loader = new DefaultResourceLoader({
+      cwd: hermetic.dir, agentDir: getAgentDir(), settingsManager,
+      extensionFactories: [pi => {
+        // Keep shutdown's unrelated worktree-prune OS boundary hermetic.
+        vi.spyOn(pi, "exec").mockResolvedValue({ stdout: "", stderr: "", code: 0, killed: false });
+        subagentsExtension(pi);
+      }, pi => {
+        pi.on(blockedEvent, async () => {
+          // Hold a reentrant run's preparation, not the first prompt.
+          if (blocked || (blockedEvent === "before_agent_start" && ++preparations === 1)) return;
+          blocked = true;
+          entered();
+          await held;
+        });
+        if (blockedEvent === "before_agent_start") {
+          let wakeRequested = false;
+          pi.on("agent_settled", () => {
+            if (wakeRequested) return;
+            wakeRequested = true;
+            pi.sendMessage({ customType: "synthetic-wake", content: "Continue", display: false },
+              { deliverAs: "steer", triggerTurn: true });
+          });
+        }
+        pi.on("input", () => { input(); });
+      }, pi => {
+        pi.on("agent_settled", () => { laterSettlementHandler(); });
+      }],
+      noSkills: true, noThemes: true, noContextFiles: true, noPromptTemplates: true,
+    });
+    await loader.reload();
+    const { session } = await createAgentSession({
+      ...fauxModelBackend(faux.getModel()), cwd: hermetic.dir, model: faux.getModel(),
+      resourceLoader: loader, settingsManager, sessionManager: SessionManager.inMemory(hermetic.dir),
+    });
+    let prompt: Promise<void> | undefined;
+    try {
+      await session.bindExtensions({});
+      const send = vi.spyOn(session, "sendCustomMessage");
+      await session.getToolDefinition("Agent")!.execute(
+        "call-alpha", { prompt: "alpha", description: "alpha", run_in_background: true },
+        undefined, undefined, session.extensionRunner.createToolContext("call-alpha", undefined),
+      );
+      prompt = session.prompt("Initial prompt");
+      await handlerEntered;
+      // Pi clears run-active BEFORE awaiting settled handlers, but a reentrant
+      // run becomes active before preparation, without a new agent_start yet.
+      expect(session.isIdle).toBe(blockedEvent === "agent_settled");
+      send.mockClear();
+      laterSettlementHandler.mockClear();
+      runs.settle("alpha");
+      await new Promise<void>(resolve => setImmediate(resolve));
+      input.mockClear();
+      await session.prompt("Input during the held handler", { streamingBehavior: "steer" });
+      expect(session.messages.filter(message => message.role === "custom" && message.customType === "subagent-notification"))
+        .toHaveLength(0);
+      expect(session.messages.some(message => message.role === "user" && JSON.stringify(message.content).includes("Input during")))
+        .toBe(false);
+      expect(laterSettlementHandler).not.toHaveBeenCalled();
+      if (blockedEvent === "agent_settled") {
+        // The outbox has already flushed. Both this send and the user's input
+        // wait in Pi's deferred-settled actions, not in CompletionOutbox.
+        expect(send).toHaveBeenCalledOnce();
+        expect(input).not.toHaveBeenCalled();
+      } else {
+        expect(send).not.toHaveBeenCalled();
+        expect(input).toHaveBeenCalledOnce();
+      }
+      release();
+      await prompt;
+      await session.waitForIdle();
+      expect(session.messages.filter(message => message.role === "custom" && message.customType === "subagent-notification"))
+        .toHaveLength(1);
+      expect(session.messages.some(message => message.role === "user" && JSON.stringify(message.content).includes("Input during")))
+        .toBe(true);
+      expect(laterSettlementHandler).toHaveBeenCalled();
+      expect(session.isIdle).toBe(true);
+    } finally {
+      release();
+      await session.abort();
+      await prompt;
       await session.extensionRunner.emit({ type: "session_shutdown", reason: "quit" });
       session.dispose();
       faux.unregister();

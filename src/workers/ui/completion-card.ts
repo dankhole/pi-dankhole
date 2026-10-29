@@ -20,11 +20,27 @@ function statusLabel(status: string): { label: string; color: "success" | "error
   }
 }
 
+// Include every foreground used by the header and Markdown callbacks. Read effective ANSI,
+// not theme identity: Pi can supply a stable proxy whose underlying palette changes.
+const foregrounds = [
+  "success", "error", "warning", "muted", "text", "syntaxVariable", "thinkingMedium", "dim",
+  "mdHeading", "mdLink", "mdLinkUrl", "mdCode", "mdCodeBlock", "mdQuote", "mdQuoteBorder", "mdListBullet",
+] as const;
+
+type CardDetails = Pick<NotificationDetails, "status" | "description" | "totalCost" | "durationMs"> & {
+  model?: string;
+  thinking?: string;
+};
+
 /** Display-only: no transcript reads, model calls, or changes to captured notification data. */
 export class CompletionCards implements Component {
-  private readonly cards: { details: NotificationDetails; markdown: Markdown }[];
+  private readonly cards: { details: CardDetails; markdown: Markdown; createMarkdown: () => Markdown }[];
+  // One final layout per instance, never a history of widths or notification identities.
+  private cached?: { width: number; theme: string; lines: string[] };
 
-  constructor(details: NotificationDetails, private expanded: boolean, private theme: Theme, private showCost: boolean) {
+  // Expansion or host invalidation creates a new instance. showCost is captured here;
+  // changing the setting alone does not rebuild an existing card (preexisting behavior).
+  constructor(details: NotificationDetails, private readonly expanded: boolean, private readonly theme: Theme, private readonly showCost: boolean) {
     // Use the renderer's supplied theme, not the process-global Markdown theme.
     const markdownTheme: MarkdownTheme = {
       heading: text => theme.fg("mdHeading", /^#{3,6} $/.test(stripTerminalSequences(text)) ? "" : text),
@@ -49,22 +65,39 @@ export class CompletionCards implements Component {
       const error = d.status === "error" && d.error ? safeText(d.error).trim() : "";
       const preview = result && result !== "No output." ? result : "No final response captured.";
       const text = error ? `Error: ${error}${expanded ? `\n\n${preview}` : ""}` : preview;
-      return { details: d, markdown: new Markdown(text, 0, 0, markdownTheme, { color: text => theme.fg("text", text) }) };
+      const createMarkdown = () => new Markdown(text, 0, 0, markdownTheme, { color: text => theme.fg("text", text) });
+      // Own the displayed snapshot, including nested invocation values. External mutations must
+      // not mix fresh headers with the Markdown preview captured by this constructor.
+      return {
+        details: {
+          status: d.status, description: d.description, totalCost: d.totalCost, durationMs: d.durationMs,
+          model: d.invocation?.modelName ?? d.invocation?.modelId, thinking: d.invocation?.thinking,
+        },
+        markdown: createMarkdown(), createMarkdown,
+      };
     });
   }
 
   invalidate(): void {
-    for (const card of this.cards) card.markdown.invalidate();
+    this.cached = undefined;
+    // Pi's Markdown.invalidate() retains its defaultStylePrefix, which can embed old ANSI.
+    // Recreate it so inline styles restored after code/bold also use the current theme.
+    for (const card of this.cards) card.markdown = card.createMarkdown();
   }
 
   render(width: number): string[] {
     if (width <= 0) return [];
+    const backgroundAnsi = this.theme.getBgAnsi("customMessageBg");
+    const theme = JSON.stringify([backgroundAnsi, ...foregrounds.map(color => this.theme.getFgAnsi(color))]);
+    if (this.cached?.theme === theme && this.cached.width === width) return this.cached.lines.slice();
+    // Markdown caches themed rows too; changing only the outer cache would retain stale colors.
+    if (this.cached && this.cached.theme !== theme) this.invalidate();
     const padding = width >= 40 ? 2 : width >= 12 ? 1 : 0;
     const contentWidth = width - padding * 2;
     const margin = " ".repeat(padding);
     const background = (line: string) => {
       // A truncation/style reset must not punch holes in the panel background.
-      const restored = line.replace(/\x1b\[(?:0|49)m/g, `$&${this.theme.getBgAnsi("customMessageBg")}`);
+      const restored = line.replace(/\x1b\[(?:0|49)m/g, `$&${backgroundAnsi}`);
       const padded = restored + " ".repeat(Math.max(0, width - visibleWidth(line)));
       return this.theme.bg("customMessageBg", padded) + "\x1b[0m";
     };
@@ -76,8 +109,8 @@ export class CompletionCards implements Component {
       const goal = this.theme.bold(this.theme.fg("text", safeText(d.description).replace(/\s+/g, " ").trim()));
       const content: string[] = [];
       const metrics = [this.showCost ? formatCost(d.totalCost ?? 0) : "", d.durationMs > 0 ? formatMs(d.durationMs) : ""].filter(Boolean).join(" · ");
-      const model = d.invocation?.modelName ?? d.invocation?.modelId;
-      const thinking = d.invocation?.thinking;
+      const model = d.model;
+      const thinking = d.thinking;
       const stats = [
         ...(metrics ? [this.theme.fg("muted", metrics)] : []),
         this.theme.fg(model ? "syntaxVariable" : "muted", model ? safeText(model).replace(/\s+/g, " ") : "Model not recorded"),
@@ -111,6 +144,8 @@ export class CompletionCards implements Component {
       for (const line of content) lines.push(background(margin + truncateToWidth(line, contentWidth, "…") + margin));
       if (width >= 24) lines.push(background(""));
     }
-    return lines;
+    this.cached = { width, theme, lines };
+    // The host receives an owned array: a consumer decorating rows cannot poison our cache.
+    return lines.slice();
   }
 }
