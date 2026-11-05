@@ -421,7 +421,8 @@ export function registerQuestions(pi: ExtensionAPI, enabled: boolean): void {
           }
           const buffer = questionPlain() ? "" : questionPaint(theme, " ".repeat(width), "question");
           const separator = questionPlain() ? "" : questionPaint(theme, " ".repeat(width), "questionSeparator");
-          const lines = [buffer, header];
+          const budget = Math.max(4, Math.min(16, (tui.terminal?.rows ?? 24) - 5));
+          const lines = budget > 4 ? [buffer, header, buffer] : [buffer, header];
           headerRow = 1;
           if (wrappedWidth !== width) {
             wrappedWidth = width;
@@ -435,7 +436,6 @@ export function registerQuestions(pi: ExtensionAPI, enabled: boolean): void {
             }
           }
           // Keep the bounded list and hint clear of ordinary input/footer controls.
-          const budget = Math.max(4, Math.min(16, (tui.terminal?.rows ?? 24) - 5));
           const available = budget - lines.length - 1; // Reserve the bottom buffer, even on tiny screens.
           const overflow = body.length > available;
           const hint = overflow && available > 1;
