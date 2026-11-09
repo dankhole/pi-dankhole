@@ -192,7 +192,7 @@ describe("completion journal/lifecycle integration", () => {
     expect(b.pi.sendMessage).not.toHaveBeenCalled();
   });
 
-  it("gives a fresh busy completion its own 30-second watchdog window beside a 60-second held restoration", async () => {
+  it.each([false, true])("gives a fresh completion its own eligibility window beside an older held restoration, warning only if public idle (idle=%s)", async idle => {
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "performance"] });
     let b = await boot();
     await b.spawn("older held result");
@@ -206,6 +206,7 @@ describe("completion journal/lifecycle integration", () => {
     b.parent.idle = false;
     await b.spawn("fresh busy result");
     await b.finish("fresh busy result");
+    b.parent.idle = idle; // No delivery boundary: observing idle is diagnostic only.
     expect(b.context.ui.notify).toHaveBeenCalledOnce();
     await b.command("diagnostics");
     expect(b.context.ui.notify.mock.calls.at(-1)[0]).toContain("Completions pending: 2; oldest 60s");
@@ -213,11 +214,49 @@ describe("completion journal/lifecycle integration", () => {
     await vi.advanceTimersByTimeAsync(29_999);
     expect(b.context.ui.notify).toHaveBeenCalledTimes(notices);
     await vi.advanceTimersByTimeAsync(1);
-    expect(b.context.ui.notify).toHaveBeenCalledTimes(notices + 1);
-    expect(b.context.ui.notify.mock.calls.at(-1)).toEqual([
-      expect.stringContaining("Completions pending: 2; oldest 90s"), "warning",
-    ]);
+    expect(b.context.ui.notify).toHaveBeenCalledTimes(notices + (idle ? 1 : 0));
+    if (idle) {
+      expect(b.context.ui.notify.mock.calls.at(-1)).toEqual([
+        "2 worker results still waiting for delivery. Check /agents diagnostics or /agents recover.", "warning",
+      ]);
+    }
     expect(b.pi.sendMessage).not.toHaveBeenCalled();
+    await b.command("diagnostics");
+    expect(b.context.ui.notify.mock.calls.at(-1)).toEqual([
+      expect.stringContaining("Completions pending: 2; oldest 90s"), "info",
+    ]);
+    expect(b.context.ui.notify.mock.calls.at(-1)[0]).toContain(`Public parent idle=${idle}`);
+    expect(b.context.ui.notify.mock.calls.at(-1)[0]).toContain("queued=1, in-flight=0, uncertain=0, held=1");
+    b.parent.idle = true;
+    await b.command("recover check");
+    expect(b.pi.sendMessage).toHaveBeenCalledOnce();
+    expect(b.pi.sendMessage.mock.calls[0][0].content).toContain("fresh busy result result");
+    expect(b.pi.sendMessage.mock.calls[0][0].content).not.toContain("older held result");
+  });
+
+  it("warns briefly about genuinely uncertain delivery while the parent remains busy, without retrying", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "performance"] });
+    const b = await boot();
+    await b.spawn("private uncertain task");
+    await b.finish("private uncertain task");
+    boundary(b);
+    b.lifecycle.get("agent_settled")({ aborted: false }); // No canonical receipt: the issued send is uncertain.
+    expect(b.pi.sendMessage).toHaveBeenCalledOnce();
+    await vi.advanceTimersByTimeAsync(29_999);
+    expect(b.context.ui.notify).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(b.context.ui.notify).toHaveBeenCalledExactlyOnceWith(
+      "Delivery unconfirmed for 1 worker result. Check /agents recover before retrying (duplicates possible).", "warning",
+    );
+    expect(b.parent.idle).toBe(false);
+    expect(b.pi.sendMessage).toHaveBeenCalledOnce();
+    await b.command("diagnostics");
+    expect(b.context.ui.notify.mock.calls.at(-1)[0]).toContain("Public parent idle=false");
+    expect(b.context.ui.notify.mock.calls.at(-1)[0]).toContain("uncertain=1");
+    expect(b.context.ui.notify.mock.calls.at(-1)[0]).not.toContain("private uncertain task");
+    b.parent.idle = true;
+    await b.command("recover check");
+    expect(b.pi.sendMessage).toHaveBeenCalledOnce(); // Checking cannot deliberately retry uncertain transport.
   });
 
   it("restores malformed trailing transitions as uncertain even without an attempted flag", async () => {

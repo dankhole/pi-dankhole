@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { COMPLETION_WAIT_WARNING_MS, CompletionDiagnostics, describeCompletionDiagnostic, observePublicParent, type ParentObservation } from "../../src/workers/completion-diagnostics.js";
+import { COMPLETION_WAIT_WARNING_MS, CompletionDiagnostics, describeCompletionDiagnostic, describeCompletionWarning, observePublicParent, type ParentObservation } from "../../src/workers/completion-diagnostics.js";
 import { CompletionOutbox, type OutboxMessage } from "../../src/workers/completion-outbox.js";
 
 const message: OutboxMessage = {
@@ -34,12 +34,135 @@ describe("completion wait diagnostics", () => {
     vi.advanceTimersByTime(COMPLETION_WAIT_WARNING_MS - 1);
     expect(publish).not.toHaveBeenCalled();
     vi.advanceTimersByTime(1);
-    expect(publish).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ count: 2, oldestAgeMs: 30_000 }), true);
+    expect(publish).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ count: 2, oldestAgeMs: 30_000 }), false);
     expect(vi.getTimerCount()).toBe(0);
     vi.advanceTimersByTime(600_000);
     expect(publish).toHaveBeenCalledOnce();
     expect(send).not.toHaveBeenCalled();
     timeout.mockRestore();
+  });
+
+  it.each(["tool_execution_start", "before_provider_request"] as const)("does not mistake a long %s for a stall", event => {
+    diagnostics.observe(event);
+    parent.signal = "active";
+    outbox.add("a", message);
+    vi.advanceTimersByTime(10 * COMPLETION_WAIT_WARNING_MS);
+    expect(publish).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ lastLifecycle: event }), false);
+    expect(vi.getTimerCount()).toBe(0);
+    expect(diagnostics.snapshot()).toMatchObject({ count: 1, oldestAgeMs: 300_000 });
+    expect(send).not.toHaveBeenCalled();
+  });
+
+  it("keeps ordinary progressing parent work quiet while retaining detailed diagnostics", () => {
+    diagnostics.observe("agent_start");
+    outbox.add("a", message);
+    for (let turn = 0; turn < 10; turn++) {
+      diagnostics.observe("before_provider_request");
+      vi.advanceTimersByTime(10_000);
+      diagnostics.observe("after_provider_response");
+      diagnostics.observe("tool_execution_start");
+      vi.advanceTimersByTime(10_000);
+      diagnostics.observe("tool_execution_end");
+    }
+    expect(publish.mock.calls.some(call => call[1])).toBe(false);
+    expect(describeCompletionDiagnostic(diagnostics.snapshot())).toContain("oldest 200s");
+    expect(describeCompletionDiagnostic(diagnostics.snapshot())).toContain("Host-internal busy cause unknown");
+    expect(vi.getTimerCount()).toBe(0);
+    expect(send).not.toHaveBeenCalled();
+  });
+
+  it("rechecks a quiet settlement after active work, without warning before its delivery handler", () => {
+    outbox.add("a", message);
+    vi.advanceTimersByTime(COMPLETION_WAIT_WARNING_MS);
+    expect(publish.mock.calls.some(call => call[1])).toBe(false);
+    parent.idle = true;
+    diagnostics.observe("agent_settled");
+    diagnostics.pendingChanged(); // Boundary state changes must retain the quiet-window check.
+    expect(publish.mock.calls.some(call => call[1])).toBe(false);
+    expect(vi.getTimerCount()).toBe(1);
+    vi.advanceTimersByTime(COMPLETION_WAIT_WARNING_MS - 1);
+    expect(publish.mock.calls.some(call => call[1])).toBe(false);
+    vi.advanceTimersByTime(1);
+    expect(publish).toHaveBeenLastCalledWith(expect.objectContaining({ idle: true, lifecycleAgeMs: 30_000 }), true);
+    expect(vi.getTimerCount()).toBe(0);
+    expect(send).not.toHaveBeenCalled();
+  });
+
+  it("clears a quiet-boundary recheck when the pending result is consumed", () => {
+    outbox.add("a", message);
+    vi.advanceTimersByTime(COMPLETION_WAIT_WARNING_MS);
+    diagnostics.observe("agent_settled");
+    expect(vi.getTimerCount()).toBe(1);
+    outbox.cancel("a");
+    expect(vi.getTimerCount()).toBe(0);
+    expect(publish).toHaveBeenLastCalledWith(undefined, false);
+    vi.advanceTimersByTime(COMPLETION_WAIT_WARNING_MS);
+    expect(publish.mock.calls.some(call => call[1])).toBe(false);
+    expect(send).not.toHaveBeenCalled();
+  });
+
+  it("cancels a quiet-boundary recheck when ordinary work resumes", () => {
+    outbox.add("a", message);
+    vi.advanceTimersByTime(COMPLETION_WAIT_WARNING_MS);
+    diagnostics.observe("agent_settled");
+    expect(vi.getTimerCount()).toBe(1);
+    vi.advanceTimersByTime(10_000);
+    diagnostics.observe("agent_start");
+    expect(vi.getTimerCount()).toBe(0);
+    vi.advanceTimersByTime(60_000);
+    expect(publish.mock.calls.some(call => call[1])).toBe(false);
+    expect(send).not.toHaveBeenCalled();
+  });
+
+  it("warns on an expired bounded summary check without inventing the host busy cause", () => {
+    outbox.add("a", message);
+    diagnostics.observe("summary_abort");
+    parent.idleObservation = "expired";
+    vi.advanceTimersByTime(COMPLETION_WAIT_WARNING_MS);
+    expect(publish).toHaveBeenLastCalledWith(expect.objectContaining({ idle: false, idleObservation: "expired" }), true);
+    const warning = describeCompletionWarning(diagnostics.snapshot());
+    expect(warning).toContain("1 worker result still waiting for delivery");
+    expect(warning).toContain("/agents diagnostics");
+    expect(warning).not.toMatch(/idle=|signal=|timers|stalled|SECRET|private/);
+    expect(send).not.toHaveBeenCalled();
+  });
+
+  it("can warn on newly uncertain delivery after suppressing the ordinary wait", () => {
+    outbox.add("a", message);
+    vi.advanceTimersByTime(COMPLETION_WAIT_WARNING_MS);
+    expect(publish.mock.calls.some(call => call[1])).toBe(false);
+    parent.uncertainDeliveries = 1;
+    diagnostics.pendingChanged();
+    expect(publish).toHaveBeenLastCalledWith(expect.objectContaining({ uncertainDeliveries: 1 }), true);
+    expect(describeCompletionWarning(diagnostics.snapshot())).toBe(
+      "Delivery unconfirmed for 1 worker result. Check /agents recover before retrying (duplicates possible).",
+    );
+    expect(describeCompletionWarning({ ...diagnostics.snapshot(), count: 3 })).toContain("for 1 worker result.");
+    expect(describeCompletionWarning({ ...diagnostics.snapshot(), uncertainDeliveries: 2 })).toContain("for 2 worker results.");
+    diagnostics.pendingChanged();
+    expect(publish.mock.calls.filter(call => call[1])).toHaveLength(1);
+    expect(send).not.toHaveBeenCalled();
+  });
+
+  it.each(["active", "unknown"] as const)("does not treat idle=true with an %s signal as a safe-idle delay", signal => {
+    outbox.add("a", message);
+    parent.idle = true;
+    parent.signal = signal;
+    vi.advanceTimersByTime(COMPLETION_WAIT_WARNING_MS);
+    expect(publish).toHaveBeenLastCalledWith(expect.objectContaining({ idle: true, signal }), false);
+    expect(send).not.toHaveBeenCalled();
+  });
+
+  it("does not warn about pending parent messages or unavailable observations alone", () => {
+    outbox.add("a", message);
+    parent.idle = true;
+    parent.queuedMessages = true;
+    vi.advanceTimersByTime(COMPLETION_WAIT_WARNING_MS);
+    expect(publish).toHaveBeenLastCalledWith(expect.objectContaining({ queuedMessages: true }), false);
+    parent.queuedMessages = undefined;
+    diagnostics.pendingChanged();
+    expect(publish).toHaveBeenLastCalledWith(expect.objectContaining({ queuedMessages: undefined }), false);
+    expect(send).not.toHaveBeenCalled();
   });
 
   it.each([false, true])("keeps restored counts truthful but watches only non-held recovery (uncertain=%s)", uncertain => {
@@ -51,6 +174,7 @@ describe("completion wait diagnostics", () => {
       getOwnerSessionId: () => "owner",
       onStateChange: () => diagnostics.pendingChanged(),
     });
+    parent.uncertainDeliveries = uncertain ? 1 : 0;
     outbox.restore("restored", message, { ownerSessionId: "owner", deliveryId: "saved-run" }, uncertain);
     expect(diagnostics.snapshot().count).toBe(1);
     expect(vi.getTimerCount()).toBe(uncertain ? 1 : 0);
@@ -82,7 +206,7 @@ describe("completion wait diagnostics", () => {
     vi.advanceTimersByTime(COMPLETION_WAIT_WARNING_MS - 1);
     expect(publish).not.toHaveBeenCalled();
     vi.advanceTimersByTime(1);
-    expect(publish).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ count, oldestAgeMs: 90_000 }), true);
+    expect(publish).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ count, oldestAgeMs: 90_000 }), false);
     expect(vi.getTimerCount()).toBe(0);
     expect(send).not.toHaveBeenCalled();
   });
@@ -131,7 +255,7 @@ describe("completion wait diagnostics", () => {
     vi.advanceTimersByTime(15_000);
     expect(publish).not.toHaveBeenCalled();
     vi.advanceTimersByTime(15_000);
-    expect(publish).toHaveBeenCalledWith(expect.objectContaining({ count: 1, oldestAgeMs: 30_000 }), true);
+    expect(publish).toHaveBeenCalledWith(expect.objectContaining({ count: 1, oldestAgeMs: 30_000 }), false);
     outbox.cancel("b");
     expect(publish).toHaveBeenLastCalledWith(undefined, false);
     expect(vi.getTimerCount()).toBe(0);
@@ -145,10 +269,11 @@ describe("completion wait diagnostics", () => {
     outbox.cancel("a");
     expect(publish).toHaveBeenLastCalledWith(expect.objectContaining({ count: 1, oldestAgeMs: 0 }), false);
     expect(vi.getTimerCount()).toBe(0);
-    expect(publish.mock.calls.filter(call => call[1])).toHaveLength(1);
+    expect(publish.mock.calls.filter(call => call[1])).toHaveLength(0);
   });
 
   it("rate limits warnings across short pending episodes and count changes", () => {
+    parent.uncertainDeliveries = 1;
     outbox.add("a", message);
     vi.advanceTimersByTime(30_000);
     outbox.add("b", message);
@@ -191,6 +316,7 @@ describe("completion wait diagnostics", () => {
     expect(() => vi.advanceTimersByTime(30_000)).not.toThrow();
     expect(diagnostics.snapshot()).toMatchObject({ idle: undefined, queuedMessages: undefined, signal: "unknown", unavailableObservations: ["parent"] });
     expect(JSON.stringify(publish.mock.calls)).not.toContain("SECRET stale parent");
+    expect(publish.mock.calls.some(call => call[1])).toBe(false);
     expect(send).not.toHaveBeenCalled();
   });
 

@@ -273,9 +273,14 @@ describe("completion delivery to a running parent", () => {
     expect(timeout.mock.calls.filter(call => call[1] === 500)).toHaveLength(60);
     expect(vi.getTimerCount()).toBe(baselineTimers);
     expect(b.pi.sendMessage).not.toHaveBeenCalled();
+    expect(b.parentCtx.ui.notify).toHaveBeenCalledExactlyOnceWith(
+      "1 worker result still waiting for delivery. Check /agents diagnostics or /agents recover.", "warning",
+    );
     expect(b.parentCtx.ui.setStatus).toHaveBeenCalledWith("subagents:pending-completions", expect.stringContaining("1 worker result waiting"));
     await b.commands.get("agents").handler("diagnostics", b.parentCtx);
     expect(b.parentCtx.ui.notify).toHaveBeenLastCalledWith(expect.stringContaining("Completions pending: 1"), "info");
+    expect(b.parentCtx.ui.notify.mock.calls.at(-1)[0]).toContain("idle observation=expired");
+    expect(b.parentCtx.ui.notify.mock.calls.at(-1)[0]).toContain("Host-internal busy cause unknown");
     b.parent.running = false;
     const expired = timeout.mock.calls.filter(call => call[1] === 500).at(-1)![0] as () => void;
     expired(); // Even an already-dequeued retry cannot act after budget expiry.
@@ -425,7 +430,7 @@ describe("completion delivery to a running parent", () => {
     expect(b.pi.sendMessage).not.toHaveBeenCalled();
   });
 
-  it("exposes stalled public/lifecycle observations without delivering, and result consumption clears the watchdog/status", async () => {
+  it("keeps busy wait details in diagnostics without warning, and result consumption clears the watchdog/status", async () => {
     vi.useFakeTimers();
     const runs = controllableRuns();
     const b = await boot();
@@ -438,14 +443,15 @@ describe("completion delivery to a running parent", () => {
     b.lifecycle.get("agent_end")?.({ type: "agent_end", messages: [] });
     await vi.advanceTimersByTimeAsync(30_000);
     expect(b.pi.sendMessage).not.toHaveBeenCalled();
-    expect(b.parentCtx.ui.notify).toHaveBeenCalledWith(expect.stringContaining("Last observed lifecycle: agent_end"), "warning");
-    const waitWarning = b.parentCtx.ui.notify.mock.calls.find(([text]: [string]) => text.startsWith("Completions pending:"))![0];
-    expect(waitWarning).toContain("Public parent idle=false");
-    expect(waitWarning).not.toContain("private");
+    expect(b.parentCtx.ui.notify).not.toHaveBeenCalled();
     expect(b.parentCtx.ui.setStatus).toHaveBeenCalledWith("subagents:pending-completions", expect.stringContaining("1 worker result waiting"));
 
     await b.commands.get("agents").handler("diagnostics", b.parentCtx);
     expect(b.parentCtx.ui.notify).toHaveBeenLastCalledWith(expect.stringContaining("oldest 30s"), "info");
+    const details = b.parentCtx.ui.notify.mock.calls.at(-1)[0];
+    expect(details).toContain("Last observed lifecycle: agent_end");
+    expect(details).toContain("Public parent idle=false");
+    expect(details).not.toContain("private");
     await b.tools.get("get_subagent_result").execute("consume", { agent_id: id }, undefined, undefined, b.parentCtx);
     expect(b.parentCtx.ui.setStatus).toHaveBeenLastCalledWith("subagents:pending-completions", undefined);
     const calls = b.parentCtx.ui.notify.mock.calls.length;

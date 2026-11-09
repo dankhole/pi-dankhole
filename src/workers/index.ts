@@ -20,7 +20,7 @@ import { abortable } from "./abortable.js";
 import { AgentManager, type SpawnOptions } from "./agent-manager.js";
 import { getAgentConversation, getDefaultMaxTurns, getGraceTurns, getRememberAgents, normalizeMaxTurns, SUBAGENT_TOOL_NAMES, setDefaultMaxTurns, setGraceTurns, setRememberAgents, steerAgent } from "./agent-runner.js";
 import { inChildSessionContext } from "./child-context.js";
-import { CompletionDiagnostics, describeCompletionDiagnostic, observePublicParent } from "./completion-diagnostics.js";
+import { CompletionDiagnostics, describeCompletionDiagnostic, describeCompletionWarning, observePublicParent } from "./completion-diagnostics.js";
 import { CompletionJournal, type CompletionResult, type CompletionSnapshot } from "./completion-journal.js";
 import { CompletionOutbox, type OutboxMessage } from "./completion-outbox.js";
 import { type RpcHandle, registerRpcHandlers } from "./cross-extension-rpc.js";
@@ -385,14 +385,14 @@ export default function (pi: ExtensionAPI) {
     () => {
       const state = outbox.getState();
       const durability = completionOwner ? completionOwner.journal.summary().durabilityDegraded ? "unverified/degraded" : "verified" : "unknown";
-      return { ...observePublicParent(currentCtx), idleObservation: parentLifecycle.getObservationState(),
+      return { ...observePublicParent(currentCtx), idleObservation: parentLifecycle.getObservationState(), uncertainDeliveries: state.uncertain,
         deliveryState: `queued=${state.queued}, in-flight=${state.inFlight}, uncertain=${state.uncertain}, held=${state.held}, automatic delivery paused=${automaticDeliveryPaused}, durability=${durability}` };
     },
     (snapshot, notify) => {
       // The immediate status above is the only banner owner. The watchdog
       // adds a bounded warning, never a delivery or a duplicate status entry.
       if (snapshot && notify && currentCtx?.hasUI) {
-        currentCtx.ui.notify(describeCompletionDiagnostic(snapshot), "warning");
+        currentCtx.ui.notify(describeCompletionWarning(snapshot), "warning");
       }
     },
     () => ({ widget: widget.getAnimationTimerCount(), fleet: fleet.getRefreshTimerCount(), foreground: foregroundSpinnerCount }),
@@ -693,6 +693,7 @@ export default function (pi: ExtensionAPI) {
   // bound session_start, so a filtered-out activation never advertises (#142).
   pi.on("session_start", async (_event, ctx) => {
     if (!ownsManagerRegistry) return;
+    steeringHandoffs = undefined;
     parentCompacting = false;
     automaticDeliveryPaused = false;
     clearCompletionStatus();
@@ -805,6 +806,7 @@ export default function (pi: ExtensionAPI) {
     rpcHandle = undefined;
     const closingOwner = completionOwner;
     if (closingOwner) closingOwner.closing = true;
+    steeringHandoffs = undefined;
     parentLifecycle.bind(undefined);
     parentCompacting = false;
     clearCompletionStatus();
@@ -858,6 +860,19 @@ export default function (pi: ExtensionAPI) {
    * offers the handoff.
    */
   const foregroundHandoffs = new Map<string, () => void>();
+  // Input hooks run BEFORE Pi queues the message. Arm only the calls that
+  // already exist, then wait for public queue evidence on their next tick;
+  // waking directly inside `input` can outrun later input handlers. The public
+  // queue combines steers/follow-ups: this is evidence of queued work, not a
+  // receipt proving that this particular input finished all its handlers.
+  let steeringHandoffs: Map<string, () => void> | undefined;
+  function backgroundForQueuedSteering(ctx: ExtensionContext): void {
+    if (!steeringHandoffs?.size) return;
+    try { if (!ctx.hasPendingMessages()) return; } catch { return; }
+    const ids = [...steeringHandoffs].filter(([id, wake]) => foregroundHandoffs.get(id) === wake).map(([id]) => id);
+    steeringHandoffs = undefined;
+    sendForegroundToBackground(ids);
+  }
 
   /** Hand these runs to the background and wake their tool calls; returns how many took. */
   function sendForegroundToBackground(ids: Iterable<string>): number {
@@ -1078,9 +1093,14 @@ export default function (pi: ExtensionAPI) {
     outbox.onSettled(automaticDeliveryPaused);
     reconcileCompletions();
   });
-  pi.on("input", () => {
+  pi.on("input", (event) => {
     parentLifecycle.invalidate();
     completionDiagnostics.observe("input");
+    // Follow-ups deliberately wait. Steers (including question-UI answers)
+    // release the parent's foreground calls once queued, without stopping or
+    // forwarding the message to the workers.
+    steeringHandoffs = event.streamingBehavior === "steer" && foregroundHandoffs.size > 0
+      ? new Map(foregroundHandoffs) : undefined;
   });
   pi.on("before_agent_start", () => {
     parentLifecycle.invalidate();
@@ -1755,6 +1775,7 @@ Terse command-style prompts produce shallow, generic work.
 
       // Animate spinner at ~80ms (smooth rotation through 10 braille frames)
       const spinnerInterval = setInterval(() => {
+        backgroundForQueuedSteering(ctx);
         spinnerFrame++;
         streamUpdate();
       }, 80);
@@ -1826,7 +1847,10 @@ Terse command-style prompts produce shallow, generic work.
         // ticking or a finished agent on the widget.
         stopPresentation();
         signal?.removeEventListener("abort", stopPresentation);
-        if (handoffId !== undefined) foregroundHandoffs.delete(handoffId);
+        if (handoffId !== undefined) {
+          foregroundHandoffs.delete(handoffId);
+          steeringHandoffs?.delete(handoffId);
+        }
         // A handed-off run is still working: its row stays, and the
         // background settle in `onComplete` tears it down when it really ends.
         if (fgId && !backgrounded) {

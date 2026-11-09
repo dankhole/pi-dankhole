@@ -307,6 +307,95 @@ describe("Agent tool — foreground run sent to the background", () => {
     await vi.waitFor(() => expect(pi.sendMessage).toHaveBeenCalledTimes(2));
   });
 
+  it.each(["interactive", "rpc", "extension"])("hands foreground calls off only after %s steering reaches the public queue", async source => {
+    vi.useFakeTimers();
+    try {
+      const runs = controllableRuns();
+      const { tools, lifecycle } = await boot();
+      let pending = false;
+      parentContext!.hasPendingMessages = () => pending;
+      const first = runAgentTool(tools, "first job");
+      const second = runAgentTool(tools, "second job");
+      await vi.advanceTimersByTimeAsync(0);
+      lifecycle.get("input")({ streamingBehavior: "steer", source });
+
+      // Input processing can await other extensions before Pi queues anything.
+      await vi.advanceTimersByTimeAsync(160);
+      expect(registry().getRecord(runs.agentId("first job"))?.isBackground).toBe(false);
+      expect(registry().getRecord(runs.agentId("second job"))?.isBackground).toBe(false);
+      pending = true;
+      await vi.advanceTimersByTimeAsync(80);
+      expect(textOf(await first)).toContain("Agent started in background.");
+      expect(textOf(await second)).toContain("Agent started in background.");
+      expect(fleet!.onAgentFinished).not.toHaveBeenCalled();
+      runs.finish("first job", "FIRST");
+      runs.finish("second job", "SECOND");
+      await vi.advanceTimersByTimeAsync(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it.each(["followUp", undefined])("does not hand off for input with streaming behavior %s", async streamingBehavior => {
+    vi.useFakeTimers();
+    try {
+      const runs = controllableRuns();
+      const { tools, lifecycle } = await boot();
+      parentContext!.hasPendingMessages = () => true;
+      const execution = runAgentTool(tools, "kept job");
+      await vi.advanceTimersByTimeAsync(0);
+      lifecycle.get("input")({ streamingBehavior });
+      await vi.advanceTimersByTimeAsync(160);
+      expect(registry().getRecord(runs.agentId("kept job"))?.isBackground).toBe(false);
+      runs.finish("kept job", "INLINE");
+      expect(textOf(await execution)).toContain("INLINE");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not hand off newly started calls on an older steering request", async () => {
+    vi.useFakeTimers();
+    try {
+      const runs = controllableRuns();
+      const { tools, lifecycle } = await boot();
+      let pending = false;
+      parentContext!.hasPendingMessages = () => pending;
+      const first = runAgentTool(tools, "first job");
+      await vi.advanceTimersByTimeAsync(0);
+      lifecycle.get("input")({ streamingBehavior: "steer" });
+      const later = runAgentTool(tools, "later job");
+      await vi.advanceTimersByTimeAsync(0);
+      pending = true;
+      await vi.advanceTimersByTimeAsync(80);
+      expect(textOf(await first)).toContain("Agent started in background.");
+      expect(registry().getRecord(runs.agentId("later job"))?.isBackground).toBe(false);
+      runs.finish("first job", "FIRST");
+      runs.finish("later job", "INLINE");
+      expect(textOf(await later)).toContain("INLINE");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps a foreground wait when the public queue getter is unavailable", async () => {
+    vi.useFakeTimers();
+    try {
+      const runs = controllableRuns();
+      const { tools, lifecycle } = await boot();
+      parentContext!.hasPendingMessages = () => { throw new Error("stale context"); };
+      const execution = runAgentTool(tools, "kept job");
+      await vi.advanceTimersByTimeAsync(0);
+      lifecycle.get("input")({ streamingBehavior: "steer" });
+      await vi.advanceTimersByTimeAsync(160);
+      expect(registry().getRecord(runs.agentId("kept job"))?.isBackground).toBe(false);
+      runs.finish("kept job", "INLINE");
+      expect(textOf(await execution)).toContain("INLINE");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("ctrl+b passes through when no foreground call is pending", async () => {
     const runs = controllableRuns();
     const { tools, lifecycle } = await boot();

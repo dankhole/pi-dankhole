@@ -86,6 +86,30 @@ default to existing behavior, and preserve the normal config/trust/auth pipeline
 A shared-client API would need explicit session-scoped leases and isolation, not
 just a process-global transport cache.
 
+## Steering during worker waits
+
+Pi 1.4.0 processes steering after the current assistant response's tool batch
+returns, not concurrently with an unfinished tool call. Input hooks run before
+the host finishes all input handlers and queues the message. Waking a foreground
+worker call directly from an input hook can therefore start a parent request
+before a slow later handler finishes transforming or consuming the input.
+
+For foreground worker launches, this extension snapshots the existing handoff
+callbacks on steering input, then uses the already-running 80 ms presentation
+tick to check public `hasPendingMessages()` before handing those same calls to
+the background. No input is intercepted, resent or forwarded to a worker, and
+the worker's session and in-flight work are preserved. No separate polling timer
+is added. Follow-ups alone do not arm this handoff; unavailable queue observation
+leaves the foreground wait intact.
+
+This is best effort, not a causal input acknowledgement: the public queue
+combines steers and follow-ups. Existing queued messages and concurrent input
+handlers can make the triggering message ambiguous. A strict post-preflight
+contract would require a host queued-input acknowledgement event. Foreground
+resumes, explicit result waits and unrelated tools are not automatically
+released by this launch-only handoff. Manual `Ctrl+B` remains available for
+supported foreground launches. No installed-host patch is made.
+
 ## Runtime handoff
 
 The user explicitly declined Pi-core changes. No new core checkout, installed

@@ -12,6 +12,8 @@ export interface ParentObservation {
   signal: "absent" | "active" | "aborted" | "unknown";
   idleObservation?: IdleObservationState;
   deliveryState?: string;
+  /** Structured outbox evidence, not inferred from parent activity or diagnostic text. */
+  uncertainDeliveries?: number;
 }
 
 /** Each public getter is independent; stale contexts must never crash a watchdog. */
@@ -70,7 +72,30 @@ export function describeCompletionDiagnostic(snapshot: CompletionDiagnostic): st
     + `Host spinner not measured. Host-internal busy cause unknown; delivery uses safe boundaries.`;
 }
 
-/** One unref'ed watchdog per pending episode; no delivery, polling or model calls. */
+export function describeCompletionWarning(snapshot: CompletionDiagnostic): string {
+  const uncertain = snapshot.uncertainDeliveries ?? 0;
+  const count = uncertain > 0 ? uncertain : snapshot.count;
+  const results = `${count} worker result${count === 1 ? "" : "s"}`;
+  return (uncertain > 0
+    ? `Delivery unconfirmed for ${results}. Check /agents recover before retrying (duplicates possible).`
+    : `${results} still waiting for delivery. Check /agents diagnostics or /agents recover.`);
+}
+
+function warrantsWarning(snapshot: CompletionDiagnostic): boolean {
+  if ((snapshot.uncertainDeliveries ?? 0) > 0) return true;
+  // A long provider request/tool call (or merely idle=false) is not stall evidence.
+  // Require a quiet public-idle observation or an expired bounded summary check.
+  return snapshot.lifecycleAgeMs >= COMPLETION_WAIT_WARNING_MS
+    && ((snapshot.idle === true && snapshot.signal === "absent" && snapshot.queuedMessages === false)
+      || snapshot.idleObservation === "expired");
+}
+
+const boundaryEvents = new Set<Lifecycle>([
+  "agent_end", "agent_before_settle", "agent_settled", "session_compact", "session_compact_failed",
+  "session_tree", "summary_abort",
+]);
+
+/** Unref'ed, event-driven watchdogs only; no delivery, polling or model calls. */
 export class CompletionDiagnostics {
   private timer: ReturnType<typeof setTimeout> | undefined;
   private disposed = false;
@@ -96,6 +121,12 @@ export class CompletionDiagnostics {
     if (event === "turn_end") {
       this.lastTurnOutcome = stopReason === "error" || stopReason === "aborted" ? stopReason
         : stopReason === undefined ? "unknown" : "success";
+    }
+    if (this.published && !this.warnedEpisode) {
+      this.clearTimer();
+      // Recheck after a quiet boundary window, not synchronously before the
+      // boundary handler has had its chance to deliver. Progress cancels it.
+      if (boundaryEvents.has(event)) this.schedule(COMPLETION_WAIT_WARNING_MS);
     }
   }
 
@@ -135,18 +166,12 @@ export class CompletionDiagnostics {
       this.warnedEpisode = false;
       return;
     }
-    // Once shown, keep the count accurate even when consumption removes the
-    // oldest run. Do not start another watchdog within this pending episode.
+    // Keep snapshots truthful even when a normal active parent suppresses the
+    // warning. Age alone is never evidence that parent work has stalled.
     if (this.published || watchdog.oldestAgeMs >= COMPLETION_WAIT_WARNING_MS) {
-      this.report();
+      this.report(watchdog.oldestAgeMs >= COMPLETION_WAIT_WARNING_MS);
     } else {
-      const timer = setTimeout(() => {
-        if (this.timer !== timer) return;
-        this.timer = undefined;
-        this.pendingChanged(); // Recheck eligible count and age before reporting.
-      }, COMPLETION_WAIT_WARNING_MS - watchdog.oldestAgeMs);
-      this.timer = timer;
-      timer.unref();
+      this.schedule(COMPLETION_WAIT_WARNING_MS - watchdog.oldestAgeMs);
     }
   }
 
@@ -158,13 +183,31 @@ export class CompletionDiagnostics {
     this.published = false;
   }
 
-  private report(): void {
+  private report(eligibleAge: boolean): void {
     const now = performance.now();
-    const notify = !this.warnedEpisode && now - this.lastWarningAt >= WARNING_INTERVAL_MS;
-    this.warnedEpisode = true;
-    if (notify) this.lastWarningAt = now;
+    const snapshot = this.snapshot();
+    const notify = eligibleAge && warrantsWarning(snapshot)
+      && !this.warnedEpisode && now - this.lastWarningAt >= WARNING_INTERVAL_MS;
+    if (notify) {
+      this.warnedEpisode = true;
+      this.lastWarningAt = now;
+    }
     this.published = true;
-    this.publishSafely(this.snapshot(), notify);
+    this.publishSafely(snapshot, notify);
+    if (!this.warnedEpisode && boundaryEvents.has(this.lastLifecycle)
+      && snapshot.lifecycleAgeMs < COMPLETION_WAIT_WARNING_MS) {
+      this.schedule(COMPLETION_WAIT_WARNING_MS - snapshot.lifecycleAgeMs);
+    }
+  }
+
+  private schedule(delayMs: number): void {
+    const timer = setTimeout(() => {
+      if (this.timer !== timer) return;
+      this.timer = undefined;
+      this.pendingChanged(); // Recheck eligible count and age before reporting.
+    }, delayMs);
+    this.timer = timer;
+    timer.unref();
   }
 
   private publishSafely(snapshot: CompletionDiagnostic | undefined, notify: boolean): void {

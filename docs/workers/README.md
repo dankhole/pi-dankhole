@@ -27,7 +27,7 @@ Agent({
 })
 ```
 
-Top-level launches run in the background by default and return an ID. Completion is delivered to the parent at a safe turn boundary. Use `run_in_background: false` when the next step needs the result immediately. A running foreground call can be handed to the background with `Ctrl+B` or the viewer's `b` action.
+Top-level launches run in the background by default and return an ID. Completion is delivered to the parent at a safe turn boundary. Use `run_in_background: false` when the next step needs the result immediately. A running foreground launch automatically hands off to the background when you submit steering to the main agent and queued input becomes observable, normally on the next 80 ms presentation tick. The worker keeps running; the parent no longer waits for it. `Ctrl+B` or the viewer's `b` action also hands it off manually.
 
 Workers inherit parent system rules. `instructions` supplements those rules; it does not replace them. Conversation history is separate and is included only with `inherit_context: true`.
 
@@ -71,6 +71,8 @@ Agent({ resume: id, prompt: "Investigate the first finding further." })
 
 `get_subagent_result` accepts `verbose: true` for the conversation log. Consuming a completed result suppresses a duplicate completion notification. Cancelling a wait does not cancel its background worker. Steering received during startup is queued until the session is ready.
 
+Main-agent steering is not forwarded to workers. Automatic foreground handoff also accepts steering submitted by the question UI; follow-up input alone (`Alt+Enter`) does not request handoff. This is a best-effort public-queue observation, not a per-message delivery receipt: Pi combines steering and follow-up queues, and concurrent input handlers can make their provenance ambiguous. It does not interrupt other tools, foreground resumes or explicit `get_subagent_result` waits; those retain Pi's normal boundaries. See [host boundaries](../pi-host-boundaries.md#steering-during-worker-waits).
+
 Stopped, failed and turn-limited work is distinguished from normal completion; available partial output remains accessible. At a configured turn limit the worker is asked to wrap up, then aborted if it exceeds its grace budget.
 
 ## UI
@@ -81,7 +83,7 @@ Stopped, failed and turn-limited work is distinguished from normal completion; a
 - **Conversation viewer:** live transcript with scrolling, Markdown controls, steering and stopping. Enter opens the steering composer; `x` twice stops the worker. Escape returns to the parent without stopping it. Detailed metrics remain available here.
 - **`/agents`:** worker conversations and settings. No profile creation, type management, scheduler or workflow menus.
 - **`/agents recover`:** inspect captured terminal results and deliberately recover pending or uncertain notifications; see [completion recovery](#completion-recovery).
-- **`/agents diagnostics`:** read-only completion-wait and animation observations. Pending count/age, public parent idle/queued/signal state and the last observed lifecycle help distinguish extension activity from a host spinner. The host's internal busy cause remains unknown. An event-driven pending status appears immediately, with a compaction-specific Escape hint in the TUI. A completion waiting 30 seconds produces a bounded warning, not forced delivery, cancellation or a model call; consumption, delivery and shutdown clear pending state.
+- **`/agents diagnostics`:** read-only completion-wait and animation observations. Pending count/age, public parent idle/queued/signal state and the last observed lifecycle help distinguish extension activity from a host spinner. The host's internal busy cause remains unknown. An event-driven pending status appears immediately, with a compaction-specific Escape hint in the TUI. Ordinary active parent work does not produce a warning just because a completion waits 30 seconds. Brief, rate-limited warnings are reserved for unconfirmed delivery, a quiet public-idle delay or an expired summary-idle observation; detailed state remains available through this command. Warnings never force delivery, cancellation or a model call; consumption, delivery and shutdown clear pending state.
 
 After compaction, successful tree navigation, or an observed summary-operation abort signal, pending completions get an immediate public-idle check, then checks every 500 ms for at most 30 seconds. Empty queues stop timers but retain the original deadline for late arrivals; input, preparation, run starts, shutdown or replacement invalidate it. Every delivery still requires public idle and rejects an active run/signal. Hooks exceeding this finite observation window can leave results pending until another safe boundary. Expiry retains results and diagnostics and never forces the parent idle.
 
