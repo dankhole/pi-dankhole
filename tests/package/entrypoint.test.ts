@@ -58,6 +58,7 @@ describe("single package composition", () => {
     expect([...extension.tools.keys()].sort()).toEqual(["Agent", "ask_user", "get_subagent_result", "resolve_question", "steer_subagent"]);
     expect([...extension.commands.keys()].sort()).toEqual(["agents", "dankhole", "latest-input", "q", "questions"]);
     expect(extension.toolRenderers).toHaveLength(1);
+    expect(extension.handlers.get("context_with_system")).toHaveLength(1);
     const questionRenderers = extension.tools.get("ask_user")!.definition;
     expect(extension.toolRenderers![0]("ask_user", () => questionRenderers)).toBe(questionRenderers);
     const resolution = extension.tools.get("resolve_question")!.definition;
@@ -78,6 +79,7 @@ describe("single package composition", () => {
     expect([...child.tools.keys()].sort()).toEqual(["ask_user", "resolve_question"]);
     expect(child.commands.has("agents")).toBe(false);
     expect(child.toolRenderers).toHaveLength(1);
+    expect(child.handlers.get("context_with_system")).toHaveLength(1);
     expect(Reflect.get(globalThis, managerKey)).toBe(rootManager);
   });
 });

@@ -261,7 +261,7 @@ const parameters = Type.Object({
   options: Type.Optional(Type.Array(Type.Object({
     label: Type.String({ minLength: 1, maxLength: 160 }),
     description: Type.Optional(Type.String({ maxLength: 1200 })),
-  }), { maxItems: 12, description: "Real choices only. Omit for text-only questions; custom text is always available." })),
+  }), { maxItems: 12, description: "Real choices only. For yes/no questions, supply Yes and No options. Omit only for genuinely open-ended questions; custom text is always available." })),
   recommended_option: Type.Optional(Type.Integer({ minimum: 1, maximum: 12, description: "1-based index of the recommended option. Never a default answer or automatic approval." })),
   rationale: Type.Optional(Type.String({ maxLength: 2000, description: "Why that option is recommended; requires recommended_option." })),
   question_id: Type.Optional(Type.Integer({ minimum: 1, description: "Reuse an existing pending ID only for the same question. Never reuse an answered or dismissed ID." })),
@@ -701,6 +701,7 @@ export function registerQuestions(pi: ExtensionAPI, enabled: boolean): void {
       content: [
         ...(pending.length ? [`Unanswered user questions (not approvals):\n${pending.map(record => `Q${record.id}: ${record.question}`).join("\n")}`] : []),
         ...(dismissed.length ? [`Dismissed, still unanswered (NOT answers or approvals):\n${dismissed.map(record => `Q${record.id}: ${record.question} — ${record.resolution ? `agent dismissal: ${record.resolution.reason}` : "dismissed by the user"}`).join("\n")}\nDo not re-ask or reuse dismissed IDs. Dismissal authorizes no action.`] : []),
+        "Reconcile these questions with the latest user reply: when it clearly answers a pending question, call resolve_question with the full observed reply, even without a Q-number or when mixed with other requests. Dismiss questions made obsolete by changed scope, with a reason. Leave ambiguous questions pending; do not re-ask answered questions.",
         "Do not infer answers from silence or unrelated input. Reuse an ID only for its unchanged pending question.",
       ].join("\n\n"),
     } };
@@ -715,12 +716,12 @@ export function registerQuestions(pi: ExtensionAPI, enabled: boolean): void {
     annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
     promptSnippet: "Ask the user one clarification, approval, or decision question with a persistent sequential ID.",
     promptGuidelines: [
-      "Use ask_user only for questions you would otherwise ask; do not ask extra questions. Ask one per call, with optional choices and recommendation; custom text is always available.",
+      "Use ask_user only for questions you would otherwise ask; do not ask extra questions. Ask one per call. For yes/no questions, supply selectable Yes and No options; offer concrete choices for other decisions. Omit options only for genuinely open-ended questions. Custom text is always available; recommendations never select an answer.",
       "Call ask_user ALONE in its assistant turn, never alongside other tool calls. Sequential execution is NOT an authorization gate for siblings. Do not execute actions dependent on an answer until a later turn after an explicit user answer.",
-      "Only the extension allocates Q-number IDs. Reuse question_id only for the unchanged pending question, never answered or dismissed IDs. Never invent user answers, treat selection/recommendation as approval, or treat dismissal/defer/unavailable/abort as an answer.",
+      "Only the extension allocates Q-number IDs. Reuse question_id only for the unchanged pending question, never answered or dismissed IDs. Never invent user answers, treat an unsubmitted selection or recommendation as approval, or treat dismissal/defer/unavailable/abort as an answer.",
       "Background workers must report their questions to the lead agent for interactive routing; headless calls remain unanswered. If ask_user is unavailable, ask labeled Qn prose; /q can capture it.",
     ],
-    description: "Save ONE question for the user without opening an answer dialog. Call ALONE, not with sibling tools: this is not a mechanical authorization fence. Returns an extension-assigned Q-number and an explicitly pending result, never an inferred answer. The user opens Questions or /q and explicitly submits an answer later; submission steers the next safe model turn without aborting tools. Options may be omitted; recommendations are not approval. Workers report questions to their lead.",
+    description: "Save ONE question for the user without opening an answer dialog. Call ALONE, not with sibling tools: this is not a mechanical authorization fence. Returns an extension-assigned Q-number and an explicitly pending result, never an inferred answer. The user opens Questions or /q and explicitly submits an answer later; submission steers the next safe model turn without aborting tools. Supply Yes and No options for yes/no questions; omit options only for genuinely open-ended questions. Recommendations are not approval. Workers report questions to their lead.",
     parameters,
     async execute(toolCallId, params, signal, _onUpdate, ctx) {
       ensureContext(ctx);
@@ -828,6 +829,7 @@ export function registerQuestions(pi: ExtensionAPI, enabled: boolean): void {
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     promptSnippet: "Mark an existing question answered from chat, or dismiss it as obsolete.",
     promptGuidelines: [
+      "Resolve only still-pending questions; submitted UI choices and labeled answers may already be recorded, so do not resolve those again. When the user clearly answers a pending question in normal conversation, call resolve_question promptly, even without a Q-number or when the reply includes other requests. Do not ask them to repeat the answer. Dismiss a question with a reason when changed scope makes it obsolete; leave ambiguous questions pending.",
       "Resolve existing questions only; do not ask extra questions or reuse resolved IDs. Quote the full relevant user reply and consider later cancellations/revocations; never invent answers or infer them from silence/unrelated input.",
       "Validation checks recorded text, not intent or authorization. Resolution never resends input or grants permission; dismissal is not an answer or approval. Existing authorization requirements still apply.",
     ],

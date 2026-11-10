@@ -12,7 +12,7 @@ Personal Pi customizations in one package, with separate feature modules.
 | `src/workers/` | Plain worker execution, scope, completion delivery, resume, usage and worker UI |
 | `src/questions/` | Persistent questions, answer UI and its accessibility palette |
 | `src/styling/` | Compact tool rows, grouping, transcript panels, pinned prompt, input/status presentation |
-| `src/session/` | Session behavior such as optional macOS keep-awake |
+| `src/session/` | Request-local prompt guidance and optional macOS keep-awake |
 | `src/settings/interface.ts` | Existing interface settings and settings command |
 | `vendor/` | Attributed third-party helpers and licenses |
 
@@ -25,6 +25,12 @@ Feature modules retain their own state and shutdown cleanup. Questions are not p
 - Worktrees and namespaced memory remain supported; profiles, nesting, scheduling, workflows and grouped completion strategies stay removed.
 
 See [workers](docs/workers/README.md), [worker RPC](docs/workers/rpc.md), [interface and questions](docs/interface.md), and [migration/reconciliation](docs/migration.md).
+
+## Prompt guidance
+
+The combined extension removes Pi's exact default **“Be concise in your responses”** rule from outgoing model requests. The global `AGENTS.md` Communication section defines useful concision instead: enough plain-English context to understand and act, without unnecessary process detail.
+
+This request-local hook preserves dynamic tool guidance, documentation, project instructions, skills, and saved transcripts. It does not install `SYSTEM.md` or replace the full prompt. Explicit custom/forced prompts, current rules overrides, and explicit contributed brevity guidance are left alone. Historical rules sections have no provenance: after resume, an unobserved override using the identical default wrapper and bullet cannot be distinguished from Pi's default. Only that exact bullet in a structured rules section is eligible; prose and other sections are untouched.
 
 ## Development
 

@@ -204,6 +204,9 @@ test("registers model-only sequential question and resolution tools; disabled is
   assert.equal(h.resolutionTool.executionMode, "sequential");
   assert.match(h.resolutionTool.promptGuidelines.join("\n"), /not intent or authorization/);
   assert.match(h.resolutionTool.promptGuidelines.join("\n"), /later cancellations\/revocations/);
+  assert.match(h.resolutionTool.promptGuidelines.join("\n"), /normal conversation.*resolve_question promptly.*without a Q-number/);
+  assert.match(h.resolutionTool.promptGuidelines.join("\n"), /leave ambiguous questions pending/);
+  assert.match(h.resolutionTool.promptGuidelines.join("\n"), /submitted UI choices and labeled answers may already be recorded.*do not resolve those again/);
   assert.deepEqual([...h.extension.commands.keys()], ["q", "questions"]);
   assert.equal(h.extension.commands.get("q").handler, h.extension.commands.get("questions").handler);
   assert.match(h.tool.description, /Questions or \/q /);
@@ -214,6 +217,8 @@ test("registers model-only sequential question and resolution tools; disabled is
   assert.match(h.tool.promptGuidelines.join("\n"), /ALONE.*NOT an authorization gate/);
   assert.match(h.tool.promptGuidelines.join("\n"), /questions you would otherwise ask/);
   assert.match(h.tool.promptGuidelines.join("\n"), /do not ask extra questions/);
+  assert.match(h.tool.promptGuidelines.join("\n"), /yes\/no questions.*selectable Yes and No options/);
+  assert.match(h.tool.parameters.properties.options.description, /yes\/no questions.*Yes and No options/);
   const disabled = await harness({ enabled: false });
   assert.equal(disabled.extension.tools.size, 0);
   assert.equal(disabled.extension.handlers.size, 0);
@@ -1642,6 +1647,43 @@ test("live transcript keeps delivery uncertainty truthful after failed sends and
   await h.emit("session_tree");
   assert.match(plain(rendered), /unconfirmed/);
   assert.doesNotMatch(plain(secondRendered), /unconfirmed/);
+});
+
+test("yes/no options are selectable and do not answer until explicitly submitted", async () => {
+  for (const [index, label] of ["Yes", "No"].entries()) {
+    const h = await harness();
+    const result = await h.ask({ question: "Proceed with the local change?", options: [{ label: "Yes" }, { label: "No" }] });
+    assert.equal(result.details.status, "pending");
+    assert.deepEqual(h.latest().options.map(option => option.label), ["Yes", "No"]);
+    const dialog = h.command("Q1");
+    assert.match(plain(h.current().component), /Yes/);
+    assert.match(plain(h.current().component), /No/);
+    if (index) h.current().component.handleInput("\x1b[B");
+    assert.equal(h.latest().status, "pending", "highlighting an option is not an answer");
+    h.submitOption();
+    await dialog;
+    assert.equal(h.latest().status, "answered");
+    assert.equal(h.latest().answer.text, label);
+    assert.equal(h.latest().answer.optionIndex, index);
+    assert.match(h.sent[0].content, new RegExp(`User answer: ${label}$`));
+  }
+});
+
+test("pending reminders request natural-reply cleanup without guessing or re-asking", async () => {
+  const h = await harness();
+  await h.ask({ question: "Which database?" });
+  const reply = "Use SQLite. Also update the setup guide.";
+  await h.input(reply);
+  const [reminder] = await h.emit("before_agent_start");
+  assert.match(reminder.message.content, /call resolve_question with the full observed reply.*without a Q-number.*mixed with other requests/);
+  assert.match(reminder.message.content, /Leave ambiguous questions pending/);
+  assert.match(reminder.message.content, /Do not infer answers from silence or unrelated input/);
+  assert.equal(h.latest().status, "pending", "semantic interpretation remains the agent's responsibility");
+  const resolved = await h.resolveQuestion({ question_id: 1, resolution: "answered", reason: "The user chose SQLite while adding a documentation request.", user_message: reply });
+  assert.notEqual(resolved.isError, true);
+  assert.equal(h.widget(), "");
+  assert.deepEqual(await h.emit("before_agent_start"), [undefined]);
+  assert.equal(h.sent.length, 0, "cleanup must not resend the reply");
 });
 
 test("resolve_question anchors observed native input with visible chat, refreshes UI, and never resends", async () => {
