@@ -218,6 +218,10 @@ test("registers model-only sequential question and resolution tools; disabled is
   assert.match(h.tool.promptGuidelines.join("\n"), /questions you would otherwise ask/);
   assert.match(h.tool.promptGuidelines.join("\n"), /do not ask extra questions/);
   assert.match(h.tool.promptGuidelines.join("\n"), /yes\/no questions.*selectable Yes and No options/);
+  assert.match(h.tool.promptGuidelines.join("\n"), /supplement your response; they never replace it.*in the middle of work.*Asking doesn't end your turn.*Don't start actions that require the answer/);
+  assert.match(h.tool.promptGuidelines.join("\n"), /explanatory text in the same message is expected/);
+  assert.match(h.tool.promptGuidelines.join("\n"), /never put a Qn label in the question text/);
+  assert.match(h.tool.description, /Asking doesn't end the turn: continue independent work and your response, but no action that requires the answer/);
   assert.match(h.tool.parameters.properties.options.description, /yes\/no questions.*Yes and No options/);
   const disabled = await harness({ enabled: false });
   assert.equal(disabled.extension.tools.size, 0);
@@ -230,7 +234,7 @@ test("ask_user returns pending immediately without auto-open; recommendation onl
   const result = await h.ask({ question: "Which database?", options: [{ label: "SQLite", description: "Local only" }, { label: "Postgres" }], recommended_option: 1, rationale: "No service required" });
   assert.equal(h.dialogs.length, 0);
   assert.equal(result.details.status, "pending");
-  assert.equal(result.terminate, true);
+  assert.equal(result.terminate, undefined, "a pending question does not end the agent's turn");
   assert.equal(h.updates.length, 0, "no repeated pending tool update");
   assert.equal(h.widget().split("\n").length, 5, "header and question have a blank row between them and outer spacers");
   assert.match(h.widget(), /▾ Questions · 1 pending/);
@@ -387,7 +391,7 @@ test("Escape keeps pending and ordinary /questions reopening never resends a sav
   h.current().component.handleInput("\x1b"); await opening;
   assert.equal(result.details.status, "pending");
   assert.equal(result.details.question.answer, undefined);
-  assert.equal(result.terminate, true);
+  assert.equal(result.terminate, undefined);
   assert.equal((h.widget().match(/Q\d+:/g) ?? []).length, 1);
   assert.equal(h.statuses.get(statusKey), undefined, "no duplicate pending reminder in status bar");
   assert.equal((h.widget().match(/Q\d+:/g) ?? []).length, 1);
@@ -1027,7 +1031,7 @@ test("unknown/mixed batch history is not a gate and cannot open UI or infer an a
   h.manager.appendMessage(msg);
   const result = await h.ask({ question: "Approve?" });
   assert.equal(result.details.status, "pending");
-  assert.equal(result.terminate, true, "Pi still requires all siblings to agree to termination");
+  assert.equal(result.terminate, undefined, "unknown history is not treated as a mixed batch");
   assert.equal(h.dialogs.length, 0);
   assert.equal(h.latest().status, "pending");
   assert.equal(h.latest().answer, undefined);
@@ -1667,6 +1671,18 @@ test("yes/no options are selectable and do not answer until explicitly submitted
     assert.equal(h.latest().answer.optionIndex, index);
     assert.match(h.sent[0].content, new RegExp(`User answer: ${label}$`));
   }
+});
+
+test("agent-supplied leading Qn labels are removed so cards never duplicate IDs", async () => {
+  const h = await harness();
+  const first = await h.ask({ question: "Q5: Q5: **Q6**: Should I draft the message?", options: [{ label: "Yes" }, { label: "No" }] });
+  assert.equal(first.details.question.id, 1);
+  assert.equal(first.details.question.question, "Should I draft the message?");
+  assert.match(h.widget(), /Q1: Should I draft the message\?/);
+  assert.doesNotMatch(h.widget(), /Q5|Q6/);
+  const reask = await h.ask({ question: "Q1: Should I draft the message?", options: [{ label: "Yes" }, { label: "No" }], question_id: 1 });
+  assert.notEqual(reask.isError, true, "an unchanged re-ask with a stray label keeps its ID");
+  assert.equal((await h.ask({ question: "Compare Q5: with Q6?" })).details.question.question, "Compare Q5: with Q6?", "only leading labels are removed");
 });
 
 test("pending reminders request natural-reply cleanup without guessing or re-asking", async () => {

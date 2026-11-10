@@ -63,6 +63,18 @@ function parseAnswerLabels(text: string): LabeledAnswer[] | undefined {
   return answers;
 }
 
+/** The extension owns IDs; drop agent-supplied leading Qn labels so cards never read "Q5: Q5:". */
+export function withoutQuestionLabels(text: string): string {
+  const label = /^(?:\*\*)?Q[1-9]\d{0,14}(?:\*\*)?\s*:(?:\*\*)?\s*(\S[\s\S]*)$/;
+  let question = text.trim();
+  let match = label.exec(question);
+  while (match) {
+    question = match[1].trim();
+    match = label.exec(question);
+  }
+  return question;
+}
+
 /** Intentionally conservative: only standalone labels in assistant text, never thinking or tool output. */
 export function parseProseQuestions(text: string): ProseQuestion[] {
   const questions: ProseQuestion[] = [];
@@ -643,7 +655,10 @@ export function registerQuestions(pi: ExtensionAPI, enabled: boolean): void {
       ? `Q${record.id} answered by the user: ${record.answer!.text}${record.answer?.optionIndex !== undefined ? `\nSelected option ${record.answer.optionIndex + 1}.` : ""}`
       : `${record ? `Q${record.id}: ` : ""}${reason ?? "Pending. No answer or approval was given. Click Questions or use /q to answer."}` }],
     details: { status, question: record ? structuredClone(record) : undefined, reason } as QuestionDetails,
-    ...(status !== "answered" ? { terminate: true } : {}),
+    // A pending question does not end the run: the agent continues independent work and its
+    // response, and the submitted answer steers a later safe turn. Unavailable calls (no UI,
+    // busy dialog, mixed batch) still stop so workers route the question to their lead.
+    ...(status === "unavailable" ? { terminate: true } : {}),
     ...(status === "error" ? { isError: true } : {}),
   });
 
@@ -717,15 +732,16 @@ export function registerQuestions(pi: ExtensionAPI, enabled: boolean): void {
     promptSnippet: "Ask the user one clarification, approval, or decision question with a persistent sequential ID.",
     promptGuidelines: [
       "Use ask_user only for questions you would otherwise ask; do not ask extra questions. Ask one per call. For yes/no questions, supply selectable Yes and No options; offer concrete choices for other decisions. Omit options only for genuinely open-ended questions. Custom text is always available; recommendations never select an answer.",
-      "Call ask_user ALONE in its assistant turn, never alongside other tool calls. Sequential execution is NOT an authorization gate for siblings. Do not execute actions dependent on an answer until a later turn after an explicit user answer.",
-      "Only the extension allocates Q-number IDs. Reuse question_id only for the unchanged pending question, never answered or dismissed IDs. Never invent user answers, treat an unsubmitted selection or recommendation as approval, or treat dismissal/defer/unavailable/abort as an answer.",
+      "Questions supplement your response; they never replace it. Ask as soon as a question arises, including in the middle of work. Asking doesn't end your turn: continue work and explanations that don't depend on the answer, then give your normal response with the context needed to decide. Don't start actions that require the answer until the user submits it.",
+      "Call ask_user ALONE in its assistant turn, never alongside other tool calls; explanatory text in the same message is expected. Sequential execution is NOT an authorization gate for siblings. Do not execute actions dependent on an answer until a later turn after an explicit user answer.",
+      "Only the extension allocates Q-number IDs; never put a Qn label in the question text. Reuse question_id only for the unchanged pending question, never answered or dismissed IDs. Never invent user answers, treat an unsubmitted selection or recommendation as approval, or treat dismissal/defer/unavailable/abort as an answer.",
       "Background workers must report their questions to the lead agent for interactive routing; headless calls remain unanswered. If ask_user is unavailable, ask labeled Qn prose; /q can capture it.",
     ],
-    description: "Save ONE question for the user without opening an answer dialog. Call ALONE, not with sibling tools: this is not a mechanical authorization fence. Returns an extension-assigned Q-number and an explicitly pending result, never an inferred answer. The user opens Questions or /q and explicitly submits an answer later; submission steers the next safe model turn without aborting tools. Supply Yes and No options for yes/no questions; omit options only for genuinely open-ended questions. Recommendations are not approval. Workers report questions to their lead.",
+    description: "Save ONE question for the user without opening an answer dialog. Asking doesn't end the turn: continue independent work and your response, but no action that requires the answer. Call ALONE, not with sibling tools: this is not a mechanical authorization fence. Returns an extension-assigned Q-number and an explicitly pending result, never an inferred answer. The user opens Questions or /q and explicitly submits an answer later; submission steers the next safe model turn without aborting tools. Supply Yes and No options for yes/no questions; omit options only for genuinely open-ended questions. Recommendations are not approval. Workers report questions to their lead.",
     parameters,
     async execute(toolCallId, params, signal, _onUpdate, ctx) {
       ensureContext(ctx);
-      const question = safe(params.question).trim();
+      const question = withoutQuestionLabels(safe(params.question));
       const options = (params.options ?? []).map(option => ({ label: safe(option.label).trim(), ...(option.description ? { description: safe(option.description) } : {}) }));
       const recommended = params.recommended_option === undefined ? undefined : params.recommended_option - 1;
       if (!question || options.some(option => !option.label) || (recommended !== undefined && (recommended < 0 || recommended >= options.length)) || (params.rationale && recommended === undefined)) {
