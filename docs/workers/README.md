@@ -6,7 +6,7 @@ The worker module migrated from the local plain-worker fork of `@tintinweb/pi-su
 
 ## Running locally
 
-Tested against Pi **1.4.0**; requires Node.js 22.19 or newer. The combined package is configured globally. The worker-only command below is for an isolated Pi configuration without the combined package or old standalone extensions—never load both registrations together.
+Tested against Pi **1.5.2** using repository-local development dependencies; requires Node.js 22.19 or newer. Installing these dependencies does not update the Pi executable on your PATH. The combined package is configured globally. The worker-only command below is for an isolated Pi configuration without the combined package or old standalone extensions—never load both registrations together.
 
 ```sh
 pi -e ./src/workers/index.ts

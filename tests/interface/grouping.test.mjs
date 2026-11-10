@@ -92,7 +92,7 @@ test("native global expansion action still reaches original tool siblings", () =
   const a = row();
   const b = row("bash");
   const f = fixture([a, b]);
-  const mode = { toolOutputExpanded: false, chatContainer: f.chat, loadedResourcesContainer: new Container(), showStatus() {} };
+  const mode = { toolOutputExpanded: false, chatContainer: f.chat, loadedResourcesContainer: new Container(), pendingMessagesContainer: new Container(), showStatus() {} };
   InteractiveMode.prototype.setToolsExpanded.call(mode, true);
   assert.ok(a.expanded && b.expanded);
   assert.match(plain(f.chat).join("\n"), /native result/);
@@ -107,7 +107,7 @@ test("global detail toggles do not close a manually revealed compact list", () =
   const b = row("bash");
   const f = fixture([a, b]);
   click(f.chat);
-  const mode = { toolOutputExpanded: false, chatContainer: f.chat, loadedResourcesContainer: new Container(), showStatus() {} };
+  const mode = { toolOutputExpanded: false, chatContainer: f.chat, loadedResourcesContainer: new Container(), pendingMessagesContainer: new Container(), showStatus() {} };
   InteractiveMode.prototype.setToolsExpanded.call(mode, true);
   assert.ok(a.expanded && b.expanded);
   InteractiveMode.prototype.setToolsExpanded.call(mode, false);

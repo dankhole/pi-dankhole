@@ -349,7 +349,7 @@ test("real host mouse submission restores ordinary editor focus and accepts subs
   editor.setText("ordinary draft");
   tui.addChild(editor);
   tui.setFocus(editor);
-  const host = Object.assign(Object.create(InteractiveMode.prototype), { ui: tui, editor, keybindings });
+  const host = Object.assign(Object.create(InteractiveMode.prototype), { ui: tui, editor, keybindings, extensionOverlays: new Map() });
   let component, handle;
   try {
     tui.start();
@@ -402,7 +402,7 @@ test("native host keyboard and quick double-click submission restore the ordinar
     const keybindings = new HostKeybindingsManager();
     const editor = new CustomEditor(tui, themes.getEditorTheme(), keybindings);
     editor.setText("ordinary draft"); tui.addChild(editor); tui.setFocus(editor);
-    const host = Object.assign(Object.create(InteractiveMode.prototype), { ui: tui, editor, keybindings });
+    const host = Object.assign(Object.create(InteractiveMode.prototype), { ui: tui, editor, keybindings, extensionOverlays: new Map() });
     let component, handle;
     try {
       tui.start();

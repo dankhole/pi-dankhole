@@ -748,12 +748,21 @@ test("fresh panel children prepare streaming wrappers and spacers without render
     a.updateContent(message([text("streamed answer")]), true);
     const next = a.contentContainer.children.find(child => child instanceof Markdown);
     assert.equal(freshTranscriptChildren(f.document), f.document.children);
-    assert.equal(Object.hasOwn(md, "render"), false);
+    assert.equal(Object.hasOwn(md, "render"), next === md, "native streaming may reuse Markdown; only detached wrappers are released");
     assert.equal(Object.hasOwn(next, "render"), true);
+    const streamed = next.render(80).find(line => line.includes("streamed answer"));
+    assert.ok(streamed?.includes(fill()), "the current native Markdown paints new streaming text with its panel");
+    // Changing native output padding requires a fresh Markdown instance on both hosts.
+    a.setOutputPad(2);
+    const rebuilt = a.contentContainer.children.find(child => child instanceof Markdown);
+    assert.notEqual(rebuilt, next);
+    assert.equal(freshTranscriptChildren(f.document), f.document.children);
+    assert.equal(Object.hasOwn(next, "render"), false, "native rebuilds release detached wrappers before painting");
+    assert.equal(Object.hasOwn(rebuilt, "render"), true);
     assert.equal(renders, 0, "fresh reconciliation is not a hidden full render pass");
     f.chat.clear();
     freshTranscriptChildren(f.document);
-    assert.equal(Object.hasOwn(next, "render"), false, "branch/compaction removals release detached wrappers during prepare too");
+    assert.equal(Object.hasOwn(rebuilt, "render"), false, "branch/compaction removals release detached wrappers during prepare too");
     f.document.render = () => ["foreign document"];
     assert.equal(freshTranscriptChildren(f.document), undefined);
   } finally { dispose(); }

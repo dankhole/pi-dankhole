@@ -31,7 +31,7 @@ let runOptions: RunOptions;
 let finish: (text?: string) => void;
 const drain = async () => { for (let i = 0; i < 30; i++) await Promise.resolve(); };
 
-beforeEach(() => {
+beforeEach(async () => {
   vi.useFakeTimers();
   hermetic = hermeticDir({ settings: { outputTranscript: false, rememberAgents: false } });
   booted = makePi();
@@ -43,6 +43,7 @@ beforeEach(() => {
     finish = (text = "DONE") => resolve({ responseText: text, session: session as never, aborted: false, steered: false });
   }));
   workers(booted.pi);
+  await booted.lifecycle.get("session_start")({}, ctx());
 });
 afterEach(async () => {
   finish?.();

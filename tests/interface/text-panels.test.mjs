@@ -20,7 +20,7 @@ const { installAssistantPanels } = await jiti.import(resolve(dirname(fileURLToPa
 const { Container, Markdown, mixColors, visibleWidth } = await import(pathToFileURL(requirePi.resolve("@earendil-works/pi-tui")).href);
 const { AssistantMessageComponent } = await fromPi("dist/modes/interactive/components/assistant-message.js");
 const { UserMessageComponent } = await fromPi("dist/modes/interactive/components/user-message.js");
-const { createMarkdownTransform } = await fromPi("dist/modes/interactive/components/markdown-transform.js");
+const { ExtensionRunner } = await fromPi("dist/core/extensions/runner.js");
 const { loadExtensionFromFactory, createExtensionRuntime } = await fromPi("dist/core/extensions/loader.js");
 const { createEventBus } = await fromPi("dist/core/event-bus.js");
 const themes = await fromPi("dist/modes/interactive/theme/theme.js");
@@ -662,11 +662,14 @@ test("registration is runtime-local, mode guarded, disabled cleanly and released
   assert.equal(loaded.tools.size, 0);
   assert.equal(loaded.commands.size, 0);
   assert.deepEqual([...loaded.handlers.keys()], ["session_start", "session_shutdown"]);
-  assert.equal(typeof loaded.markdownTransformer, "function");
+  // Resolve the registration through the host, just as the real transcript does.
+  const transformers = ExtensionRunner.prototype.getMarkdownTransformers.call({ extensions: [loaded] });
+  assert.equal(transformers.length, 1);
+  assert.equal(typeof transformers[0], "function");
   await loaded.handlers.get("session_start")[0]({}, f.ctx);
-  const renderTransform = createMarkdownTransform("assistant", false, [loaded.markdownTransformer]);
-  const markdown = new Markdown(source, 0, 0, themes.getMarkdownTheme(), undefined, { transform: renderTransform });
-  assert.doesNotMatch(plain(markdown, 80).join("\n"), /```/);
+  const message = { role: "assistant", content: [{ type: "text", text: source }], stopReason: "stop" };
+  const component = new AssistantMessageComponent(message, false, themes.getMarkdownTheme(), "Thinking...", 0, transformers);
+  assert.doesNotMatch(plain(component, 80).join("\n"), /```/);
   await loaded.handlers.get("session_shutdown")[0]({}, f.ctx);
-  assert.equal(loaded.markdownTransformer(source, { messageType: "assistant", isStreaming: false, availableWidth: 80 }), source);
+  assert.equal(transformers[0](source, { messageType: "assistant", isStreaming: false, availableWidth: 80 }), source);
 });

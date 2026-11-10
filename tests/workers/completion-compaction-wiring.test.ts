@@ -1,4 +1,4 @@
-/** Real Pi 1.4 summary, async-handler, queued-input, and cancellation regressions. */
+/** Real Pi summary, async-handler, queued-input, and cancellation regressions. */
 import { createAssistantMessageEventStream, fauxAssistantMessage } from "@earendil-works/pi-ai";
 import { type AgentSession, createAgentSession, DefaultResourceLoader, type ExtensionFactory, getAgentDir, SessionManager, SettingsManager } from "@earendil-works/pi-coding-agent";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -109,10 +109,11 @@ async function boot(laterExtensions: ExtensionFactory[] = []) {
     entered();
     return stream;
   };
+  const originalSend = session.sendCustomMessage.bind(session);
   const send = vi.spyOn(session, "sendCustomMessage");
   const notifications = () => session.messages.filter(message => message.role === "custom" && message.customType === "subagent-notification");
   return {
-    session, send, streamEntered, notifications,
+    session, send, originalSend, streamEntered, notifications,
     startSummary(tree = false) {
       operation = (tree ? session.navigateTree(treeTarget, { summarize: true }) : session.compact())
         .then(result => ({ result }), error => ({ error }));
@@ -161,22 +162,37 @@ describe("worker delivery after real Pi summarization", () => {
     await b.expectDelivered();
   });
 
-  // Ported from /tmp/review-w3/async-handler.test.ts: Pi awaits later extension
-  // handlers before clearing isCompacting, after our first immediate has run.
-  it.each([false, true])("delivers after a later asynchronous terminal handler (tree: %s)", async tree => {
+  // Pi 1.4 stays busy through both terminal hooks. Pi 1.5.2 installs the
+  // selected tree context and clears summary busy state before session_tree.
+  // Delivery follows public idle, not the lifetime of every later hook.
+  it.each([false, true])("respects public idle during a later asynchronous terminal handler (tree: %s)", async tree => {
+    let entered!: () => void;
+    let release!: () => void;
+    const handlerEntered = new Promise<void>(resolve => { entered = resolve; });
+    const handlerReleased = new Promise<void>(resolve => { release = resolve; });
     const b = await boot([pi => {
-      const delay = async () => { await new Promise<void>(resolve => setTimeout(resolve, 25)); };
+      const delay = async () => { entered(); await handlerReleased; };
       pi.on("session_compact", delay);
       pi.on("session_tree", delay);
     }]);
+    b.send.mockImplementation((...args) => {
+      expect(b.session.isIdle).toBe(true);
+      return b.originalSend(...args);
+    });
     const operation = b.startSummary(tree);
-    await b.streamEntered;
-    await b.finishWorkers();
-    b.finishSummary("stop");
-    await nextImmediate();
-    expect(b.session.isCompacting).toBe(true);
-    expect(b.session.isStreaming).toBe(false);
-    expect(b.send).not.toHaveBeenCalled();
+    try {
+      await b.streamEntered;
+      await b.finishWorkers();
+      expect(b.send).not.toHaveBeenCalled();
+      b.finishSummary("stop");
+      await handlerEntered;
+      await nextImmediate();
+      if (!tree) expect(b.session.isCompacting).toBe(true);
+      if (b.session.isCompacting) {
+        expect(b.session.isStreaming).toBe(false);
+        expect(b.send).not.toHaveBeenCalled();
+      }
+    } finally { release(); }
     await operation;
     await b.expectDelivered();
   });

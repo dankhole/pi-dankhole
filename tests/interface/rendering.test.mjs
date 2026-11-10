@@ -96,8 +96,9 @@ test("stable summaries survive result updates without skipping downstream render
   assert.equal(results, 100);
   args.code = "tools.edit({}); tools.write({}); tools.bash({}); tools.read({}); tools.extra({});";
   component.updateArgs(args);
-  assert.notEqual(component.rendererState.summary, cached, "in-place argument edits invalidate the summary");
+  // Native hosts can coalesce argument deltas until the next display frame.
   assert.match(nonblank(component, 200)[0], /edit, write, bash, read, …/);
+  assert.notEqual(component.rendererState.summary, cached, "in-place argument edits invalidate the summary at render");
   args.script = "tools.fallback({});";
   args.code = "";
   component.updateArgs(args);

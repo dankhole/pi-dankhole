@@ -106,6 +106,7 @@ async function hostFixture(t) {
   host.defaultEditor = new CustomEditor(host.ui, themeModule.getEditorTheme(), host.keybindings);
   host.editor = host.defaultEditor;
   host.editorContainer = new Container();
+  host.extensionDialogs = [];
   host.disposeActiveSelector = () => {};
   host.setupKeyHandlers();
   host.updateEditorBorderColor();

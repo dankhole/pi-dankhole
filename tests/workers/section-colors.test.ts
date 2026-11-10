@@ -252,17 +252,22 @@ describe("section colors", () => {
       expect(renderWidget()).toContain(fg("text", theme.bold("Inspect auth")));
       expect(stripAnsi(render())).toBe(stripAnsi(off));
       expect(extension.tool.renderCall({ description: "Inspect auth" }, theme, { isPartial: false, isError: false }).render(240).join("\n")).toContain(fg("accent", "Inspect auth"));
-      await extension.shutdown();
-      const reloaded = activate();
-      try {
-        expect(reloaded.tool.renderResult({ content: [], details }, { expanded: false, isPartial: false }, theme, { isError: false }).render(240).join("\n")).toContain(fg("syntaxVariable", "sonnet 4.6"));
-      } finally { await reloaded.shutdown(); }
       toggle = "off";
       vi.mocked(ctx.ui.select).mockResolvedValueOnce("Settings");
       await extension.command("", ctx);
       expect(render()).toBe(off);
       expect(renderWidget()).toContain(fg("muted", theme.bold("Inspect auth")));
       expect(loadSettings(cwd).sectionColors).toBe(false);
+      // Verify persisted enabled state on a fresh activation only after all
+      // live-widget assertions; shutdown intentionally unregisters the widget.
+      toggle = "on";
+      vi.mocked(ctx.ui.select).mockResolvedValueOnce("Settings");
+      await extension.command("", ctx);
+      await extension.shutdown();
+      const reloaded = activate();
+      try {
+        expect(reloaded.tool.renderResult({ content: [], details }, { expanded: false, isPartial: false }, theme, { isError: false }).render(240).join("\n")).toContain(fg("syntaxVariable", "sonnet 4.6"));
+      } finally { await reloaded.shutdown(); }
     } finally { await extension.shutdown(); }
   });
 });

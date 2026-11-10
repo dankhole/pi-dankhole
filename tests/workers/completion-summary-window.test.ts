@@ -44,6 +44,7 @@ describe("post-summary completion window", () => {
     const settingsManager = SettingsManager.inMemory({
       compaction: { enabled: false, keepRecentTokens: 200 }, retry: { enabled: false },
     });
+    let terminalIdle = false;
     const loader = new DefaultResourceLoader({
       cwd: environment.dir, agentDir: getAgentDir(), settingsManager,
       extensionFactories: [pi => {
@@ -52,12 +53,15 @@ describe("post-summary completion window", () => {
         subagentsExtension(pi);
       }, pi => {
         const finishDuringCleanup = async (_event: unknown, context: { isIdle(): boolean }) => {
-          expect(context.isIdle()).toBe(false);
+          // Pi 1.5.2 permits work from session_tree after installing the new
+          // context; 1.4 retains busy state until all tree handlers return.
+          terminalIdle = context.isIdle();
+          if (!tree) expect(terminalIdle).toBe(false);
           finishers.get("alpha")!();
           await nextImmediate();
           finishers.get("beta")!();
           await nextImmediate();
-          expect(context.isIdle()).toBe(false);
+          if (!tree) expect(context.isIdle()).toBe(false);
           await new Promise<void>(resolve => setTimeout(resolve, 25));
         };
         pi.on("session_compact", finishDuringCleanup);
@@ -82,20 +86,32 @@ describe("post-summary completion window", () => {
           undefined, undefined, session.extensionRunner.createToolContext(`call-${prompt}`, undefined),
         );
       }
-      const send = vi.spyOn(session, "sendCustomMessage");
+      const originalSend = session.sendCustomMessage.bind(session);
+      const send = vi.spyOn(session, "sendCustomMessage").mockImplementation((...args) => {
+        expect(session.isIdle).toBe(true);
+        return originalSend(...args);
+      });
       // No worker has finished when our terminal hook opens the window. The
-      // later extension finishes them while Pi still reports summary cleanup.
+      // later handler finishes them; public-idle tree hooks may deliver each
+      // immediately, while busy summary cleanup coalesces the two results.
       if (tree) await session.navigateTree(treeTarget, { summarize: true });
       else await session.compact();
-      await vi.waitFor(() => expect(send).toHaveBeenCalledOnce(), { interval: 5, timeout: 1500 });
+      const expectedSends = terminalIdle ? 2 : 1;
+      await vi.waitFor(() => expect(send).toHaveBeenCalledTimes(expectedSends), { interval: 5, timeout: 1500 });
       await session.waitForIdle();
       const notifications = session.messages.filter(message => message.role === "custom" && message.customType === "subagent-notification");
-      expect(notifications).toHaveLength(1);
-      expect(notifications[0]).toMatchObject({
-        details: expect.objectContaining({ description: "alpha", others: [expect.objectContaining({ description: "beta" })] }),
-      });
+      expect(notifications).toHaveLength(expectedSends);
+      if (terminalIdle) {
+        expect(notifications).toMatchObject([
+          { details: { description: "alpha" } }, { details: { description: "beta" } },
+        ]);
+      } else {
+        expect(notifications[0]).toMatchObject({
+          details: expect.objectContaining({ description: "alpha", others: [expect.objectContaining({ description: "beta" })] }),
+        });
+      }
       await nextImmediate();
-      expect(send).toHaveBeenCalledOnce();
+      expect(send).toHaveBeenCalledTimes(expectedSends);
       expect(session.isIdle).toBe(true);
     } finally {
       await session.abort();

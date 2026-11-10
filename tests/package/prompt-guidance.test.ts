@@ -4,7 +4,7 @@ import { join } from "node:path";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import {
   fauxAssistantMessage, fauxToolCall, getCurrentSystemMessage, getCurrentTools,
-  resolveTranscript, type SystemMessage, Type,
+  resolveTranscript, type SystemMessage,
 } from "@earendil-works/pi-ai";
 import {
   type AgentSession, type BeforeAgentStartEvent, type BeforeAgentStartEventResult,
@@ -12,6 +12,7 @@ import {
   DefaultResourceLoader, type ExtensionAPI, type ExtensionHandler,
   type NormalizedBuildSystemPromptOptions, SessionManager, SettingsManager,
 } from "@earendil-works/pi-coding-agent";
+import { Type } from "typebox";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import registerPromptGuidance from "../../src/session/prompt-guidance.js";
 import { ctx } from "../workers/helpers/boot-extension.js";

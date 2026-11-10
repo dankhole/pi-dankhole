@@ -34,7 +34,7 @@ This request-local hook preserves dynamic tool guidance, documentation, project 
 
 ## Development
 
-Requires Node.js 22.19+; this package is tested against Pi **1.4.0**. Pi supplies host modules at runtime; local development uses pinned host dependencies.
+Requires Node.js 22.19+; local development and compatibility checks target Pi **1.5.2**. Pi supplies host modules at runtime; the pinned development dependencies do not update your installed Pi. The interface is also checked against Pi **1.4.0**.
 
 ```sh
 npm ci --ignore-scripts
