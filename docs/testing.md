@@ -47,6 +47,7 @@ These are starting points, not an exhaustive dependency graph. All interface pat
 |---|---|
 | Question overlay, selection, keyboard/mouse | `questions-ui.test.mjs`; include `questions.test.mjs` for integration or submission changes |
 | Question history, evidence, delivery, branch/lifecycle state | `questions.test.mjs`; include `questions-ui.test.mjs` when overlay behavior changes |
+| Prose question choices, transcript styling and click targets | `prose-question-choices.test.mjs`, `questions.test.mjs`; include `viewport-performance.test.mjs` and `pinned-prompt.test.mjs` for viewport changes |
 | Shared styling/question palettes | `palette.test.mjs`, plus the affected panel/renderer suites (e.g. `questions-ui`, `questions`, `rendering`, `assistant-panels`) |
 | Compact tool rows / grouping | `rendering.test.mjs`, `grouping.test.mjs`; include `questions` or `pinned-prompt` when shared transcript projection changes |
 | Pinned prompt / transcript visibility | `pinned-prompt.test.mjs`; include `questions.test.mjs` for shared viewport changes |

@@ -26,7 +26,7 @@ interface Transcript extends Tree {
   getContentWidth(width: number): number;
 }
 interface PendingIdentity { toolCallId?: string }
-type ProseQuestion = { identity: object; id: number; question: string };
+type ProseQuestion = { identity: object; id: number; question: string; choices?: string[] };
 export interface ProseQuestionSource { message: object; questions: ProseQuestion[] }
 interface ProseBinding {
   descriptor?: PropertyDescriptor;
@@ -63,12 +63,48 @@ function proseRows(lines: string[], id: number, question: string): number[] | un
   return matches.length === 1 ? matches[0] : undefined;
 }
 
+// Only extend a proven question target over an exact, adjacent choice block. Native
+// Markdown removes list markers and emphasis; no wording or choices are inferred here.
+function proseChoiceRows(lines: string[], after: number, choices: string[]): number[] {
+  const rows: number[] = [];
+  let cursor = after + 1;
+  for (const choice of choices) {
+    const expected = choice.replace(/^\s*[-*+]\s+/, "").replace(/\*\*|__/g, "").replace(/\s/g, "");
+    if (!expected) return [];
+    while (cursor < lines.length && !stripTerminalSequences(lines[cursor]).trim()) rows.push(cursor++);
+    let text = "";
+    let first = true;
+    while (cursor < lines.length && text.length < expected.length) {
+      let part = stripTerminalSequences(lines[cursor]).trim();
+      if (first) part = part.replace(/^[-*+•]\s+/, "");
+      first = false;
+      text += part.replace(/\s/g, "");
+      if (!expected.startsWith(text) || !part) return [];
+      rows.push(cursor++);
+    }
+    if (text !== expected) return [];
+  }
+  return rows;
+}
+
 function proseTargets(lines: string[], questions: ProseQuestion[]): Map<number, ProseQuestion> {
   const targets = new Map<number, ProseQuestion>();
   const ambiguous = new Set<number>();
-  for (const question of questions) for (const row of proseRows(lines, question.id, question.question) ?? []) {
-    if (targets.has(row)) ambiguous.add(row);
-    else targets.set(row, question);
+  for (const question of questions) {
+    const heading = proseRows(lines, question.id, question.question) ?? [];
+    const choices = heading.length && question.choices?.length
+      ? proseChoiceRows(lines, heading.at(-1)!, question.choices) : [];
+    const rows = [...heading, ...choices];
+    // Fill existing native spacing without inserting rows or changing mouse geometry.
+    if (choices.length) {
+      if (heading[0] > 0 && !stripTerminalSequences(lines[heading[0] - 1]).trim()) rows.push(heading[0] - 1);
+      const end = choices.at(-1)! + 1;
+      if (end < lines.length && !stripTerminalSequences(lines[end]).trim()) rows.push(end);
+    }
+    for (const row of rows) {
+      if (targets.has(row)) ambiguous.add(row);
+      else targets.set(row, question);
+    }
   }
   for (const row of ambiguous) targets.delete(row);
   return targets;
@@ -271,7 +307,11 @@ export function questionListVisibility(tui: TUI, pending: readonly PendingIdenti
           if (!bindProse(child, source, rows, contentWidth, targets)) continue;
           retained.add(child);
           // Visibility can suppress the only reminder only after native click routing exists.
-          for (const [row, question] of targets) if (preceding + offset + row >= top && preceding + offset + row < top + viewport) visible.add(question.identity);
+          // Choices and card padding are clickable, but only visible question text
+          // can suppress the off-screen reminder.
+          for (const question of source.questions) for (const row of proseRows(rows, question.id, question.question) ?? []) {
+            if (targets.get(row) === question && preceding + offset + row >= top && preceding + offset + row < top + viewport) visible.add(question.identity);
+          }
         }
         for (const child of bindings.keys()) if (!retained.has(child)) removeBinding(child);
         return pending.some(identity => !visible.has(identity));

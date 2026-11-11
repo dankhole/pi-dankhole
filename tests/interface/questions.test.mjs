@@ -37,7 +37,8 @@ const plain = (component, width = 100) => component.render(width).map(stripVTCon
 
 async function harness(options = {}) {
   const path = join(scratch, `questions-${serial++}.ts`);
-  writeFileSync(path, `import {registerQuestions} from ${JSON.stringify(questionsPath)};
+  writeFileSync(path, `import {registerQuestions, parseProseQuestions} from ${JSON.stringify(questionsPath)};
+${options.parse ? "globalThis.__questionTestParseProse = parseProseQuestions;" : ""}
 import {registerPinnedPrompt} from ${JSON.stringify(resolve(dirname(questionsPath), "../styling/pinned-prompt.ts"))};
 import {registerGrouping} from ${JSON.stringify(resolve(dirname(questionsPath), "../styling/grouping.ts"))};
 import {registerAssistantPanels} from ${JSON.stringify(resolve(dirname(questionsPath), "../styling/assistant-panels.ts"))};
@@ -48,7 +49,9 @@ export default pi => { registerQuestions(pi, ${options.enabled !== false}); ${op
   assert.deepEqual(loaded.errors, []);
   const extension = loaded.extensions[0];
   const registerRenderer = options.instrument ? globalThis.__questionTestRegisterRenderer : undefined;
+  const parseProse = options.parse ? globalThis.__questionTestParseProse : undefined;
   delete globalThis.__questionTestRegisterRenderer;
+  delete globalThis.__questionTestParseProse;
   const manager = options.manager ?? SessionManager.inMemory(scratch);
   const statuses = new Map([["other", "keep me"]]);
   const widgets = new Map();
@@ -124,7 +127,7 @@ export default pi => { registerQuestions(pi, ${options.enabled !== false}); ${op
     current.component.handleInput("\r"); // Enter sends the highlighted choice directly.
   };
   await emit("session_start");
-  return { loaded, extension, ctx, manager, statuses, widgets, notifications, confirmations, dialogs, sent, tool, resolutionTool, resolveQuestion, updates, ask, command, emit, message, toolMessage, input, records, latest, widget, widgetComponent, submitCustom, submitOption, registerRenderer, current: () => current };
+  return { loaded, extension, ctx, manager, statuses, widgets, notifications, confirmations, dialogs, sent, tool, resolutionTool, resolveQuestion, updates, ask, command, emit, message, toolMessage, input, records, latest, widget, widgetComponent, submitCustom, submitOption, registerRenderer, parseProse, current: () => current };
 }
 
 // Use Pi's real event/persistence handler while bypassing unrelated model/tool runtime setup.
@@ -1329,6 +1332,127 @@ test("fallback captures labeled assistant prose, skips fences/quotes/examples/th
   const result = await h.ask({ question: "Next?" });
   assert.equal(result.details.question.id, 5);
   assert.equal(h.dialogs.length, 0);
+});
+
+test("prose screenshot choices are captured, selectable in /q and delivered with their letter identity", async () => {
+  const h = await harness({ parse: true });
+  const choices = [
+    "- A (my recommendation): keep behaviour and explain the existing contract.",
+    "- B: apply the fix and add a regression test.",
+    "- C: ask Daniel for more context.",
+  ];
+  const text = `Q5: How should I respond to Daniel's comment?\n${choices.join("\n")}`;
+  const parsed = h.parseProse(text)[0];
+  assert.deepEqual(parsed.choices, choices, "viewport receives exact original option lines");
+  assert.deepEqual(parsed.options.map(option => option.label), choices.map(line => line.slice(2)));
+  await h.message(assistant(text));
+  assert.deepEqual(h.latest().options, parsed.options);
+  assert.equal(h.latest().recommended, undefined, "recommendation wording is preserved, not inferred as selection");
+  assert.equal(h.latest().status, "pending");
+  assert.equal(h.dialogs.length, 0);
+  const opening = h.command("Q5");
+  const component = h.current().component;
+  for (const choice of parsed.options) assert.ok(plain(component, 140).includes(choice.label));
+  assert.equal(h.sent.length, 0, "opening and recommendation text never submit");
+  component.handleInput("\x1b[B");
+  component.handleInput("\r");
+  await opening;
+  assert.equal(h.latest().answer.optionIndex, 1);
+  assert.equal(h.latest().answer.text, parsed.options[1].label);
+  assert.match(h.sent[0].content, /Answer to Q5\nQuestion: How should I respond to Daniel's comment\?\nSelected option: 2\nUser answer: B: apply the fix/);
+  await h.message(user(h.sent[0].content));
+  const resumed = await harness({ manager: h.manager });
+  assert.equal(resumed.sent.length, 0);
+  await resumed.command("Q5");
+  assert.equal(resumed.dialogs.length, 0, "restored answered choices do not reopen or resend");
+  assert.equal((await resumed.ask({ question: "Next?" })).details.question.id, 6);
+});
+
+test("prose choice parsing preserves Markdown source and accepts only complete unambiguous groups", async () => {
+  const h = await harness({ parse: true });
+  const choices = ["- **A (my recommendation):** keep `behaviour`.", "- **B:** apply the **fix**."];
+  const parsed = h.parseProse(`**Q2:** Which response?\n\n${choices.join("\n")}`)[0];
+  assert.deepEqual(parsed.choices, choices);
+  assert.deepEqual(parsed.options.map(option => option.label), choices.map(line => line.slice(2)));
+  assert.deepEqual(h.parseProse("Q1: Which target?\n1. Local only\n2. Leave unchanged")[0].options,
+    [{ label: "1. Local only" }, { label: "2. Leave unchanged" }]);
+  for (const group of [
+    "- A: Only one choice", "- A: First\n- C: Missing B", "- B: Starts late\n- C: Third",
+    "- A: First\n- A: Duplicate", "- A: First\n2. Mixed numbering", "1. First\n3. Missing second",
+    "- A: First\n- B: Second\n  a wrapped continuation", "- A: First\n  - B: Nested",
+    "- A: First\n- B: Second\nUnseparated explanation", "- A: First\n\n- B: Disconnected",
+    "- A: \n- B: Empty first", "- Yes\n- No", "", "- A: First\n- B: Second\n```\nC: Example\n```",
+    Array.from({ length: 13 }, (_, i) => `${i + 1}. Choice ${i + 1}`).join("\n"),
+  ]) {
+    const [question] = h.parseProse(`Q1: Proceed?\n${group}`);
+    assert.deepEqual(question, { id: 1, question: "Proceed?" }, `custom-only for ${JSON.stringify(group)}`);
+  }
+  for (const wrapper of [
+    text => `\`\`\`markdown\n${text}\n\`\`\``, text => `~~~~markdown\n${text}\n~~~~`,
+    text => `Example:\n${text}`, text => `For example:\n${text}`,
+    text => text.split("\n").map(line => `> ${line}`).join("\n"),
+    text => text.split("\n").map(line => `    ${line}`).join("\n"),
+  ]) assert.deepEqual(h.parseProse(wrapper("Q1: Example?\n- A: First\n- B: Second")), []);
+});
+
+test("prose choices survive pending restoration and neither repeated prose nor tool reuse changes their scope", async () => {
+  const h = await harness();
+  await h.message(assistant("Q1: Which response?\n- A: Keep behaviour\n- B: Apply fix"));
+  const original = h.latest();
+  await h.message(assistant("Q1: Which response?\n- A: Different action\n- B: Delete everything"));
+  assert.deepEqual(h.latest(), original);
+  assert.equal((await h.ask({ question_id: 1, question: original.question, options: [{ label: "Changed" }] })).isError, true);
+  assert.equal((await h.ask({ question_id: 1, question: original.question })).isError, true);
+  assert.deepEqual(h.latest(), original);
+  const resumed = await harness({ manager: h.manager });
+  const opening = resumed.command("Q1");
+  assert.match(plain(resumed.current().component), /A: Keep behaviour/);
+  assert.doesNotMatch(plain(resumed.current().component), /Different action|Delete everything/);
+  resumed.current().component.handleInput("\x1b");
+  await opening;
+  assert.equal(resumed.sent.length, 0);
+});
+
+test("custom-only prose still upgrades to explicitly supplied ask_user choices", async () => {
+  const h = await harness();
+  await h.message(assistant("Q1: Which response?"));
+  const options = [{ label: "Keep behaviour" }, { label: "Apply fix" }];
+  const result = await h.ask({ question_id: 1, question: "Which response?", options });
+  assert.notEqual(result.isError, true);
+  assert.deepEqual(result.details.question.options, options);
+  assert.equal(result.details.question.source, "tool");
+  assert.equal(h.sent.length, 0);
+});
+
+test("legacy empty prose choices restore only from a unique exact branch source without rewriting history", async () => {
+  for (const variant of ["snapshot-first", "source-first", "repeated", "changed-question", "unrelated-gap", "resolved"]) {
+    const manager = SessionManager.inMemory(scratch);
+    const legacy = { version: 1, id: 5, source: "prose", status: "pending", question: "Which response?", options: [] };
+    const source = assistant(`Q5: ${variant === "changed-question" ? "A different question?" : legacy.question}\n- A: Keep behaviour\n- B: Apply fix`);
+    if (variant === "source-first") manager.appendMessage(source);
+    manager.appendCustomEntry(entryType, legacy);
+    if (variant === "unrelated-gap") manager.appendMessage(user("An unrelated message"));
+    if (variant !== "source-first") manager.appendMessage(source);
+    if (variant === "repeated") manager.appendMessage(source);
+    if (variant === "resolved") manager.appendCustomEntry(entryType, { ...legacy, status: "dismissed" });
+    const before = manager.getBranch().length;
+    const h = await harness({ manager });
+    assert.equal(manager.getBranch().length, before, "restoration never rewrites saved snapshots");
+    const opening = h.command("Q5");
+    if (variant === "resolved") {
+      await opening;
+      assert.equal(h.dialogs.length, 0);
+      continue;
+    }
+    const restored = plain(h.current().component);
+    const recovered = variant === "snapshot-first" || variant === "source-first";
+    assert.equal(restored.includes("A: Keep behaviour"), recovered, variant);
+    if (recovered) h.submitOption();
+    else h.current().component.handleInput("\x1b");
+    await opening;
+    assert.equal(h.sent.length, recovered ? 1 : 0, variant);
+    if (recovered) assert.match(h.sent[0].content, /User answer: A: Keep behaviour/);
+  }
 });
 
 test("long code fences cannot be closed by a shorter embedded fence", async () => {

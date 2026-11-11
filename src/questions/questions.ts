@@ -42,7 +42,7 @@ interface QuestionDetails {
   status: "pending" | "answered" | "dismissed" | "unavailable" | "error";
   reason?: string;
 }
-interface ProseQuestion { id: number; question: string }
+interface ProseQuestion { id: number; question: string; options?: QuestionView["options"]; choices?: string[] }
 interface LabeledAnswer { id: number; text: string }
 
 const idIsValid = (id: unknown): id is number => Number.isSafeInteger(id) && Number(id) > 0 && Number(id) < Number.MAX_SAFE_INTEGER;
@@ -75,12 +75,40 @@ export function withoutQuestionLabels(text: string): string {
   return question;
 }
 
+/** Only complete, contiguous A/B/... or 1/2/... groups; never infer choices from wording. */
+function proseChoices(lines: string[], start: number): Pick<ProseQuestion, "options" | "choices"> {
+  if (lines[start]?.trim() === "") start++;
+  const choices: string[] = [], options: QuestionView["options"] = [];
+  let kind: "letter" | "number" | undefined;
+  let layout: string | undefined;
+  for (let index = start; index < lines.length && lines[index].trim(); index++) {
+    const line = lines[index];
+    // Inline emphasis belongs to the source. Ignore its markers only to recognize the label.
+    const parts = /^( {0,3})([-+*] +)?(\S.*)$/.exec(line);
+    const label = parts?.[3];
+    if (!parts) return {};
+    const currentLayout = `${parts[1]}${parts[2]?.trim() ?? ""}`;
+    layout ??= currentLayout;
+    if (currentLayout !== layout) return {};
+    const match = label && /^([A-Z]|[1-9]\d?)(?:\s*\([^()\n]+\))?\s*[:.)]\s+\S/.exec(label.replace(/\*\*|__/g, ""));
+    if (!match) return {}; // Wrapped/nested/otherwise ambiguous lists stay custom-only.
+    const currentKind: "letter" | "number" = /^[A-Z]$/.test(match[1]) ? "letter" : "number";
+    kind ??= currentKind;
+    const ordinal = currentKind === "letter" ? match[1].charCodeAt(0) - 64 : Number(match[1]);
+    if (currentKind !== kind || ordinal !== options.length + 1 || options.length === 12) return {};
+    choices.push(line);
+    options.push({ label: safe(label).trim() });
+  }
+  return options.length >= 2 ? { options, choices } : {};
+}
+
 /** Intentionally conservative: only standalone labels in assistant text, never thinking or tool output. */
 export function parseProseQuestions(text: string): ProseQuestion[] {
   const questions: ProseQuestion[] = [];
+  const lines = text.split(/\r?\n/);
   let fence: { character: string; length: number } | undefined;
   let example = false;
-  for (const line of text.split(/\r?\n/)) {
+  for (const [index, line] of lines.entries()) {
     const marker = /^\s{0,3}(`{3,}|~{3,})/.exec(line)?.[1];
     if (marker) {
       if (!fence) fence = { character: marker[0], length: marker.length };
@@ -94,7 +122,7 @@ export function parseProseQuestions(text: string): ProseQuestion[] {
     const match = /^\s{0,3}(?:\*\*)?Q([1-9]\d{0,14})(?:\*\*)?\s*:(?:\*\*)?\s+(.+?)\s*$/.exec(line);
     if (!match || !idIsValid(Number(match[1]))) continue;
     const question = safe(match[2]).trim();
-    if (question) questions.push({ id: Number(match[1]), question });
+    if (question) questions.push({ id: Number(match[1]), question, ...proseChoices(lines, index + 1) });
   }
   return questions;
 }
@@ -392,9 +420,10 @@ export function registerQuestions(pi: ExtensionAPI, enabled: boolean): void {
           if (entry.type !== "message" || entry.message.role !== "assistant") return [];
           const questions = parseProseQuestions(textContent(entry.message)).flatMap(question => {
             const record = pendingProse.get(question.id);
-            if (!record || record.question !== question.question || seen.has(record.id)) return [];
+            if (!record || record.question !== question.question || seen.has(record.id)
+              || optionsKey(record.options) !== optionsKey(question.options ?? [])) return [];
             seen.add(record.id);
-            return [{ identity: record, id: record.id, question: record.question }];
+            return [{ identity: record, id: record.id, question: record.question, ...(question.choices ? { choices: question.choices } : {}) }];
           });
           return questions.length ? [{ message: entry.message, questions }] : [];
         });
@@ -515,7 +544,7 @@ export function registerQuestions(pi: ExtensionAPI, enabled: boolean): void {
       reserve(question.id);
       // A repeated prose label cannot replace an answered question or silently change its scope.
       if (records.has(question.id)) continue;
-      const record: QuestionRecord = { ...question, options: [], version: 1, source: "prose", status: "pending" };
+      const record: QuestionRecord = { id: question.id, question: question.question, options: question.options ?? [], version: 1, source: "prose", status: "pending" };
       if (write) { listOffset = 0; persist(record); } else setRecord(record);
     }
   };
@@ -598,6 +627,49 @@ export function registerQuestions(pi: ExtensionAPI, enabled: boolean): void {
       } else if (entry.type === "message") {
         if (entry.message.role === "assistant") captureProse(textContent(entry.message), false);
         confirmMessage(entry.message);
+      }
+    }
+    // Old prose snapshots had no choices. Recover only a unique exact assistant source,
+    // never a later repeated label or a question whose saved options already define its scope.
+    const legacy = new Map([...records.values()].filter(record => record.source === "prose"
+      && record.status === "pending" && !record.options.length).map(record => [record.id, record]));
+    if (legacy.size) {
+      const proseSources = new Map<number, { question: ProseQuestion; position: number; snapshotStart: number }[]>();
+      const legacySnapshots = new Map<number, { first: number; compatible: boolean }>();
+      for (const [position, entry] of branch.entries()) {
+        const snapshot = recordFor(entry);
+        if (snapshot && legacy.has(snapshot.id)) {
+          const previous = legacySnapshots.get(snapshot.id);
+          legacySnapshots.set(snapshot.id, { first: previous?.first ?? position, compatible: previous?.compatible !== false
+            && snapshot.source === "prose" && snapshot.status === "pending" && !snapshot.options.length
+            && snapshot.question === legacy.get(snapshot.id)!.question });
+        }
+        if (entry.type !== "message" || entry.message.role !== "assistant") continue;
+        const questions = parseProseQuestions(textContent(entry.message));
+        const sourceQuestions = new Map(questions.map(question => [question.id, question.question]));
+        // message_end saves sibling snapshots just before their assistant message. Scan
+        // that contiguous run once per source, not the whole branch per legacy question.
+        let snapshotStart = position;
+        while (snapshotStart > 0) {
+          const sibling = recordFor(branch[snapshotStart - 1]);
+          if (sibling?.source !== "prose" || sibling.status !== "pending"
+            || sourceQuestions.get(sibling.id) !== sibling.question) break;
+          snapshotStart--;
+        }
+        for (const question of questions) {
+          if (!legacy.has(question.id)) continue;
+          const sources = proseSources.get(question.id) ?? [];
+          sources.push({ question, position, snapshotStart });
+          proseSources.set(question.id, sources);
+        }
+      }
+      for (const record of legacy.values()) {
+        const sources = proseSources.get(record.id), snapshots = legacySnapshots.get(record.id);
+        if (sources?.length !== 1 || !snapshots?.compatible) continue;
+        const source = sources[0];
+        if (source.question.question !== record.question || !source.question.options
+          || (snapshots.first < source.position && snapshots.first < source.snapshotStart)) continue;
+        setRecord({ ...record, options: source.question.options });
       }
     }
     // A confirmation can precede the final custom snapshot (e.g. input hooks). Reconcile a second
@@ -749,7 +821,7 @@ export function registerQuestions(pi: ExtensionAPI, enabled: boolean): void {
       }
       const previous = params.question_id === undefined ? undefined : records.get(params.question_id);
       if (params.question_id !== undefined && (!previous || previous.status !== "pending" || previous.question !== question
-        || (previous.source !== "prose" && optionsKey(previous.options) !== optionsKey(options)))) {
+        || ((previous.source !== "prose" || previous.options.length > 0) && optionsKey(previous.options) !== optionsKey(options)))) {
         return resultFor(previous, "error", `Q${params.question_id} cannot be reassigned: it must be an existing unanswered question with unchanged wording/options. No new ID was allocated and no approval was given.`);
       }
       if (previous && active?.id === previous.id) {
