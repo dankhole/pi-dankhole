@@ -13,14 +13,14 @@ import type { AgentRecord } from "./types.js";
  * agent can't mistake partial output for a completed result. Empty string for a
  * clean completion (and any unknown/non-terminal status).
  *
- * `stopped` (a human aborted it) is deliberately distinct from `aborted` (the
- * turn limit was hit) — the parent should treat human intervention differently
- * from a budget cutoff.
+ * `stopped` (external cancellation, by a user or parent agent) is deliberately
+ * distinct from `aborted` (the turn limit was hit). The status alone does not
+ * identify who requested cancellation or prove execution has settled.
  */
 export function getStatusNote(status: string): string {
   switch (status) {
     case "stopped":
-      return " (STOPPED BY THE USER before completion — output is partial; the task was NOT finished)";
+      return " (STOPPED before completion — output is partial; the task was NOT finished)";
     case "aborted":
       return " (aborted — hit the turn limit before completion; output may be incomplete)";
     case "steered":
@@ -45,11 +45,11 @@ export function getStatusNote(status: string): string {
  *
  * Only the lead clause varies between the three, and each variation carries
  * information: `wrapped up` vs `aborted` tells the parent whether the output is
- * a considered final answer or a fragment, and `stopped` shouts because a human
- * intervening outranks everything else in the string. Only `steered` hedges on
+ * a considered final answer or a fragment, and `stopped` flags external
+ * cancellation without attributing it to a human. Only `steered` hedges on
  * completion — it was told to wrap up and did, so it may well have finished at
  * the limit; an aborted run blew through its grace turns while still working,
- * and `stopped` can only fire on a running agent, so neither ever delivered a
+ * and `stopped` interrupts a queued or running run, so neither guarantees a
  * final answer. Identical confidence gets identical wording: phrasing one fact
  * two ways invites a hunt for a distinction that isn't there.
  *
@@ -67,7 +67,7 @@ export function getStatusNote(status: string): string {
 export function getForegroundOutcomeNote(status: string): string {
   switch (status) {
     case "stopped":
-      return " (STOPPED BY THE USER — everything the agent produced is above; the task is unfinished)";
+      return " (STOPPED — everything the agent produced is above; the task is unfinished)";
     case "aborted":
       return " (aborted at the turn limit — everything the agent produced is above; the task is unfinished)";
     case "steered":

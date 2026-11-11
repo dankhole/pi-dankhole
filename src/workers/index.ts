@@ -5,6 +5,7 @@
  *   Agent             — LLM-callable: spawn a sub-agent
  *   get_subagent_result  — LLM-callable: check background agent status/result
  *   steer_subagent       — LLM-callable: send a steering message to a running agent
+ *   stop_subagent        — LLM-callable: request cancellation of a managed worker
  *
  * Commands:
  *   /agents                 — Interactive agent management menu
@@ -31,6 +32,7 @@ import { createOutputFilePath, ensureOutputFile, getOutputTranscriptDefault, set
 import { ParentLifecycle } from "./parent-lifecycle.js";
 import { applyAndEmitLoaded, type SubagentsSettings, saveAndEmitChanged, type ToolDescriptionMode } from "./settings.js";
 import { getForegroundOutcomeNote, getStatusNote, partialOutputSuffix } from "./status-note.js";
+import { createStopSubagentTool } from "./stop-tool.js";
 import { type AgentInvocation, type AgentRecord, type NotificationDetails, type ViewerMarkdownMode, type WidgetMode } from "./types.js";
 import {
   type AgentActivity,
@@ -1176,7 +1178,7 @@ export default function (pi: ExtensionAPI) {
 - Workers inherit the parent's system rules. instructions adds to them; inherit_context separately includes conversation history.
 - Independent calls in one message run concurrently. Do not duplicate a worker's work.
 - Background is the default; completion notifies you. Use run_in_background: false only when the next action depends on the result.
-- Use get_subagent_result to collect results and steer_subagent to redirect running workers, using their returned IDs. resume continues the same conversation and launch configuration; it accepts prompt, optional description, run_in_background and max_turns only.${isolationCompactGuideline}`;
+- Use get_subagent_result to collect results, steer_subagent to redirect running workers, and stop_subagent to request cancellation, using their returned IDs. resume continues the same conversation and launch configuration; it accepts prompt, optional description, run_in_background and max_turns only.${isolationCompactGuideline}`;
 
   const fullAgentToolDescription = `Launch an autonomous worker for a complex, multi-step task. Its description is the short visible goal; its returned ID identifies its conversation.
 
@@ -1189,7 +1191,7 @@ Use direct tools when the target is already known. Delegate independent implemen
 - For independent parallel tasks, make multiple Agent calls in one message. Do not duplicate work already delegated.
 - Workers run in the background by default and notify you when they complete. Do not poll or sleep waiting for them; continue useful independent work. Use run_in_background: false only when the next action depends on the result and nothing else can progress.
 - Never fabricate or predict a pending worker's results. Its summary describes intent, not verified outcome: inspect actual changes before reporting success. The result is not shown to the user; summarize it when appropriate.
-- Use get_subagent_result and steer_subagent with the returned worker ID. Descriptions are labels, not handles.
+- Use get_subagent_result and steer_subagent with the returned worker ID. stop_subagent requests cancellation of running or queued work without waiting for settlement. Descriptions are labels, not handles.
 - resume continues the original conversation and launch configuration. It accepts prompt, optional description, run_in_background and max_turns only; start a new worker to change tools, rules or model. A running worker must be steered, not resumed.
 - Only the main agent launches and controls workers. Workers report further work or coordination needs to the main agent; they cannot delegate further.${isolationGuideline}
 
@@ -2065,6 +2067,10 @@ Terse command-style prompts produce shallow, generic work.
       }
     },
   }));
+
+  // ---- stop_subagent tool (same manager path as RPC and viewer stop) ----
+
+  pi.registerTool(withUsageReporting(createStopSubagentTool(manager)));
 
   // ---- /agents interactive menu ----
 

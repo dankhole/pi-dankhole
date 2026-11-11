@@ -33,7 +33,7 @@ describe("plain worker surface", () => {
 
   it("exposes worker controls without workflow tools or scheduled launches", () => {
     expect([...booted.tools.keys()].sort()).toEqual([
-      "Agent", "get_subagent_result", "steer_subagent",
+      "Agent", "get_subagent_result", "steer_subagent", "stop_subagent",
     ].sort());
     expect(booted.registeredFlags.size).toBe(0);
     const schema = booted.tools.get("Agent").parameters;

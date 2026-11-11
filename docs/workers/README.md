@@ -66,12 +66,23 @@ Resume reuses the worker's configuration and conversation. Only `prompt`, option
 ```js
 get_subagent_result({ agent_id: id, wait: true })
 steer_subagent({ agent_id: id, message: "Also inspect password resets." })
+stop_subagent({ agent_id: id })
 Agent({ resume: id, prompt: "Investigate the first finding further." })
 ```
 
 `get_subagent_result` accepts `verbose: true` for the conversation log. Consuming a completed result suppresses a duplicate completion notification. Cancelling a wait does not cancel its background worker. Steering received during startup is queued until the session is ready.
 
 Main-agent steering is not forwarded to workers. Automatic foreground handoff also accepts steering submitted by the question UI; follow-up input alone (`Alt+Enter`) does not request handoff. This is a best-effort public-queue observation, not a per-message delivery receipt: Pi combines steering and follow-up queues, and concurrent input handlers can make their provenance ambiguous. It does not interrupt other tools, foreground resumes or explicit `get_subagent_result` waits; those retain Pi's normal boundaries. See [host boundaries](../pi-host-boundaries.md#steering-during-worker-waits).
+
+### Stopping workers
+
+The main agent can call `stop_subagent({ agent_id: id })` for its managed running or queued children. It uses the same manager cancellation path as viewer stop and the in-process RPC stop operation. Unknown IDs (including goal labels and workers in another process) and workers no longer running or queued produce tool errors. Workers do not receive this tool, including through extension selectors, late registration or codemode-mediated calls.
+
+Queued work is removed immediately and that run never starts. Running work receives an abort signal, and the tool returns without waiting for the provider or current tool to return. **The manager's `stopped` status records cancellation, not proof that execution has settled.** A provider, tool or hook that ignores cancellation can keep running and hold its concurrency slot. This is not a force-kill or session deletion; do not resume until the old execution has settled.
+
+Stopping does not consume results or discard transcripts, usage, launch scope or resumable conversations. Running workers finish through the existing lifecycle and completion outbox once they settle; queued stops retain the existing behavior of no completion notification. Use `get_subagent_result` for available output, which can be partial or empty before settlement. Resume, when a session is available and execution has settled, keeps the original configuration.
+
+The tool is registered when this extension loads. For an existing Pi session, finish or stop active workers before `/reload`, or start a new session. Editing this checkout does not hot-add a tool to an already-running parent.
 
 Stopped, failed and turn-limited work is distinguished from normal completion; available partial output remains accessible. At a configured turn limit the worker is asked to wrap up, then aborted if it exceeds its grace budget.
 

@@ -11,6 +11,7 @@ export const SUBAGENT_TOOL_NAMES = {
   AGENT: "Agent",
   GET_RESULT: "get_subagent_result",
   STEER: "steer_subagent",
+  STOP: "stop_subagent",
 } as const;
 
 /** Includes memory's implicit tools, with the launch denylist applied. */

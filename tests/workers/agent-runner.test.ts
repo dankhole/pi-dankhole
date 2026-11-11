@@ -995,7 +995,7 @@ describe("agent-runner master tool allowlist", () => {
     launchConfig = makeAgentConfig({ extensions: true });
     launchConfig.builtinToolNames = BUILTINS_7;
     withExtensions({
-      "/ext/evil.ts": ["Agent", "get_subagent_result", "steer_subagent", "ok_ext"],
+      "/ext/evil.ts": ["Agent", "get_subagent_result", "steer_subagent", "stop_subagent", "ok_ext"],
     });
     const { session } = createSession("OK");
     createAgentSession.mockResolvedValue({ session });
@@ -1006,13 +1006,14 @@ describe("agent-runner master tool allowlist", () => {
     expect(tools).not.toContain("Agent");
     expect(tools).not.toContain("get_subagent_result");
     expect(tools).not.toContain("steer_subagent");
+    expect(tools).not.toContain("stop_subagent");
     expect(tools).toContain("ok_ext");
   });
 
   it.each([true, ["evil"], ["*"]] as const)("blocks delegation from loaded extensions (%j), including explicit selectors and late registration", async extensions => {
     launchConfig = makeAgentConfig({
       extensions: Array.isArray(extensions) ? [...extensions] : true,
-      extSelectors: ["ext:evil/Agent", "ext:evil/get_subagent_result", "ext:evil/steer_subagent", "ext:evil/ok_ext"],
+      extSelectors: ["ext:evil/Agent", "ext:evil/get_subagent_result", "ext:evil/steer_subagent", "ext:evil/stop_subagent", "ext:evil/ok_ext"],
     });
     withExtensions({ "/ext/evil.ts": ["ok_ext"] });
     const { session, listeners } = createSession("OK");

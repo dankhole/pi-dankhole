@@ -55,7 +55,7 @@ describe("single package composition", () => {
   it("loads the manifest entrypoint with workers, questions and interface rendering", async () => {
     const extension = await loadPackage();
     expect(extension.resolvedPath).toBe(join(packageRoot, "src/index.ts"));
-    expect([...extension.tools.keys()].sort()).toEqual(["Agent", "ask_user", "get_subagent_result", "resolve_question", "steer_subagent"]);
+    expect([...extension.tools.keys()].sort()).toEqual(["Agent", "ask_user", "get_subagent_result", "resolve_question", "steer_subagent", "stop_subagent"]);
     expect([...extension.commands.keys()].sort()).toEqual(["agents", "dankhole", "latest-input", "q", "questions"]);
     expect(extension.toolRenderers).toHaveLength(1);
     expect(extension.handlers.get("context_with_system")).toHaveLength(1);

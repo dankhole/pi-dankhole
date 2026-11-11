@@ -9,7 +9,7 @@ Use direct tools when the target is already known. Delegate independent implemen
 - For independent parallel tasks, make multiple Agent calls in one message. Do not duplicate work already delegated.
 - Workers run in the background by default and notify you when they complete. Do not poll or sleep waiting for them; continue useful independent work. Use run_in_background: false only when the next action depends on the result and nothing else can progress.
 - Never fabricate or predict a pending worker's results. Its summary describes intent, not verified outcome: inspect actual changes before reporting success. The result is not shown to the user; summarize it when appropriate.
-- Use get_subagent_result and steer_subagent with the returned worker ID. Descriptions are labels, not handles.
+- Use get_subagent_result and steer_subagent with the returned worker ID. stop_subagent requests cancellation of running or queued work without waiting for settlement. Descriptions are labels, not handles.
 - resume continues the original conversation and launch configuration. It accepts prompt, optional description, run_in_background and max_turns only; start a new worker to change tools, rules or model. A running worker must be steered, not resumed.
 - Only the main agent launches and controls workers. Workers report further work or coordination needs to the main agent; they cannot delegate further.{{isolationGuideline}}
 

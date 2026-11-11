@@ -73,7 +73,7 @@ describe("requested-name scope checks", () => {
     const h = scopeHarness();
     h.toolNames.push("Agent");
     h.disallowedSet.add("read");
-    for (const name of ["read", "Agent", "get_subagent_result", "steer_subagent"]) {
+    for (const name of ["read", "Agent", "get_subagent_result", "steer_subagent", "stop_subagent"]) {
       expect(h.gate.allows(name)).toBe(false);
       expect(await h.direct(name)).toMatchObject({ block: true });
     }

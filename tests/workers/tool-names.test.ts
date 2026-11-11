@@ -12,11 +12,12 @@ describe("worker tool names", () => {
     expect(new Set(BUILTIN_TOOL_NAMES).size).toBe(BUILTIN_TOOL_NAMES.length);
   });
 
-  it("retains the three worker-control tool names", () => {
+  it("retains the parent-only worker-control tool names", () => {
     expect(SUBAGENT_TOOL_NAMES).toEqual({
       AGENT: "Agent",
       GET_RESULT: "get_subagent_result",
       STEER: "steer_subagent",
+      STOP: "stop_subagent",
     });
   });
 });
